@@ -214,7 +214,7 @@ def main() -> None:
                     dry_up = (vol60 > 0) and (vol10 / vol60 < 0.60)
 
                     if dry_up:
-                        results.append((t, px, dv20, bbz_last, atr_pctl))results.append((t, px, dv20, bbz_last, atr_pctl))
+                        results.append((t, px, dv20, bbz_last, atr_pctl))
    
         except Exception:
             pass
