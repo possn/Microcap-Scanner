@@ -14,17 +14,33 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-def compute_atr(...):
-...
+def compute_atr(df, n=14):
+    high = df["high"]
+    low = df["low"]
+    close = df["close"].shift(1)
 
-def compute_bb_width(...):
-...
+    tr = np.maximum(high - low,
+         np.maximum(abs(high - close), abs(low - close)))
 
-def zscore(...):
-...
+    atr = tr.rolling(n).mean()
+    return atr
 
-def fetch_csv(...):
-...
+
+def compute_bb_width(df, n=20):
+    ma = df["close"].rolling(n).mean()
+    std = df["close"].rolling(n).std()
+
+    upper = ma + 2 * std
+    lower = ma - 2 * std
+
+    width = (upper - lower) / ma
+    return width
+
+
+def zscore(series, window=100):
+    mean = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    return (series - mean) / std
 
 TG_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
