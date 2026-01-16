@@ -70,6 +70,8 @@ def fetch_ohlcv(ticker: str, fmt: str):
     return df.reset_index(drop=True)
 
 def main():
+    import os
+os.makedirs("cache/ohlcv", exist_ok=True)
 
     holdings_url = os.environ["IWC_HOLDINGS_CSV_URL"]
     ohlcv_fmt = os.environ["OHLCV_URL_FMT"]
