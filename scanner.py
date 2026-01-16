@@ -94,9 +94,10 @@ def fetch_ohlcv(ticker: str, fmt: str):
     df.to_csv(path, index=False)
 
     return df
+    
 def main():
     import os
-os.makedirs("cache/ohlcv", exist_ok=True)
+    os.makedirs("cache/ohlcv", exist_ok=True)
 
     holdings_url = os.environ["IWC_HOLDINGS_CSV_URL"]
     ohlcv_fmt = os.environ["OHLCV_URL_FMT"]
