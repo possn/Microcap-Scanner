@@ -174,8 +174,41 @@ def main() -> None:
             # Conservative staging gate
             is_staging = (bbz_last < -1.8) and (atr_pctl < 0.10)
 
-            if is_staging and np.isfinite(bbz_last) and np.isfinite(atr_pctl):
-                results.append((t, px, dv20, bbz_last, atr_pctl))
+            if is_staging:
+
+            # -------- BASE QUALITY FILTER (4–10 weeks) --------
+
+           base_min = 20     # 4 semanas
+           base_max = 50     # 10 semanas
+
+           base_pass = False
+
+           for win in range(base_min, base_max + 1, 5):
+
+           base = df.iloc[-win:]
+
+        high_base = base["high"].max()
+        low_base = base["low"].min()
+
+        # drawdown interno da base
+        dd = (high_base - low_base) / high_base
+
+        # comparação com volatilidade anterior
+        prev = df.iloc[-(win+120):-win]
+        if len(prev) < 60:
+            continue
+
+        prev_range = prev["high"].max() - prev["low"].min()
+        base_range = high_base - low_base
+
+        contraction_ratio = base_range / prev_range if prev_range > 0 else 1
+
+        if dd <= 0.35 and contraction_ratio <= 0.50:
+            base_pass = True
+            break
+
+    if base_pass:
+        results.append((t, px, dv20, bbz_last, atr_pctl))
 
         except Exception:
             pass
