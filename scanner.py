@@ -140,8 +140,26 @@ def main():
             px = float(df.iloc[-1]["close"])
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
 
-            if px >= 1 and dv20 >= 3_000_000:
-                results.append((t,px,dv20))
+            if px >= 1 and dv20 >= 3_000_000 and len(df) >= 260:
+
+    # --- Compression metrics ---
+    bb_width = compute_bb_width(df, n=20)
+    bb_z = zscore(bb_width, window=120)
+
+    atr = compute_atr(df, n=14)
+    atr_pct = atr / df["close"]
+
+    # percentil do ATR% no último ano
+    atr_last = float(atr_pct.iloc[-1])
+    atr_pctl = float((atr_pct.iloc[-252:] <= atr_last).mean())
+
+    bbz_last = float(bb_z.iloc[-1])
+
+    # Critério conservador de staging zone
+    is_staging = (bbz_last < -1.8) and (atr_pctl < 0.10)
+
+    if is_staging:
+        results.append((t, px, dv20, bbz_last, atr_pctl))
 
         except:
             pass
@@ -149,16 +167,16 @@ def main():
         if (i+1) % 50 == 0:
             time.sleep(1)
 
-    results.sort(key=lambda x: x[2], reverse=True)
-    top = results[:15]
+results.sort(key=lambda x: (x[3], -x[2]))
+top = results[:15]
 
-    msg = [f"[{now}] Microcap scanner (bootstrap online)"]
-    msg.append(f"Universo avaliado: {len(tickers)}")
-    msg.append("")
-    msg.append("Top liquidez (proxy universo):")
+msg = [f"[{now}] Microcap scanner (Modo A - staging)"]
+msg.append(f"Universo avaliado: {len(tickers)}")
+msg.append("")
+msg.append("AGUARDAR (compressão extrema):")
 
-    for t,px,dv in top:
-        msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M")
+for t, px, dv, bbz, atrp in top:
+    msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}")
 
     tg_send("\n".join(msg))
 
