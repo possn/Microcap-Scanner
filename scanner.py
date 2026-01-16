@@ -53,6 +53,22 @@ def get_universe(holdings_url: str):
     return tickers
 
 def fetch_ohlcv(ticker: str, fmt: str):
+    import os
+
+    path = f"cache/ohlcv/{ticker}.csv"
+
+    cached = None
+    if os.path.exists(path):
+        try:
+            cached = pd.read_csv(path)
+            if "date" in cached.columns:
+                cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+                cached = cached.dropna(subset=["date"]).sort_values("date")
+            else:
+                cached = None
+        except Exception:
+            cached = None
+
     url = fmt.format(symbol=ticker.lower())
     df = fetch_csv(url)
 
@@ -67,8 +83,17 @@ def fetch_ohlcv(ticker: str, fmt: str):
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
 
-    return df.reset_index(drop=True)
+    if cached is not None and len(cached) > 0:
+        df = pd.concat([cached, df], ignore_index=True)
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+        df = df.drop_duplicates(subset=["date"], keep="last")
 
+    df = df.reset_index(drop=True)
+
+    df.to_csv(path, index=False)
+
+    return df
 def main():
     import os
 os.makedirs("cache/ohlcv", exist_ok=True)
