@@ -18,13 +18,33 @@ def tg_send(text: str):
     r = requests.post(url, json=payload, timeout=30)
     r.raise_for_status()
 
-def fetch_csv(url: str) -> pd.DataFrame:
+def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
     r = requests.get(url, timeout=60)
     r.raise_for_status()
-    return pd.read_csv(io.StringIO(r.text))
+    text = r.text
+
+    if not holdings:
+        return pd.read_csv(io.StringIO(text))
+
+    # HOLDINGS CSV (iShares): tem metadados antes da tabela
+    lines = text.splitlines()
+
+    header_idx = None
+    for i, ln in enumerate(lines[:200]):
+        # procura header real
+        if ln.strip().lower().startswith("ticker,"):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        raise RuntimeError("Não encontrei o header 'Ticker,' no holdings CSV.")
+
+    cleaned = "\n".join(lines[header_idx:])
+
+    return pd.read_csv(io.StringIO(cleaned), engine="python", on_bad_lines="skip")
 
 def get_universe(holdings_url: str):
-    df = fetch_csv(holdings_url)
+    df = fetch_csv(holdings_url, holdings=True)
     if "Ticker" not in df.columns:
         raise RuntimeError("Holdings CSV não tem coluna 'Ticker'")
     tickers = df["Ticker"].astype(str).str.strip()
