@@ -23,6 +23,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Cache data
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: microcap-cache-v1
+
       - name: Run scanner
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
