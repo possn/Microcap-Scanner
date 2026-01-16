@@ -177,7 +177,7 @@ def main() -> None:
 
             if is_staging and np.isfinite(bbz_last) and np.isfinite(atr_pctl):
 
-                # -------- BASE QUALITY FILTER (4–10 weeks) --------
+                                # -------- BASE QUALITY FILTER (4–10 weeks) --------
                 base_min = 20     # ~4 semanas
                 base_max = 50     # ~10 semanas
 
@@ -186,36 +186,28 @@ def main() -> None:
                 best_high_base = None
 
                 for win in range(base_min, base_max + 1, 5):
-                base = df.iloc[-win:]
+                    base = df.iloc[-win:]
 
-                high_base = float(base["high"].max())
-                low_base = float(base["low"].min())
+                    high_base = float(base["high"].max())
+                    low_base = float(base["low"].min())
 
-                dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
+                    dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
 
-                prev = df.iloc[-(win + 120):-win]
-                if len(prev) < 60:
-                    continue
+                    prev = df.iloc[-(win + 120):-win]
+                    if len(prev) < 60:
+                        continue
 
-                prev_range = float(prev["high"].max() - prev["low"].min())
-                base_range = float(high_base - low_base)
+                    prev_range = float(prev["high"].max() - prev["low"].min())
+                    base_range = float(high_base - low_base)
 
-                contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
+                    contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
 
-                if dd <= 0.35 and contraction_ratio <= 0.50:
-                    base_pass = True
-                    best_win = win
-                    best_high_base = high_base
-                    break
-
-  
-
-                if base_pass:
-                    # -------- VOLUME DRY-UP FILTER --------
-                    vol10 = float(df["volume"].iloc[-10:].mean())
-                    vol60 = float(df["volume"].iloc[-60:].mean())
-
-                    dry_up = (vol60 > 0) and (vol10 / vol60 < 0.60)
+                    if dd <= 0.35 and contraction_ratio <= 0.50:
+                        base_pass = True
+                        best_win = win
+                        best_high_base = high_base
+                        break
+ 
 
                     if dry_up and best_high_base is not None:
 
