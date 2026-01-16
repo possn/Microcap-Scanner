@@ -172,44 +172,43 @@ def main() -> None:
             bbz_last = float(bb_z.iloc[-1])
 
             # Conservative staging gate
+                        # Conservative staging gate
             is_staging = (bbz_last < -1.8) and (atr_pctl < 0.10)
 
-            if is_staging:
+            if is_staging and np.isfinite(bbz_last) and np.isfinite(atr_pctl):
 
-            # -------- BASE QUALITY FILTER (4–10 weeks) --------
+                # -------- BASE QUALITY FILTER (4–10 weeks) --------
+                base_min = 20     # ~4 semanas
+                base_max = 50     # ~10 semanas
 
-           base_min = 20     # 4 semanas
-           base_max = 50     # 10 semanas
+                base_pass = False
 
-           base_pass = False
+                for win in range(base_min, base_max + 1, 5):
+                    base = df.iloc[-win:]
 
-           for win in range(base_min, base_max + 1, 5):
+                    high_base = float(base["high"].max())
+                    low_base = float(base["low"].min())
 
-           base = df.iloc[-win:]
+                    # drawdown interno da base
+                    dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
 
-        high_base = base["high"].max()
-        low_base = base["low"].min()
+                    # comparar range da base vs range anterior (até 6 meses)
+                    prev = df.iloc[-(win + 120):-win]
+                    if len(prev) < 60:
+                        continue
 
-        # drawdown interno da base
-        dd = (high_base - low_base) / high_base
+                    prev_range = float(prev["high"].max() - prev["low"].min())
+                    base_range = float(high_base - low_base)
 
-        # comparação com volatilidade anterior
-        prev = df.iloc[-(win+120):-win]
-        if len(prev) < 60:
-            continue
+                    contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
 
-        prev_range = prev["high"].max() - prev["low"].min()
-        base_range = high_base - low_base
+                    if dd <= 0.35 and contraction_ratio <= 0.50:
+                        base_pass = True
+                        break
 
-        contraction_ratio = base_range / prev_range if prev_range > 0 else 1
-
-        if dd <= 0.35 and contraction_ratio <= 0.50:
-            base_pass = True
-            break
-
-    if base_pass:
-        results.append((t, px, dv20, bbz_last, atr_pctl))
-
+                if base_pass:
+                    results.append((t, px, dv20, bbz_last, atr_pctl))
+   
         except Exception:
             pass
 
