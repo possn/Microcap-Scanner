@@ -5,6 +5,27 @@ import requests
 import pandas as pd
 from datetime import datetime, timezone
 
+import os
+import io
+import time
+import requests
+import pandas as pd
+from datetime import datetime, timezone
+
+import numpy as np
+
+def compute_atr(...):
+...
+
+def compute_bb_width(...):
+...
+
+def zscore(...):
+...
+
+def fetch_csv(...):
+...
+
 TG_TOKEN = os.environ["TG_BOT_TOKEN"]
 TG_CHAT_ID = os.environ["TG_CHAT_ID"]
 
