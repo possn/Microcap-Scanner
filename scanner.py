@@ -154,7 +154,7 @@ def main():
                 continue
 
             px = float(df.iloc[-1]["close"])
-            dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).
+            dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
         if px >= 1 and dv20 >= 3_000_000 and len(df) >= 260:
 
     # --- Compression metrics ---
