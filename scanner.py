@@ -217,8 +217,22 @@ def main() -> None:
 
                     dry_up = (vol60 > 0) and (vol10 / vol60 < 0.60)
 
-                    if dry_up:
-                        results.append((t, px, dv20, bbz_last, atr_pctl))
+                    if dry_up and best_high_base is not None:
+
+    # -------- EXECUTAR trigger (EOD verified) --------
+    close_today = float(df["close"].iloc[-1])
+    open_today = float(df["open"].iloc[-1])
+    close_prev = float(df["close"].iloc[-2])
+    vol_today = float(df["volume"].iloc[-1])
+    vol20 = float(df["volume"].iloc[-20:].mean())
+
+    breakout = close_today > best_high_base
+    vol_confirm = (vol20 > 0) and (vol_today >= 1.5 * vol20)
+    no_exhaust_gap = open_today <= close_prev * 1.10
+
+    decision = "EXECUTAR" if (breakout and vol_confirm and no_exhaust_gap) else "AGUARDAR"
+
+    results.append((t, decision, px, dv20, bbz_last, atr_pctl, best_win, best_high_base))
    
         except Exception:
             pass
@@ -227,21 +241,40 @@ def main() -> None:
             time.sleep(1)
 
     # Sort: most compressed first (more negative bbz), then higher liquidity
-    results.sort(key=lambda x: (x[3], -x[2]))
-    top = results[:15]
+    # separar EXECUTAR e AGUARDAR
+exec_list = [r for r in results if r[1] == "EXECUTAR"]
+watch_list = [r for r in results if r[1] == "AGUARDAR"]
 
-    msg = [f"[{now}] Microcap scanner (Modo A - staging)"]
-    msg.append(f"Universo avaliado: {len(tickers)}")
-    msg.append("")
+# ordenar:
+# EXECUTAR por liquidez
+# AGUARDAR por compressão (bbz mais negativo) e depois liquidez
+exec_list.sort(key=lambda x: -x[3])
+watch_list.sort(key=lambda x: (x[4], -x[3]))
 
-    if not top:
-        msg.append("FLAT: nenhum candidato passou o filtro conservador de compressão.")
-    else:
-        msg.append("AGUARDAR (compressão extrema):")
-        for t, px, dv, bbz, atrp in top:
-            msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}")
+exec_top = exec_list[:5]
+watch_top = watch_list[:10]
 
-    tg_send("\n".join(msg))
+msg = [f"[{now}] Microcap scanner (Modo A)"]
+msg.append(f"Universo avaliado: {len(tickers)}")
+msg.append("")
+
+if not exec_top:
+    msg.append("EXECUTAR: (vazio)")
+else:
+    msg.append("EXECUTAR (gatilho EOD confirmado):")
+    for t, decision, px, dv, bbz, atrp, win, highb in exec_top:
+        msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | base={win}d | trigger>={highb:.2f}")
+
+msg.append("")
+
+if not watch_top:
+    msg.append("AGUARDAR: (vazio)")
+else:
+    msg.append("AGUARDAR (staging):")
+    for t, decision, px, dv, bbz, atrp, win, highb in watch_top:
+        msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f} | base={win}d | trigger>={highb:.2f}")
+
+tg_send("\n".join(msg))
 
 
 if __name__ == "__main__":
