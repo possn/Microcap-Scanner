@@ -182,29 +182,33 @@ def main() -> None:
                 base_max = 50     # ~10 semanas
 
                 base_pass = False
+                best_win = None
+                best_high_base = None
 
                 for win in range(base_min, base_max + 1, 5):
-                    base = df.iloc[-win:]
+                base = df.iloc[-win:]
 
-                    high_base = float(base["high"].max())
-                    low_base = float(base["low"].min())
+                high_base = float(base["high"].max())
+                low_base = float(base["low"].min())
 
-                    # drawdown interno da base
-                    dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
+                dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
 
-                    # comparar range da base vs range anterior (até 6 meses)
-                    prev = df.iloc[-(win + 120):-win]
-                    if len(prev) < 60:
-                        continue
+                prev = df.iloc[-(win + 120):-win]
+                if len(prev) < 60:
+                    continue
 
-                    prev_range = float(prev["high"].max() - prev["low"].min())
-                    base_range = float(high_base - low_base)
+                prev_range = float(prev["high"].max() - prev["low"].min())
+                base_range = float(high_base - low_base)
 
-                    contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
+                contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
 
-                    if dd <= 0.35 and contraction_ratio <= 0.50:
-                        base_pass = True
-                        break
+                if dd <= 0.35 and contraction_ratio <= 0.50:
+                    base_pass = True
+                    best_win = win
+                    best_high_base = high_base
+                    break
+
+  
 
                 if base_pass:
                     # -------- VOLUME DRY-UP FILTER --------
