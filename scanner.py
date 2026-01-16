@@ -154,9 +154,8 @@ def main():
                 continue
 
             px = float(df.iloc[-1]["close"])
-            dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
-
-            if px >= 1 and dv20 >= 3_000_000 and len(df) >= 260:
+            dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).
+        if px >= 1 and dv20 >= 3_000_000 and len(df) >= 260:
 
     # --- Compression metrics ---
     bb_width = compute_bb_width(df, n=20)
@@ -165,18 +164,15 @@ def main():
     atr = compute_atr(df, n=14)
     atr_pct = atr / df["close"]
 
-    # percentil do ATR% no último ano
     atr_last = float(atr_pct.iloc[-1])
     atr_pctl = float((atr_pct.iloc[-252:] <= atr_last).mean())
 
     bbz_last = float(bb_z.iloc[-1])
 
-    # Critério conservador de staging zone
     is_staging = (bbz_last < -1.8) and (atr_pctl < 0.10)
 
     if is_staging:
         results.append((t, px, dv20, bbz_last, atr_pctl))
-
         except:
             pass
 
