@@ -207,7 +207,14 @@ def main() -> None:
                         break
 
                 if base_pass:
-                    results.append((t, px, dv20, bbz_last, atr_pctl))
+                    # -------- VOLUME DRY-UP FILTER --------
+                    vol10 = float(df["volume"].iloc[-10:].mean())
+                    vol60 = float(df["volume"].iloc[-60:].mean())
+
+                    dry_up = (vol60 > 0) and (vol10 / vol60 < 0.60)
+
+                    if dry_up:
+                        results.append((t, px, dv20, bbz_last, atr_pctl))results.append((t, px, dv20, bbz_last, atr_pctl))
    
         except Exception:
             pass
