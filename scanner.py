@@ -14,7 +14,6 @@ def compute_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
     prev_close = df["close"].shift(1)
-
     tr = np.maximum(
         high - low,
         np.maximum((high - prev_close).abs(), (low - prev_close).abs())
@@ -64,7 +63,7 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
     # iShares holdings: skip metadata until header starts with "Ticker,"
     lines = text.splitlines()
     header_idx = None
-    for i, ln in enumerate(lines[:250]):
+    for i, ln in enumerate(lines[:300]):
         if ln.strip().lower().startswith("ticker,"):
             header_idx = i
             break
@@ -78,12 +77,14 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
 def get_universe(holdings_url: str) -> list[str]:
     df = fetch_csv(holdings_url, holdings=True)
 
-    # Be tolerant to minor column name variations
     cols = {c.lower(): c for c in df.columns}
-    if "ticker" not in cols and "symbol" not in cols:
+    if "ticker" in cols:
+        col = cols["ticker"]
+    elif "symbol" in cols:
+        col = cols["symbol"]
+    else:
         raise RuntimeError(f"Holdings CSV sem coluna Ticker/Symbol: {df.columns.tolist()}")
 
-    col = cols.get("ticker", cols.get("symbol"))
     tickers = df[col].astype(str).str.strip()
     tickers = tickers[tickers.str.len() > 0].unique().tolist()
     tickers = [t.replace(".", "-") for t in tickers]
@@ -117,7 +118,6 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date"]).sort_values("date")
 
-    # Merge cache + new, de-duplicate by date
     if cached is not None and len(cached) > 0:
         df = pd.concat([cached, df], ignore_index=True)
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
@@ -125,15 +125,12 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
         df = df.drop_duplicates(subset=["date"], keep="last")
 
     df = df.reset_index(drop=True)
-
-    # Save back to cache
     df.to_csv(path, index=False)
-
     return df
 
 
 # -----------------------------
-# Main (Mode A - Conservative staging)
+# Main (Mode A: staging + EOD trigger)
 # -----------------------------
 def main() -> None:
     holdings_url = os.environ["IWC_HOLDINGS_CSV_URL"]
@@ -141,132 +138,132 @@ def main() -> None:
     max_n = int(os.environ.get("MAX_TICKERS", "300"))
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
     tickers = get_universe(holdings_url)[:max_n]
-    results = []
+
+    results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
 
     for i, t in enumerate(tickers):
         try:
             df = fetch_ohlcv(t, ohlcv_fmt)
-
-            # Need enough history for percentiles/zscore
             if len(df) < 260:
                 continue
 
-            px = float(df.iloc[-1]["close"])
+            px = float(df["close"].iloc[-1])
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
 
-            # Liquidity + price filters
+            # liquidity
             if not (px >= 1.0 and dv20 >= 3_000_000):
                 continue
 
-            # --- Compression metrics ---
+            # compression metrics
             bb_width = compute_bb_width(df, n=20)
             bb_z = zscore(bb_width, window=120)
 
             atr = compute_atr(df, n=14)
             atr_pct = atr / df["close"]
 
+            bbz_last = float(bb_z.iloc[-1])
             atr_last = float(atr_pct.iloc[-1])
             atr_pctl = float((atr_pct.iloc[-252:] <= atr_last).mean())
-            bbz_last = float(bb_z.iloc[-1])
 
-            # Conservative staging gate
-                        # Conservative staging gate
-            is_staging = (bbz_last < -1.8) and (atr_pctl < 0.10)
+            if not (np.isfinite(bbz_last) and np.isfinite(atr_pctl)):
+                continue
 
-            if is_staging and np.isfinite(bbz_last) and np.isfinite(atr_pctl):
+            # staging gate
+            if not (bbz_last < -1.8 and atr_pctl < 0.10):
+                continue
 
-                                # -------- BASE QUALITY FILTER (4–10 weeks) --------
-                base_min = 20     # ~4 semanas
-                base_max = 50     # ~10 semanas
+            # base quality 4–10 weeks
+            base_min = 20
+            base_max = 50
+            base_pass = False
+            best_win = None
+            best_high = None
 
-                base_pass = False
-                best_win = None
-                best_high_base = None
+            for win in range(base_min, base_max + 1, 5):
+                base = df.iloc[-win:]
+                high_base = float(base["high"].max())
+                low_base = float(base["low"].min())
 
-                for win in range(base_min, base_max + 1, 5):
-                    base = df.iloc[-win:]
+                dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
 
-                    high_base = float(base["high"].max())
-                    low_base = float(base["low"].min())
+                prev = df.iloc[-(win + 120):-win]
+                if len(prev) < 60:
+                    continue
 
-                    dd = (high_base - low_base) / high_base if high_base > 0 else 1.0
+                prev_range = float(prev["high"].max() - prev["low"].min())
+                base_range = float(high_base - low_base)
+                contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
 
-                    prev = df.iloc[-(win + 120):-win]
-                    if len(prev) < 60:
-                        continue
+                if dd <= 0.35 and contraction_ratio <= 0.50:
+                    base_pass = True
+                    best_win = win
+                    best_high = high_base
+                    break
 
-                    prev_range = float(prev["high"].max() - prev["low"].min())
-                    base_range = float(high_base - low_base)
+            if not base_pass or best_high is None or best_win is None:
+                continue
 
-                    contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
+            # volume dry-up
+            vol10 = float(df["volume"].iloc[-10:].mean())
+            vol60 = float(df["volume"].iloc[-60:].mean())
+            if not (vol60 > 0 and (vol10 / vol60) < 0.60):
+                continue
 
-                    if dd <= 0.35 and contraction_ratio <= 0.50:
-                        base_pass = True
-                        best_win = win
-                        best_high_base = high_base
-                        break
- 
+            # EXECUTAR trigger (EOD verified)
+            close_today = float(df["close"].iloc[-1])
+            open_today = float(df["open"].iloc[-1])
+            close_prev = float(df["close"].iloc[-2])
+            vol_today = float(df["volume"].iloc[-1])
+            vol20 = float(df["volume"].iloc[-20:].mean())
 
-                    if dry_up and best_high_base is not None:
+            breakout = close_today > best_high
+            vol_confirm = (vol20 > 0) and (vol_today >= 1.5 * vol20)
+            no_exhaust_gap = open_today <= close_prev * 1.10
 
-    # -------- EXECUTAR trigger (EOD verified) --------
-    close_today = float(df["close"].iloc[-1])
-    open_today = float(df["open"].iloc[-1])
-    close_prev = float(df["close"].iloc[-2])
-    vol_today = float(df["volume"].iloc[-1])
-    vol20 = float(df["volume"].iloc[-20:].mean())
+            decision = "EXECUTAR" if (breakout and vol_confirm and no_exhaust_gap) else "AGUARDAR"
+            results.append((t, decision, px, dv20, bbz_last, atr_pctl, best_win, best_high))
 
-    breakout = close_today > best_high_base
-    vol_confirm = (vol20 > 0) and (vol_today >= 1.5 * vol20)
-    no_exhaust_gap = open_today <= close_prev * 1.10
-
-    decision = "EXECUTAR" if (breakout and vol_confirm and no_exhaust_gap) else "AGUARDAR"
-
-    results.append((t, decision, px, dv20, bbz_last, atr_pctl, best_win, best_high_
-   
         except Exception:
             pass
 
         if (i + 1) % 50 == 0:
             time.sleep(1)
 
-    # Sort: most compressed first (more negative bbz), then higher liquidity
-    # separar EXECUTAR e AGUARDAR
-exec_list = [r for r in results if r[1] == "EXECUTAR"]
-watch_list = [r for r in results if r[1] == "AGUARDAR"]
+    exec_list = [r for r in results if r[1] == "EXECUTAR"]
+    watch_list = [r for r in results if r[1] == "AGUARDAR"]
 
-# ordenar:
-# EXECUTAR por liquidez
-# AGUARDAR por compressão (bbz mais negativo) e depois liquidez
-exec_list.sort(key=lambda x: -x[3])
-watch_list.sort(key=lambda x: (x[4], -x[3]))
+    exec_list.sort(key=lambda x: -x[3])          # dv20 desc
+    watch_list.sort(key=lambda x: (x[4], -x[3])) # bbz asc (mais negativo), dv20 desc
 
-exec_top = exec_list[:5]
-watch_top = watch_list[:10]
+    exec_top = exec_list[:5]
+    watch_top = watch_list[:10]
 
-msg = [f"[{now}] Microcap scanner (Modo A)"]
-msg.append(f"Universo avaliado: {len(tickers)}")
-msg.append("")
+    msg = [f"[{now}] Microcap scanner (Modo A)"]
+    msg.append(f"Universo avaliado: {len(tickers)}")
+    msg.append("")
 
-if not exec_top:
-    msg.append("EXECUTAR: (vazio)")
-else:
-    msg.append("EXECUTAR (gatilho EOD confirmado):")
-    for t, decision, px, dv, bbz, atrp, win, highb in exec_top:
-        msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | base={win}d | trigger>={highb:.2f}")
+    if not exec_top:
+        msg.append("EXECUTAR: (vazio)")
+    else:
+        msg.append("EXECUTAR (gatilho EOD confirmado):")
+        for t, decision, px, dv, bbz, atrp, win, highb in exec_top:
+            msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | base={win}d | trigger>={highb:.2f}")
 
-msg.append("")
+    msg.append("")
 
-if not watch_top:
-    msg.append("AGUARDAR: (vazio)")
-else:
-    msg.append("AGUARDAR (staging):")
-    for t, decision, px, dv, bbz, atrp, win, highb in watch_top:
-        msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f} | base={win}d | trigger>={highb:.2f}")
+    if not watch_top:
+        msg.append("AGUARDAR: (vazio)")
+    else:
+        msg.append("AGUARDAR (staging):")
+        for t, decision, px, dv, bbz, atrp, win, highb in watch_top:
+            msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f} | base={win}d | trigger>={highb:.2f}")
 
-tg_send("\n".join(msg))
+    if not exec_top and not watch_top:
+        msg.append("")
+        msg.append("FLAT: nenhum candidato passou os filtros (compressão + base + dry-up).")
+
+    tg_send("\n".join(msg))
 
 
 if __name__ == "__main__":
