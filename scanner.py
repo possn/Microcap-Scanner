@@ -1,14 +1,8 @@
-import os
-import io
-import time
-import requests
+import os, io, time, requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 
-# =========================
-# ENV
-# =========================
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
@@ -17,33 +11,30 @@ IWM_URL = os.environ.get("IWM_HOLDINGS_CSV_URL", "")
 IJR_URL = os.environ.get("IJR_HOLDINGS_CSV_URL", "")
 
 OHLCV_FMT = os.environ.get("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d")
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "350"))
 
-# Small+micro proxy (verificável; sem market cap):
-# - corta mega caps pela liquidez e preço
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "600"))
+CANDIDATE_POOL = int(os.environ.get("CANDIDATE_POOL", "2600"))
+
+# micro/small proxy (verifiable)
 MIN_PX = float(os.environ.get("MIN_PX", "1.0"))
-MAX_PX = float(os.environ.get("MAX_PX", "35"))                 # << mais micro/small
-MIN_DV20 = float(os.environ.get("MIN_DV20", "3000000"))        # $3M/day
-MAX_DV20 = float(os.environ.get("MAX_DV20", "120000000"))      # $120M/day
-MIN_SV20 = float(os.environ.get("MIN_SV20", "600000"))         # 0.6M shares/day
+MAX_PX = float(os.environ.get("MAX_PX", "35"))
+MIN_DV20 = float(os.environ.get("MIN_DV20", "3000000"))
+MAX_DV20 = float(os.environ.get("MAX_DV20", "120000000"))
+MIN_SV20 = float(os.environ.get("MIN_SV20", "600000"))
 
-# Model thresholds (a produzir watchlist quase sempre)
 BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.7"))
 ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.45"))
 BASE_DD_MAX = float(os.environ.get("BASE_DD_MAX", "0.55"))
 CONTRACTION_MAX = float(os.environ.get("CONTRACTION_MAX", "0.85"))
 DRYUP_MAX = float(os.environ.get("DRYUP_MAX", "0.95"))
 
-# EXECUTAR strict (EOD)
-VOL_CONFIRM_MULT = float(os.environ.get("VOL_CONFIRM_MULT", "1.3"))  # ligeiramente menos duro
+VOL_CONFIRM_MULT = float(os.environ.get("VOL_CONFIRM_MULT", "1.3"))
 MAX_GAP_UP = float(os.environ.get("MAX_GAP_UP", "1.12"))
 
 SLEEP_EVERY = int(os.environ.get("SLEEP_EVERY", "60"))
 SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "1.0"))
 
-# =========================
-# Telegram
-# =========================
+
 def tg_send(text: str) -> None:
     if not TG_TOKEN or not TG_CHAT_ID:
         return
@@ -55,15 +46,14 @@ def tg_send(text: str) -> None:
     except Exception:
         pass
 
-# =========================
-# Indicators
-# =========================
+
 def compute_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high = df["high"]
     low = df["low"]
     prev_close = df["close"].shift(1)
     tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
     return tr.rolling(n).mean()
+
 
 def compute_bb_width(df: pd.DataFrame, n: int = 20) -> pd.Series:
     ma = df["close"].rolling(n).mean()
@@ -72,18 +62,18 @@ def compute_bb_width(df: pd.DataFrame, n: int = 20) -> pd.Series:
     lower = ma - 2 * std
     return (upper - lower) / ma
 
+
 def zscore(series: pd.Series, window: int = 120) -> pd.Series:
     mean = series.rolling(window).mean()
     std = series.rolling(window).std()
     return (series - mean) / std
 
-# =========================
-# HTTP + Holdings
-# =========================
+
 def fetch_text(url: str) -> str:
     r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
+
 
 def fetch_holdings_csv(url: str) -> pd.DataFrame:
     text = fetch_text(url)
@@ -101,6 +91,7 @@ def fetch_holdings_csv(url: str) -> pd.DataFrame:
     cleaned = "\n".join(lines[header_idx:])
     return pd.read_csv(io.StringIO(cleaned), engine="python", on_bad_lines="skip")
 
+
 def is_valid_ticker(t: str) -> bool:
     if not t:
         return False
@@ -114,6 +105,7 @@ def is_valid_ticker(t: str) -> bool:
     if any(ch in t for ch in [" ", "/", "\\"]):
         return False
     return True
+
 
 def get_universe_from_holdings(url: str) -> list[str]:
     if not url:
@@ -132,22 +124,45 @@ def get_universe_from_holdings(url: str) -> list[str]:
         t = t.replace(".", "-").upper()
         if is_valid_ticker(t):
             out.append(t)
-    return sorted(set(out))
+    return out
 
-# =========================
-# OHLCV (Stooq) + cache
-# =========================
+
 def ensure_dirs() -> None:
     os.makedirs("cache/ohlcv", exist_ok=True)
 
+
 def cache_path(t: str) -> str:
     return f"cache/ohlcv/{t}.csv"
+
 
 def build_ohlcv_url(ticker: str) -> str:
     sym = ticker.lower().replace("-", ".")
     if ".us" in OHLCV_FMT.lower():
         return OHLCV_FMT.format(symbol=sym)
     return OHLCV_FMT.format(symbol=f"{sym}.us")
+
+
+def read_cached_dv20(ticker: str) -> float | None:
+    path = cache_path(ticker)
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        df.columns = [c.strip().lower() for c in df.columns]
+        if not set(["close", "volume"]).issubset(df.columns):
+            return None
+        df["close"] = pd.to_numeric(df["close"], errors="coerce")
+        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
+        df = df.dropna(subset=["close", "volume"])
+        if len(df) < 30:
+            return None
+        dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
+        if not np.isfinite(dv20):
+            return None
+        return dv20
+    except Exception:
+        return None
+
 
 def fetch_ohlcv(ticker: str) -> pd.DataFrame:
     ensure_dirs()
@@ -190,13 +205,11 @@ def fetch_ohlcv(ticker: str) -> pd.DataFrame:
     df.to_csv(path, index=False)
     return df.reset_index(drop=True)
 
-# =========================
-# Base + dry-up
-# =========================
-def base_scan(df: pd.DataFrame) -> tuple[bool, int, float, float]:
-    # returns (ok, win, high_base, low_base)
+
+def base_scan(df: pd.DataFrame) -> tuple[bool, float, float, float, float]:
+    # returns (ok, high_base, low_base, dd, contr)
     if len(df) < 260:
-        return (False, 0, np.nan, np.nan)
+        return (False, np.nan, np.nan, np.nan, np.nan)
 
     best = None
     for win in [20, 25, 30, 35, 40, 50, 60, 70, 80]:
@@ -216,14 +229,16 @@ def base_scan(df: pd.DataFrame) -> tuple[bool, int, float, float]:
 
         if dd <= BASE_DD_MAX and contr <= CONTRACTION_MAX:
             score = (BASE_DD_MAX - dd) + (CONTRACTION_MAX - contr)
-            cand = (score, win, highb, lowb)
+            cand = (score, highb, lowb, dd, contr)
             if best is None or cand[0] > best[0]:
                 best = cand
 
     if best is None:
-        return (False, 0, np.nan, np.nan)
-    _, win, highb, lowb = best
-    return (True, int(win), float(highb), float(lowb))
+        return (False, np.nan, np.nan, np.nan, np.nan)
+
+    _, highb, lowb, dd, contr = best
+    return (True, float(highb), float(lowb), float(dd), float(contr))
+
 
 def dryup_ratio(df: pd.DataFrame) -> float:
     v10 = float(df["volume"].iloc[-10:].mean())
@@ -232,16 +247,40 @@ def dryup_ratio(df: pd.DataFrame) -> float:
         return np.nan
     return v10 / v60
 
-# =========================
-# Main
-# =========================
+
+def score_candidate(bbz: float, atrpctl: float, dd: float, contr: float, dry: float, dv20: float) -> float:
+    # more negative bbz = better; lower atrpctl = better; lower dd/contr/dry = better; some liquidity preference
+    # all inputs verifiable
+    s = 0.0
+    s += (-bbz) * 2.0
+    s += (0.6 - atrpctl) * 1.5
+    s += (BASE_DD_MAX - dd) * 1.2
+    s += (CONTRACTION_MAX - contr) * 1.0
+    s += (DRYUP_MAX - dry) * 0.8
+    s += min(dv20 / 50_000_000.0, 1.0) * 0.6
+    return float(s)
+
+
 def main() -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ensure_dirs()
 
-    # Universe
-    u = sorted(set(get_universe_from_holdings(IWC_URL) + get_universe_from_holdings(IWM_URL) + get_universe_from_holdings(IJR_URL)))
-    tickers = u[:MAX_TICKERS]
+    universe = list(set(get_universe_from_holdings(IWC_URL) + get_universe_from_holdings(IWM_URL) + get_universe_from_holdings(IJR_URL)))
+
+    # cache-first pre-ranking by dv20 (no network)
+    pool = universe[:min(CANDIDATE_POOL, len(universe))]
+    scored = []
+    unscored = []
+    for t in pool:
+        dv = read_cached_dv20(t)
+        if dv is None:
+            unscored.append(t)
+        else:
+            scored.append((t, dv))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    ordered = [t for t, _ in scored] + unscored
+    tickers = ordered[:MAX_TICKERS]
 
     hits_limited = False
     no_data = 0
@@ -250,17 +289,14 @@ def main() -> None:
     near = []
     execs = []
 
-    hist_ok = 0
-    liq_ok = 0
-    comp_ok = 0
-    base_ok = 0
-    dry_ok = 0
+    hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
 
     for i, t in enumerate(tickers):
         if hits_limited:
             break
         try:
             df = fetch_ohlcv(t)
+
             for c in ["open", "high", "low", "close", "volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
@@ -296,32 +332,33 @@ def main() -> None:
                 continue
             comp_ok += 1
 
-            ok, win, highb, lowb = base_scan(df)
+            ok, trig, lowb, dd, contr = base_scan(df)
             if not ok:
-                near.append((t, px, dv20, bbz_last, atr_pctl, "BASE"))
+                near.append((0.0, t, px, dv20, bbz_last, "BASE"))
                 continue
             base_ok += 1
 
-            dr = dryup_ratio(df)
-            if not np.isfinite(dr) or dr >= DRYUP_MAX:
-                near.append((t, px, dv20, bbz_last, atr_pctl, "DRY"))
+            dry = dryup_ratio(df)
+            if not np.isfinite(dry) or dry >= DRYUP_MAX:
+                near.append((0.0, t, px, dv20, bbz_last, "DRY"))
                 continue
             dry_ok += 1
 
-            # EXECUTAR (EOD confirmed)
+            stop = lowb * 0.99
+
             close_today = float(df["close"].iloc[-1])
             open_today = float(df["open"].iloc[-1])
             close_prev = float(df["close"].iloc[-2])
             vol_today = float(df["volume"].iloc[-1])
             vol20 = float(df["volume"].iloc[-20:].mean())
 
-            breakout = close_today > highb
+            breakout = close_today > trig
             vol_confirm = (vol20 > 0) and (vol_today >= VOL_CONFIRM_MULT * vol20)
             no_big_gap = (close_prev > 0) and (open_today <= close_prev * MAX_GAP_UP)
 
-            stop = lowb * 0.99
+            sc = score_candidate(bbz_last, atr_pctl, dd, contr, dry, dv20)
+            item = (sc, t, px, dv20, bbz_last, trig, stop)
 
-            item = (t, px, dv20, bbz_last, atr_pctl, highb, stop)
             if breakout and vol_confirm and no_big_gap:
                 execs.append(item)
             else:
@@ -338,23 +375,23 @@ def main() -> None:
         if (i + 1) % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SECONDS)
 
-    # Rank: strongest compression then liquidity
-    execs.sort(key=lambda x: (x[3], -x[2]))
-    watch.sort(key=lambda x: (x[3], -x[2]))
-    near.sort(key=lambda x: (x[3], -x[2]))
+    # Rank by score desc (NOT alphabetical)
+    execs.sort(key=lambda x: x[0], reverse=True)
+    watch.sort(key=lambda x: x[0], reverse=True)
+    near.sort(key=lambda x: (x[0], -x[3]), reverse=True)
 
     execs = execs[:8]
     watch = watch[:10]
     near = near[:10]
 
-    msg = [f"[{now}] Microcap scanner (LITE)"]
-    msg.append(f"Cap: {len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | watch={len(watch)} exec={len(execs)} | nodata={no_data}")
+    msg = [f"[{now}] ### V4_RUNNING ### Microcap scanner (RANKED)"]
+    msg.append(f"Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | watch={len(watch)} exec={len(execs)} | nodata={no_data}")
     msg.append("")
 
     if execs:
         msg.append("EXECUTAR (EOD):")
-        for t, px, dv20, bbz, atrp, trig, stop in execs:
-            msg.append(f"- {t} | {px:.2f} | dv20={dv20/1e6:.1f}M | trig>={trig:.2f} | stop~{stop:.2f}")
+        for sc, t, px, dv20, bbz, trig, stop in execs:
+            msg.append(f"- {t} | score={sc:.2f} | {px:.2f} | dv20={dv20/1e6:.1f}M | BBz={bbz:.2f} | trig>={trig:.2f} | stop~{stop:.2f}")
         msg.append("")
     else:
         msg.append("EXECUTAR: (vazio)")
@@ -362,8 +399,8 @@ def main() -> None:
 
     if watch:
         msg.append("AGUARDAR (TOP 10):")
-        for t, px, dv20, bbz, atrp, trig, stop in watch:
-            msg.append(f"- {t} | {px:.2f} | dv20={dv20/1e6:.1f}M | trig>={trig:.2f} | stop~{stop:.2f}")
+        for sc, t, px, dv20, bbz, trig, stop in watch:
+            msg.append(f"- {t} | score={sc:.2f} | {px:.2f} | dv20={dv20/1e6:.1f}M | BBz={bbz:.2f} | trig>={trig:.2f} | stop~{stop:.2f}")
         msg.append("")
     else:
         msg.append("AGUARDAR: (vazio)")
@@ -371,12 +408,13 @@ def main() -> None:
 
     if near:
         msg.append("QUASE (TOP 10):")
-        for t, px, dv20, bbz, atrp, reason in near:
-            msg.append(f"- {t} | {reason} | {px:.2f} | dv20={dv20/1e6:.1f}M")
+        for sc, t, px, dv20, bbz, reason in near:
+            msg.append(f"- {t} | {reason} | {px:.2f} | dv20={dv20/1e6:.1f}M | BBz={bbz:.2f}")
     else:
         msg.append("QUASE: (vazio)")
 
     tg_send("\n".join(msg))
+
 
 if __name__ == "__main__":
     main()
