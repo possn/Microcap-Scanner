@@ -35,6 +35,8 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           IWC_HOLDINGS_CSV_URL: ${{ secrets.IWC_HOLDINGS_CSV_URL }}
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
-          MAX_TICKERS: "300"
+          IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
+          VTWO_HOLDINGS_CSV_URL: ${{ secrets.VTWO_HOLDINGS_CSV_URL }}
+          MAX_TICKERS: "600"
         run: |
           python scanner.py
