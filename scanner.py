@@ -249,7 +249,7 @@ def main() -> None:
     exec_top = exec_list[:5]
     watch_top = watch_list[:10]
 
-    msg = [f"[{now}] Microcap scanner (Modo A)"]
+    msg = [f"[{now}] Microcap scanner (Modo A) [BUILD=IJR_UNIVERSE_V1]"]
     msg.append(f"Universo combinado bruto: {len(set(u1 + u2 + u3))}")
     msg.append(f"Universo avaliado (cap {max_n}): {len(tickers)}")
     msg.append("")
