@@ -150,6 +150,7 @@ def main() -> None:
     tickers = list(set(u1 + u2 + u3))[:max_n]
 
     results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
+    pipeline_pass = 0
     # Funnel counters
     c_total = 0
     c_hist = 0
@@ -261,6 +262,8 @@ def main() -> None:
     msg.append(f"Universo avaliado (cap {max_n}): {len(tickers)}")
     msg.append("")
     msg.append(f"FUNIL: total={c_total} | hist={c_hist} | liq={c_liq} | comp={c_comp} | base={c_base} | dry={c_dry}")
+    msg.append("")
+    msg.append(f"PIPELINE_OK: {len(results)}")
     msg.append("")
 
     if not exec_top:
