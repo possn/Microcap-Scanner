@@ -133,7 +133,7 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
 # Main (Mode A: staging + EOD trigger)
 # -----------------------------
 def main() -> None:
-    iwc_url = os.environ["IWC_HOLDINGS_CSV_URL"]
+iwc_url = os.environ["IWC_HOLDINGS_CSV_URL"]
 iwm_url = os.environ["IWM_HOLDINGS_CSV_URL"]
 vtwo_url = os.environ["VTWO_HOLDINGS_CSV_URL"]
 
@@ -144,7 +144,8 @@ u3 = get_universe(vtwo_url)
 tickers = list(set(u1 + u2 + u3))
 tickers = tickers[:max_n]
 
-    results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
+results = [] 
+# (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
 
     for i, t in enumerate(tickers):
         try:
