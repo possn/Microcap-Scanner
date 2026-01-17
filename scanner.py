@@ -1,8 +1,16 @@
-# scanner.py
+# scanner.py  (V3)
 # Daily US small+microcap pre-breakout scanner (free/public data, no paid APIs)
-# Universe: iShares holdings CSV (IWC + IWM + IJR)
-# Prices/Volume: Stooq EOD CSV (per symbol) via OHLCV_URL_FMT
-# Output: Telegram message with EXECUTAR / AGUARDAR / QUASE + diagnostics
+# Universe: iShares holdings CSV (IWC + IWM + IJR) via secrets
+# Prices/Volume: Stooq EOD CSV via OHLCV_URL_FMT (handles .us suffix correctly)
+#
+# V3 improvements:
+# - Rate-limit resilience: detects "daily hits limit" and stops further OHLCV calls early
+# - Optional caps to approximate small+micro without market-cap (verifiable proxies):
+#     MAX_PX, MAX_DV20 (set as GitHub Actions variables)
+# - Prints base LOW + suggested stop (invalidation)
+# - Always shows QUASE + DIAG
+#
+# Copy/paste this whole file and commit.
 
 import os
 import io
@@ -23,28 +31,38 @@ IWC_URL = os.environ.get("IWC_HOLDINGS_CSV_URL", "")
 IWM_URL = os.environ.get("IWM_HOLDINGS_CSV_URL", "")
 IJR_URL = os.environ.get("IJR_HOLDINGS_CSV_URL", "")
 
-# Expected examples:
-#   "https://stooq.com/q/d/l/?s={symbol}.us&i=d"
-#   "https://stooq.com/q/d/l/?s={symbol}&i=d"
+# Examples:
+#   https://stooq.com/q/d/l/?s={symbol}.us&i=d
+#   https://stooq.com/q/d/l/?s={symbol}&i=d
 OHLCV_FMT = os.environ.get("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d")
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "600"))
+
+MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "350"))  # reduce Stooq limits by default
 
 # Liquidity filters
 MIN_PX = float(os.environ.get("MIN_PX", "1.0"))
 MIN_DV20 = float(os.environ.get("MIN_DV20", "2000000"))   # $2M/day avg dollar vol
 MIN_SV20 = float(os.environ.get("MIN_SV20", "500000"))    # 0.5M shares/day avg
 
-# Thresholds tuned to produce candidates
+# Optional caps (proxy to exclude large caps; still fully verifiable)
+MAX_PX = float(os.environ.get("MAX_PX", "80"))
+MAX_DV20 = float(os.environ.get("MAX_DV20", "300000000"))  # $300M/day
+
+# Compression thresholds
 BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.7"))
 ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.45"))
 
+# Base + dry-up thresholds
 BASE_DD_MAX = float(os.environ.get("BASE_DD_MAX", "0.55"))
 CONTRACTION_MAX = float(os.environ.get("CONTRACTION_MAX", "0.85"))
-
 DRYUP_MAX = float(os.environ.get("DRYUP_MAX", "0.95"))
 
-VOL_CONFIRM_MULT = float(os.environ.get("VOL_CONFIRM_MULT", "1.5"))
+# EXECUTAR trigger strictness
+VOL_CONFIRM_MULT = float(os.environ.get("VOL_CONFIRM_MULT", "1.5"))  # set 1.2 for more signals
 MAX_GAP_UP = float(os.environ.get("MAX_GAP_UP", "1.12"))
+
+# Pacing/backoff
+SLEEP_EVERY = int(os.environ.get("SLEEP_EVERY", "60"))
+SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "1.0"))
 
 
 # -----------------------------
@@ -124,7 +142,6 @@ def is_valid_ticker(t: str) -> bool:
         return False
     if len(t) < 2:
         return False
-    # must contain at least one letter; allow digits; allow '-' (converted from '.'), but not only punctuation
     if not any(ch.isalpha() for ch in t):
         return False
     if any(ch in t for ch in [" ", "/", "\\"]):
@@ -165,20 +182,12 @@ def ohlcv_cache_path(ticker: str) -> str:
 
 
 def build_ohlcv_url(ticker: str) -> str:
-    """
-    Prevent .us.us errors:
-    - If OHLCV_FMT already contains ".us" after {symbol}, we pass symbol WITHOUT ".us"
-    - Otherwise we pass symbol WITH ".us"
-    """
-    sym = ticker.lower().replace("-", ".")  # stooq prefers dot for class shares
+    # Prevent .us.us errors
+    sym = ticker.lower().replace("-", ".")
     fmt_lower = OHLCV_FMT.lower()
-
-    # crude but robust: if the format string already mentions ".us" anywhere, assume it adds suffix itself
-    # (covers "...s={symbol}.us&i=d")
     if ".us" in fmt_lower:
         return OHLCV_FMT.format(symbol=sym)
-    else:
-        return OHLCV_FMT.format(symbol=f"{sym}.us")
+    return OHLCV_FMT.format(symbol=f"{sym}.us")
 
 
 def fetch_ohlcv_stooq(ticker: str) -> pd.DataFrame:
@@ -194,17 +203,22 @@ def fetch_ohlcv_stooq(ticker: str) -> pd.DataFrame:
 
     url = build_ohlcv_url(ticker)
     text = fetch_text(url).strip()
+    low = text.lower()
 
-    # Stooq returns a one-line "No data" payload sometimes
-    if text.lower().startswith("no data") or text.lower() == "no data":
+    if low.startswith("no data") or low == "no data":
         raise RuntimeError("NO_DATA")
+    if "exceeded the daily hits limit" in low:
+        raise RuntimeError("HITS_LIMIT")
 
     df = pd.read_csv(io.StringIO(text))
     df.columns = [c.strip().lower() for c in df.columns]
 
-    # If Stooq returns weird single-column content, columns may be ['no data']
-    if len(df.columns) == 1 and "no data" in df.columns[0].lower():
-        raise RuntimeError("NO_DATA")
+    if len(df.columns) == 1:
+        h = df.columns[0].lower()
+        if "exceeded the daily hits limit" in h:
+            raise RuntimeError("HITS_LIMIT")
+        if "no data" in h:
+            raise RuntimeError("NO_DATA")
 
     need = ["date", "open", "high", "low", "close", "volume"]
     if not all(c in df.columns for c in need):
@@ -282,6 +296,10 @@ def failed_breakout_recent(df: pd.DataFrame, level: float, lookback: int = 30) -
     return False
 
 
+def suggested_stop(low_base: float) -> float:
+    return float(low_base * 0.99)
+
+
 # -----------------------------
 # Main
 # -----------------------------
@@ -290,6 +308,7 @@ def main() -> None:
     ensure_dirs()
 
     errors: list[str] = []
+    hits_limited = False
 
     # Universe
     u1 = []
@@ -311,23 +330,25 @@ def main() -> None:
     universe_all = sorted(set(u1 + u2 + u3))
     tickers = universe_all[:MAX_TICKERS]
 
-    # Diagnostics counters
+    # Diagnostics
     n_hist_ok = 0
     n_liq_ok = 0
     n_comp_ok = 0
     n_base_ok = 0
     n_dry_ok = 0
     n_no_data = 0
+    n_hits_limit = 0
 
     results_exec = []
     results_watch = []
-    results_near = []  # passed comp+liq but failed base/dry
+    results_near = []
 
     for i, t in enumerate(tickers):
+        if hits_limited:
+            break
         try:
             df = fetch_ohlcv_stooq(t)
 
-            # numeric
             for c in ["open", "high", "low", "close", "volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
@@ -340,11 +361,12 @@ def main() -> None:
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
             sv20 = float(df["volume"].iloc[-20:].mean())
 
+            if px > MAX_PX or dv20 > MAX_DV20:
+                continue
             if px < MIN_PX or dv20 < MIN_DV20 or sv20 < MIN_SV20:
                 continue
             n_liq_ok += 1
 
-            # compression
             bbw = compute_bb_width(df, n=20)
             bbz = zscore(bbw, window=120)
             atrp = compute_atr(df, n=14) / df["close"]
@@ -359,26 +381,22 @@ def main() -> None:
 
             if (not np.isfinite(bbz_last)) or (not np.isfinite(atr_pctl)):
                 continue
-
             if not (bbz_last < BBZ_GATE and atr_pctl < ATRPCTL_GATE):
                 continue
             n_comp_ok += 1
 
-            # base
             base_ok, win, highb, lowb, dd, contr = base_scan(df)
             if not base_ok:
                 results_near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_BASE"))
                 continue
             n_base_ok += 1
 
-            # dry-up
             dry_ok, vratio = dryup_ok(df)
             if not dry_ok:
                 results_near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_DRYUP"))
                 continue
             n_dry_ok += 1
 
-            # EXECUTAR trigger strict
             close_today = float(df["close"].iloc[-1])
             open_today = float(df["open"].iloc[-1])
             close_prev = float(df["close"].iloc[-2])
@@ -388,14 +406,14 @@ def main() -> None:
             breakout = close_today > highb
             vol_confirm = (vol20 > 0) and (vol_today >= VOL_CONFIRM_MULT * vol20)
             no_big_gap = (close_prev > 0) and (open_today <= close_prev * MAX_GAP_UP)
-
             fb = failed_breakout_recent(df, level=highb, lookback=30)
 
             decision = "AGUARDAR"
             if breakout and vol_confirm and no_big_gap and (not fb):
                 decision = "EXECUTAR"
 
-            item = (t, decision, px, dv20, bbz_last, atr_pctl, win, highb, dd, contr, vratio)
+            stp = suggested_stop(lowb)
+            item = (t, decision, px, dv20, bbz_last, atr_pctl, win, highb, lowb, stp, dd, contr, vratio)
             if decision == "EXECUTAR":
                 results_exec.append(item)
             else:
@@ -405,31 +423,40 @@ def main() -> None:
             s = str(e)
             if "NO_DATA" in s:
                 n_no_data += 1
+            elif "HITS_LIMIT" in s:
+                n_hits_limit += 1
+                hits_limited = True
             else:
                 if len(errors) < 8:
                     errors.append(f"{t}: {s[:140]}")
             pass
 
-        if (i + 1) % 60 == 0:
-            time.sleep(1)
+        if (i + 1) % SLEEP_EVERY == 0:
+            time.sleep(SLEEP_SECONDS)
 
-    # rank
-    results_exec.sort(key=lambda x: (-x[3], x[4]))     # dv20 desc, bbz more negative better
-    results_watch.sort(key=lambda x: (x[4], -x[3]))    # bbz asc (more negative), dv20 desc
-    results_near.sort(key=lambda x: (x[3], -x[2]))     # bbz asc, dv desc
+    results_exec.sort(key=lambda x: (-x[3], x[4]))
+    results_watch.sort(key=lambda x: (x[4], -x[3]))
+    results_near.sort(key=lambda x: (x[3], -x[2]))
 
-    exec_top = results_exec[:5]
+    exec_top = results_exec[:6]
     watch_top = results_watch[:12]
     near_top = results_near[:12]
 
-    msg = [f"[{now}] Microcap scanner (Modo A) [BUILD=FIXED_V2_STOOQ_URL]"]
+    msg = [f"[{now}] Microcap scanner (Modo A) [BUILD=V3_RATE_LIMIT_SMALLCAP_PROXY]"]
     msg.append(f"Universo combinado bruto: {len(universe_all)}")
     msg.append(f"Universo avaliado (cap {MAX_TICKERS}): {len(tickers)}")
     msg.append("")
     msg.append(
-        f"DIAG: hist_ok={n_hist_ok} | liq_ok={n_liq_ok} | comp_ok={n_comp_ok} | base_ok={n_base_ok} | dry_ok={n_dry_ok} | no_data={n_no_data} | exec={len(results_exec)} | watch={len(results_watch)}"
+        "DIAG: "
+        f"hist_ok={n_hist_ok} | liq_ok={n_liq_ok} | comp_ok={n_comp_ok} | base_ok={n_base_ok} | dry_ok={n_dry_ok} | "
+        f"no_data={n_no_data} | hits_limit={n_hits_limit} | exec={len(results_exec)} | watch={len(results_watch)}"
     )
+    msg.append(f"CAPS: MAX_PX={MAX_PX:.0f} | MAX_DV20=${MAX_DV20/1e6:.0f}M | MIN_DV20=${MIN_DV20/1e6:.1f}M")
     msg.append("")
+
+    if hits_limited:
+        msg.append("NOTA: Stooq atingiu limite diário; run terminou cedo.")
+        msg.append("")
 
     if errors:
         msg.append("ERROS (top):")
@@ -441,16 +468,19 @@ def main() -> None:
         msg.append("EXECUTAR: (vazio)")
     else:
         msg.append("EXECUTAR (gatilho EOD confirmado):")
-        for t, decision, px, dv, bbz, atrp, win, highb, dd, contr, vratio in exec_top:
-            msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | base={win}d dd={dd:.2f} | trigger>={highb:.2f}")
+        for t, _, px, dv, bbz, atrp, win, highb, lowb, stp, dd, contr, vratio in exec_top:
+            msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | trigger>={highb:.2f} | stop~{stp:.2f}")
 
     msg.append("")
     if not watch_top:
         msg.append("AGUARDAR: (vazio)")
     else:
         msg.append("AGUARDAR (pré-breakout):")
-        for t, decision, px, dv, bbz, atrp, win, highb, dd, contr, vratio in watch_top:
-            msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} ATRpctl={atrp:.2f} | base={win}d dd={dd:.2f} | trigger>={highb:.2f}")
+        for t, _, px, dv, bbz, atrp, win, highb, lowb, stp, dd, contr, vratio in watch_top:
+            msg.append(
+                f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} ATRpctl={atrp:.2f} | "
+                f"trigger>={highb:.2f} | stop~{stp:.2f}"
+            )
 
     msg.append("")
     if near_top:
@@ -459,10 +489,6 @@ def main() -> None:
             msg.append(f"- {t} | {reason} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} ATRpctl={atrp:.2f}")
     else:
         msg.append("QUASE: (vazio)")
-
-    if not exec_top and not watch_top:
-        msg.append("")
-        msg.append("FLAT: nenhum candidato final hoje (ver DIAG; se no_data for alto, é URL/símbolos/endpoint).")
 
     tg_send("\n".join(msg))
 
