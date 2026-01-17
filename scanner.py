@@ -178,7 +178,7 @@ def main() -> None:
                 continue
 
             # Relaxed but still conservative
-            if not (bbz_last < -1.2 and atr_pctl < 0.25):
+            if not (bbz_last < -1.0 and atr_pctl < 0.3):
                 continue
 
             # Base 4–10 weeks
@@ -216,7 +216,7 @@ def main() -> None:
             # Dry-up (relaxed)
             vol10 = float(df["volume"].iloc[-10:].mean())
             vol60 = float(df["volume"].iloc[-60:].mean())
-            if not (vol60 > 0 and (vol10 / vol60) < 0.70):
+            if not (vol60 > 0 and (vol10 / vol60) < 0.85):
                 near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_DRYUP"))
                 continue
 
