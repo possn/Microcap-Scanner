@@ -143,7 +143,7 @@ def main() -> None:
     # Universe URLs from env (GitHub Actions secrets mapped in workflow env:)
     iwc_url = os.environ["IWC_HOLDINGS_CSV_URL"]
     iwm_url = os.environ["IWM_HOLDINGS_CSV_URL"]
-    vtwo_url = os.environ["VTWO_HOLDINGS_CSV_URL"]
+    ijr_url = os.environ["IJR_HOLDINGS_CSV_URL"]
 
     ohlcv_fmt = os.environ["OHLCV_URL_FMT"]
     max_n = int(os.environ.get("MAX_TICKERS", "600"))
@@ -153,7 +153,7 @@ def main() -> None:
     # Build combined universe (dedupe)
     u1 = get_universe(iwc_url)
     u2 = get_universe(iwm_url)
-    u3 = get_universe(vtwo_url)
+    u3 = get_universe(ijr_url)
     tickers = list(set(u1 + u2 + u3))[:max_n]
 
     results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
