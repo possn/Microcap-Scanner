@@ -203,7 +203,7 @@ def main() -> None:
                 base_range = float(high_base - low_base)
                 contraction_ratio = (base_range / prev_range) if prev_range > 0 else 1.0
 
-                if dd <= 0.35 and contraction_ratio <= 0.50:
+            if dd <= 0.45 and contraction_ratio <= 0.65:
                     base_pass = True
                     best_win = win
                     best_high = high_base
