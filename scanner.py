@@ -161,7 +161,7 @@ def main() -> None:
             px = float(df["close"].iloc[-1])
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
 
-            if not (px >= 1.0 and dv20 >= 3_000_000):
+            if not (px >= 1.0 and dv20 >= 2_000_000):
                 continue
 
             bb_width = compute_bb_width(df, n=20)
