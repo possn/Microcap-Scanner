@@ -223,7 +223,7 @@ def main() -> None:
             # volume dry-up
             vol10 = float(df["volume"].iloc[-10:].mean())
             vol60 = float(df["volume"].iloc[-60:].mean())
-            if not (vol60 > 0 and (vol10 / vol60) < 0.60):
+            if not (vol60 > 0 and (vol10 / vol60) < 0.70):
                 continue
 
             # EXECUTAR trigger (EOD verified)
