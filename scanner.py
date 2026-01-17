@@ -224,7 +224,7 @@ def main() -> None:
 
     decision = "EXECUTAR" if (breakout and vol_confirm and no_exhaust_gap) else "AGUARDAR"
 
-    results.append((t, decision, px, dv20, bbz_last, atr_pctl, best_win, best_high_base))
+    results.append((t, decision, px, dv20, bbz_last, atr_pctl, best_win, best_high_
    
         except Exception:
             pass
