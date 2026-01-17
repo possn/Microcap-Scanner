@@ -261,6 +261,7 @@ def main() -> None:
     msg.append(f"Universo combinado bruto: {len(set(u1 + u2 + u3))}")
     msg.append(f"Universo avaliado (cap {max_n}): {len(tickers)}")
     msg.append("")
+    c_total = len(tickers)
     msg.append(f"FUNIL: total={c_total} | hist={c_hist} | liq={c_liq} | comp={c_comp} | base={c_base} | dry={c_dry}")
     msg.append("")
     msg.append(f"PIPELINE_OK: {len(results)}")
