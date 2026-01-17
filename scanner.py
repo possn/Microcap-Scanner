@@ -50,7 +50,7 @@ def tg_send(text: str) -> None:
 
 
 # -----------------------------
-# Data fetchers
+# CSV fetchers
 # -----------------------------
 def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
     r = requests.get(url, timeout=60)
@@ -63,12 +63,16 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
     # iShares holdings: skip metadata until header starts with "Ticker,"
     lines = text.splitlines()
     header_idx = None
-    for i, ln in enumerate(lines[:300]):
+    for i, ln in enumerate(lines[:400]):
         if ln.strip().lower().startswith("ticker,"):
             header_idx = i
             break
     if header_idx is None:
-        raise RuntimeError("Não encontrei o header 'Ticker,' no holdings CSV.")
+        # Some providers might already be clean CSV; try normal parse as fallback
+        try:
+            return pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip")
+        except Exception as e:
+            raise RuntimeError("Não encontrei o header 'Ticker,' no holdings CSV.") from e
 
     cleaned = "\n".join(lines[header_idx:])
     return pd.read_csv(io.StringIO(cleaned), engine="python", on_bad_lines="skip")
@@ -77,6 +81,7 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
 def get_universe(holdings_url: str) -> list[str]:
     df = fetch_csv(holdings_url, holdings=True)
 
+    # Accept Ticker or Symbol columns (case-insensitive)
     cols = {c.lower(): c for c in df.columns}
     if "ticker" in cols:
         col = cols["ticker"]
@@ -87,6 +92,8 @@ def get_universe(holdings_url: str) -> list[str]:
 
     tickers = df[col].astype(str).str.strip()
     tickers = tickers[tickers.str.len() > 0].unique().tolist()
+
+    # Stooq uses '-' for US tickers with '.' sometimes; normalize
     tickers = [t.replace(".", "-") for t in tickers]
     return tickers
 
@@ -105,7 +112,7 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
             cached = None
 
     url = fmt.format(symbol=ticker.lower())
-    df = fetch_csv(url)
+    df = fetch_csv(url, holdings=False)
 
     cols = {c.lower(): c for c in df.columns}
     need = ["date", "open", "high", "low", "close", "volume"]
@@ -133,19 +140,23 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
 # Main (Mode A: staging + EOD trigger)
 # -----------------------------
 def main() -> None:
-iwc_url = os.environ["IWC_HOLDINGS_CSV_URL"]
-iwm_url = os.environ["IWM_HOLDINGS_CSV_URL"]
-vtwo_url = os.environ["VTWO_HOLDINGS_CSV_URL"]
+    # Universe URLs from env (GitHub Actions secrets mapped in workflow env:)
+    iwc_url = os.environ["IWC_HOLDINGS_CSV_URL"]
+    iwm_url = os.environ["IWM_HOLDINGS_CSV_URL"]
+    vtwo_url = os.environ["VTWO_HOLDINGS_CSV_URL"]
 
-u1 = get_universe(iwc_url)
-u2 = get_universe(iwm_url)
-u3 = get_universe(vtwo_url)
+    ohlcv_fmt = os.environ["OHLCV_URL_FMT"]
+    max_n = int(os.environ.get("MAX_TICKERS", "600"))
 
-tickers = list(set(u1 + u2 + u3))
-tickers = tickers[:max_n]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-results = [] 
-# (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
+    # Build combined universe (dedupe)
+    u1 = get_universe(iwc_url)
+    u2 = get_universe(iwm_url)
+    u3 = get_universe(vtwo_url)
+    tickers = list(set(u1 + u2 + u3))[:max_n]
+
+    results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
 
     for i, t in enumerate(tickers):
         try:
@@ -239,13 +250,14 @@ results = []
     watch_list = [r for r in results if r[1] == "AGUARDAR"]
 
     exec_list.sort(key=lambda x: -x[3])          # dv20 desc
-    watch_list.sort(key=lambda x: (x[4], -x[3])) # bbz asc (mais negativo), dv20 desc
+    watch_list.sort(key=lambda x: (x[4], -x[3])) # bbz asc (more negative first), dv20 desc
 
     exec_top = exec_list[:5]
     watch_top = watch_list[:10]
 
     msg = [f"[{now}] Microcap scanner (Modo A)"]
-    msg.append(f"Universo avaliado: {len(tickers)}")
+    msg.append(f"Universo combinado bruto: {len(set(u1 + u2 + u3))}")
+    msg.append(f"Universo avaliado (cap {max_n}): {len(tickers)}")
     msg.append("")
 
     if not exec_top:
