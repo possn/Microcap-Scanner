@@ -219,14 +219,14 @@ def main() -> None:
                     break
 
             if not base_pass or best_high is None or best_win is None:
-            near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_BASE"))
+                near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_BASE"))
                 continue
 
             # volume dry-up
             vol10 = float(df["volume"].iloc[-10:].mean())
             vol60 = float(df["volume"].iloc[-60:].mean())
             if not (vol60 > 0 and (vol10 / vol60) < 0.70):
-            near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_DRYUP"))
+                near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_DRYUP"))
                 continue
 
             # EXECUTAR trigger (EOD verified)
