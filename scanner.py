@@ -157,7 +157,8 @@ def main() -> None:
     tickers = list(set(u1 + u2 + u3))[:max_n]
 
     results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
-
+    near = []  # candidatos que passaram compressão mas falharam base/dry-up
+   
     for i, t in enumerate(tickers):
         try:
             df = fetch_ohlcv(t, ohlcv_fmt)
@@ -218,12 +219,14 @@ def main() -> None:
                     break
 
             if not base_pass or best_high is None or best_win is None:
+            near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_BASE"))
                 continue
 
             # volume dry-up
             vol10 = float(df["volume"].iloc[-10:].mean())
             vol60 = float(df["volume"].iloc[-60:].mean())
             if not (vol60 > 0 and (vol10 / vol60) < 0.70):
+            near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_DRYUP"))
                 continue
 
             # EXECUTAR trigger (EOD verified)
@@ -275,7 +278,18 @@ def main() -> None:
         msg.append("AGUARDAR (staging):")
         for t, decision, px, dv, bbz, atrp, win, highb in watch_top:
             msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f} | base={win}d | trigger>={highb:.2f}")
+    # fallback: mostrar quase candidatos se nada passou tudo
+    if not exec_top and not watch_top and near:
+    near.sort(key=lambda x: (x[3], -x[2]))  # bbz mais negativo, depois liquidez
+    near_top = near[:10]
 
+    msg.append("")
+    msg.append("QUASE (passou compressão, falhou base/dry-up):")
+
+    for t, px, dv, bbz, atrp, reason in near_top:
+        msg.append(
+            f"- {t} | {reason} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}"
+        )
     if not exec_top and not watch_top:
         msg.append("")
         msg.append("FLAT: nenhum candidato passou os filtros (compressão + base + dry-up).")
