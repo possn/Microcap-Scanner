@@ -186,7 +186,7 @@ def main() -> None:
                 continue
 
             # staging gate
-            if not (bbz_last < -1.8 and atr_pctl < 0.10):
+            if not (bbz_last < -1.6 and atr_pctl < 0.15):
                 continue
 
             # base quality 4–10 weeks
