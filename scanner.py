@@ -60,7 +60,6 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
     if not holdings:
         return pd.read_csv(io.StringIO(text))
 
-    # iShares holdings: skip metadata until header starts with "Ticker,"
     lines = text.splitlines()
     header_idx = None
     for i, ln in enumerate(lines[:400]):
@@ -68,11 +67,10 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
             header_idx = i
             break
     if header_idx is None:
-        # Some providers might already be clean CSV; try normal parse as fallback
         try:
             return pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip")
         except Exception as e:
-            raise RuntimeError("Não encontrei o header 'Ticker,' no holdings CSV.") from e
+            raise RuntimeError("Não encontrei header holdings.") from e
 
     cleaned = "\n".join(lines[header_idx:])
     return pd.read_csv(io.StringIO(cleaned), engine="python", on_bad_lines="skip")
@@ -80,20 +78,16 @@ def fetch_csv(url: str, holdings: bool = False) -> pd.DataFrame:
 
 def get_universe(holdings_url: str) -> list[str]:
     df = fetch_csv(holdings_url, holdings=True)
-
-    # Accept Ticker or Symbol columns (case-insensitive)
     cols = {c.lower(): c for c in df.columns}
     if "ticker" in cols:
         col = cols["ticker"]
     elif "symbol" in cols:
         col = cols["symbol"]
     else:
-        raise RuntimeError(f"Holdings CSV sem coluna Ticker/Symbol: {df.columns.tolist()}")
+        raise RuntimeError(f"Holdings sem Ticker/Symbol: {df.columns.tolist()}")
 
     tickers = df[col].astype(str).str.strip()
     tickers = tickers[tickers.str.len() > 0].unique().tolist()
-
-    # Stooq uses '-' for US tickers with '.' sometimes; normalize
     tickers = [t.replace(".", "-") for t in tickers]
     return tickers
 
@@ -117,7 +111,7 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
     cols = {c.lower(): c for c in df.columns}
     need = ["date", "open", "high", "low", "close", "volume"]
     if not all(k in cols for k in need):
-        raise RuntimeError(f"{ticker}: formato OHLCV inválido, colunas={df.columns.tolist()}")
+        raise RuntimeError(f"{ticker}: formato OHLCV inválido")
 
     df = df[[cols["date"], cols["open"], cols["high"], cols["low"], cols["close"], cols["volume"]]].copy()
     df.columns = ["date", "open", "high", "low", "close", "volume"]
@@ -137,10 +131,9 @@ def fetch_ohlcv(ticker: str, fmt: str) -> pd.DataFrame:
 
 
 # -----------------------------
-# Main (Mode A: staging + EOD trigger)
+# Main
 # -----------------------------
 def main() -> None:
-    # Universe URLs from env (GitHub Actions secrets mapped in workflow env:)
     iwc_url = os.environ["IWC_HOLDINGS_CSV_URL"]
     iwm_url = os.environ["IWM_HOLDINGS_CSV_URL"]
     ijr_url = os.environ["IJR_HOLDINGS_CSV_URL"]
@@ -150,15 +143,15 @@ def main() -> None:
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    # Build combined universe (dedupe)
     u1 = get_universe(iwc_url)
     u2 = get_universe(iwm_url)
     u3 = get_universe(ijr_url)
+
     tickers = list(set(u1 + u2 + u3))[:max_n]
 
     results = []  # (ticker, decision, px, dv20, bbz, atr_pctl, win, high_base)
-    near = []  # candidatos que passaram compressão mas falharam base/dry-up
-   
+    near = []     # (ticker, px, dv20, bbz, atr_pctl, reason)
+
     for i, t in enumerate(tickers):
         try:
             df = fetch_ohlcv(t, ohlcv_fmt)
@@ -168,11 +161,9 @@ def main() -> None:
             px = float(df["close"].iloc[-1])
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
 
-            # liquidity
             if not (px >= 1.0 and dv20 >= 3_000_000):
                 continue
 
-            # compression metrics
             bb_width = compute_bb_width(df, n=20)
             bb_z = zscore(bb_width, window=120)
 
@@ -186,11 +177,11 @@ def main() -> None:
             if not (np.isfinite(bbz_last) and np.isfinite(atr_pctl)):
                 continue
 
-            # staging gate
+            # Relaxed but still conservative
             if not (bbz_last < -1.6 and atr_pctl < 0.15):
                 continue
 
-            # base quality 4–10 weeks
+            # Base 4–10 weeks
             base_min = 20
             base_max = 50
             base_pass = False
@@ -222,14 +213,14 @@ def main() -> None:
                 near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_BASE"))
                 continue
 
-            # volume dry-up
+            # Dry-up (relaxed)
             vol10 = float(df["volume"].iloc[-10:].mean())
             vol60 = float(df["volume"].iloc[-60:].mean())
             if not (vol60 > 0 and (vol10 / vol60) < 0.70):
                 near.append((t, px, dv20, bbz_last, atr_pctl, "FAIL_DRYUP"))
                 continue
 
-            # EXECUTAR trigger (EOD verified)
+            # EXECUTAR trigger
             close_today = float(df["close"].iloc[-1])
             open_today = float(df["open"].iloc[-1])
             close_prev = float(df["close"].iloc[-2])
@@ -252,8 +243,8 @@ def main() -> None:
     exec_list = [r for r in results if r[1] == "EXECUTAR"]
     watch_list = [r for r in results if r[1] == "AGUARDAR"]
 
-    exec_list.sort(key=lambda x: -x[3])          # dv20 desc
-    watch_list.sort(key=lambda x: (x[4], -x[3])) # bbz asc (more negative first), dv20 desc
+    exec_list.sort(key=lambda x: -x[3])
+    watch_list.sort(key=lambda x: (x[4], -x[3]))
 
     exec_top = exec_list[:5]
     watch_top = watch_list[:10]
@@ -271,28 +262,24 @@ def main() -> None:
             msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | base={win}d | trigger>={highb:.2f}")
 
     msg.append("")
-
     if not watch_top:
         msg.append("AGUARDAR: (vazio)")
     else:
         msg.append("AGUARDAR (staging):")
         for t, decision, px, dv, bbz, atrp, win, highb in watch_top:
             msg.append(f"- {t} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f} | base={win}d | trigger>={highb:.2f}")
-    # fallback: mostrar quase candidatos se nada passou tudo
-    if not exec_top and not watch_top and near:
-    near.sort(key=lambda x: (x[3], -x[2]))  # bbz mais negativo, depois liquidez
-    near_top = near[:10]
 
-    msg.append("")
-    msg.append("QUASE (passou compressão, falhou base/dry-up):")
-
-    for t, px, dv, bbz, atrp, reason in near_top:
-        msg.append(
-            f"- {t} | {reason} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}"
-        )
     if not exec_top and not watch_top:
         msg.append("")
-        msg.append("FLAT: nenhum candidato passou os filtros (compressão + base + dry-up).")
+        msg.append("FLAT: nenhum candidato passou os filtros finais (base+dry-up).")
+
+        if near:
+            near.sort(key=lambda x: (x[3], -x[2]))
+            near_top = near[:10]
+            msg.append("")
+            msg.append("QUASE (passou compressão, falhou base/dry-up):")
+            for t, px, dv, bbz, atrp, reason in near_top:
+                msg.append(f"- {t} | {reason} | close={px:.2f} | dv20=${dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}")
 
     tg_send("\n".join(msg))
 
