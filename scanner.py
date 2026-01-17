@@ -178,7 +178,7 @@ def main() -> None:
                 continue
 
             # Relaxed but still conservative
-            if not (bbz_last < -1.6 and atr_pctl < 0.15):
+            if not (bbz_last < -1.2 and atr_pctl < 0.25):
                 continue
 
             # Base 4–10 weeks
