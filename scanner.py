@@ -948,7 +948,7 @@ def main() -> None:
 
     if watch_clean:
         def _prio_key(x):
-        sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
+            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
 
         prioridade = 0
         if dist <= 4:
