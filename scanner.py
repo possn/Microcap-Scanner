@@ -947,14 +947,58 @@ def main() -> None:
         msg.append("")
 
     if watch_clean:
-        msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
-        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
-            msg.append(
-                f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
-                f"R%={Rp:.1f} | overhead={oh}"
-            )
-        msg.append("")
+
+    # ---- PRIORIDADE OBJECTIVA ----
+    def _prio_key(x):
+        sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
+
+        prioridade = 0
+        if dist <= 4:
+            prioridade += 1      # perto do breakout
+        if oh <= 3:
+            prioridade += 1      # pouco overhead supply
+        if atrp <= 0.20:
+            prioridade += 1      # baixa volatilidade (boa compressão)
+        if Rp >= 12:
+            prioridade += 1      # payoff reconhecido
+
+        return (prioridade, sc)
+
+    # ordenar primeiro por prioridade depois por score
+    watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
+
+    msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
+
+    for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
+
+        prioridade = 0
+        if dist <= 4:
+            prioridade += 1
+        if oh <= 3:
+            prioridade += 1
+        if atrp <= 0.20:
+            prioridade += 1
+        if Rp >= 12:
+            prioridade += 1
+
+        # Emoji visual
+        if prioridade == 4:
+            emoji = "🔥"
+        elif prioridade == 3:
+            emoji = "✅"
+        elif prioridade == 2:
+            emoji = "⚠️"
+        else:
+            emoji = "❌"
+
+        msg.append(
+            f"- {emoji} {t} | PRIORIDADE={prioridade}/4 | score={sc:.2f} | close={c:.2f} | "
+            f"dist={dist:.1f}% | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} ATRp={atrp:.2f} | "
+            f"trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
+        )
+
+    msg.append("")
+    
     else:
         msg.append("AGUARDAR_LIMPO: (vazio)")
         msg.append("")
