@@ -890,11 +890,14 @@ def main() -> None:
 
             else:
                 # Pre-breakout watchlist
-                if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT and atr_pctl <= 0.30:
-                    item = (
-                        sc, t, close_now, dv20, bbz_last, atr_pctl,
-                        trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
-                    )
+                else:
+    # Pre-breakout watchlist
+    if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT and atr_pctl <= 0.30:
+        item = (
+            sc, t, close_now, dv20, bbz_last, atr_pctl,
+            trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
+        )
+        watch.append(item)
 
                     # split clean vs overhead (key tweak)
                     if overhead <= 5:
