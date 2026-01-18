@@ -953,6 +953,8 @@ def main() -> None:
     )
     msg.append(emp)
     msg.append(f"LEARNING: outcomes_updated={upd['updated']} | resolved_total={upd['resolved_total']}")
+    if STOOQ_HITSLIMIT:
+        hits_limited = True
     if hits_limited:
         msg.append(f"NOTA: Stooq rate-limit; modo CACHE_ONLY ativado (cache_used={cache_used} cache_miss={cache_miss}).")
     msg.append("")
