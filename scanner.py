@@ -812,7 +812,7 @@ def main() -> None:
     execB = execB[:12]
 
     # overhead = position 10 in watch tuple
-    watch_clean = [w for w in watch if w[10] <= 5][:7]
+    watch_clean = [w for w in watch if w[10] <= 3][:7]
     watch_over = [w for w in watch if w[10] > 10][:7]
 
     near = near[:10]
