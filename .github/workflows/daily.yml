@@ -43,7 +43,7 @@ jobs:
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
 
           # Universe scope
-          MAX_TICKERS: "600"
+          MAX_TICKERS: "450"
           CANDIDATE_POOL: "2600"
 
           # Small/micro proxy caps
