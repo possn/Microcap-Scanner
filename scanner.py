@@ -1,7 +1,8 @@
-# scanner.py  (V7_PREOPEN_FULL)
+# scanner.py  (V7_1_PREOPEN_FULL_TOP7_IDEAL)
 # EOD-only, public/free, cache-first, ranked, pre-open actionable.
-# Adds: regime filter, overhead supply proxy, MIN_R%, EXECUTAR_A/B, liquidity sweet spot,
-# watch maturation/stale logic, and empirical logging (P30/P50) using realized outcomes.
+# Adds: regime filter, overhead supply proxy w/ strong penalty tiers, MIN_R%,
+# EXECUTAR_A/B, liquidity sweet spot, watch maturation/stale logic,
+# empirical logging (P30/P50) using realized outcomes, and TOP7 watchlist with IDEAL flag.
 
 import os, io, time, csv
 import requests
@@ -357,9 +358,12 @@ def score_candidate(
     if np.isfinite(dist_to_trig_pct):
         s += max(0.0, (DIST_MAX_PCT - dist_to_trig_pct)) * 0.10
 
-    if overhead_touches > OVERHEAD_MAX_TOUCHES:
-        s -= 0.9
-    elif overhead_touches > max(3, OVERHEAD_MAX_TOUCHES // 2):
+    # Overhead supply penalty (strong tiers)
+    if overhead_touches >= 60:
+        s -= 1.5
+    elif overhead_touches >= 30:
+        s -= 0.8
+    elif overhead_touches > OVERHEAD_MAX_TOUCHES:
         s -= 0.4
 
     s += watch_boost
@@ -370,14 +374,7 @@ def score_candidate(
 # Regime logic (EOD)
 # =========================
 def regime_snapshot() -> dict:
-    out = {
-        "mode": "TRANSITION",
-        "vol_mult_adj": 0.0,
-        "dist_adj": 0.0,
-        "qqq_trend": None,
-        "vix_trend": None,
-    }
-
+    out = {"mode": "TRANSITION", "vol_mult_adj": 0.0, "dist_adj": 0.0, "qqq_trend": None, "vix_trend": None}
     qqq = fetch_ohlcv_symbol_best_effort(REG_QQQ)
     if qqq is None or len(qqq) < 120:
         return out
@@ -423,7 +420,7 @@ def regime_snapshot() -> dict:
     return out
 
 # =========================
-# Watch history via signals.csv
+# signals.csv helpers
 # =========================
 def signals_csv_init_if_needed() -> None:
     if SIGNALS_CSV.exists():
@@ -498,7 +495,7 @@ def watch_boost_and_stale_penalty(dist_series: list[float]) -> tuple[float, floa
     return (boost, penalty)
 
 # =========================
-# Empirical outcomes update
+# outcomes update
 # =========================
 def update_outcomes_using_cache() -> dict:
     if not SIGNALS_CSV.exists():
@@ -645,11 +642,7 @@ def main() -> None:
     ordered = [t for t, _ in scored] + unscored
     tickers = ordered[:MAX_TICKERS]
 
-    execA = []
-    execB = []
-    watch = []
-    near = []
-
+    execA, execB, watch, near = [], [], [], []
     hits_limited = False
     no_data = 0
     hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
@@ -746,26 +739,18 @@ def main() -> None:
                 (execB if sig == "EXEC_B" else execA).append(item)
 
                 append_signal_row({
-                    "date": now.split(" ")[0],
-                    "ticker": t,
-                    "signal": sig,
-                    "score": round(sc, 6),
-                    "close": round(close_now, 6),
-                    "trig": round(trig, 6),
-                    "stop": round(stop, 6),
+                    "date": now.split(" ")[0], "ticker": t, "signal": sig,
+                    "score": round(sc, 6), "close": round(close_now, 6),
+                    "trig": round(trig, 6), "stop": round(stop, 6),
                     "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                    "dv20": round(dv20, 2),
-                    "bbz": round(bbz_last, 6),
-                    "atrpctl": round(atr_pctl, 6),
-                    "dd": round(dd, 6),
-                    "contr": round(contr, 6),
-                    "dry": round(dry, 6),
+                    "dv20": round(dv20, 2), "bbz": round(bbz_last, 6),
+                    "atrpctl": round(atr_pctl, 6), "dd": round(dd, 6),
+                    "contr": round(contr, 6), "dry": round(dry, 6),
                     "overhead_touches": overhead,
                     "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
                     "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
                     "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                    "regime": mode,
-                    "resolved": "0"
+                    "regime": mode, "resolved": "0"
                 })
 
             else:
@@ -773,26 +758,18 @@ def main() -> None:
                     watch.append((sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen))
 
                     append_signal_row({
-                        "date": now.split(" ")[0],
-                        "ticker": t,
-                        "signal": "WATCH",
-                        "score": round(sc, 6),
-                        "close": round(close_now, 6),
-                        "trig": round(trig, 6),
-                        "stop": round(stop, 6),
+                        "date": now.split(" ")[0], "ticker": t, "signal": "WATCH",
+                        "score": round(sc, 6), "close": round(close_now, 6),
+                        "trig": round(trig, 6), "stop": round(stop, 6),
                         "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                        "dv20": round(dv20, 2),
-                        "bbz": round(bbz_last, 6),
-                        "atrpctl": round(atr_pctl, 6),
-                        "dd": round(dd, 6),
-                        "contr": round(contr, 6),
-                        "dry": round(dry, 6),
+                        "dv20": round(dv20, 2), "bbz": round(bbz_last, 6),
+                        "atrpctl": round(atr_pctl, 6), "dd": round(dd, 6),
+                        "contr": round(contr, 6), "dry": round(dry, 6),
                         "overhead_touches": overhead,
                         "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
                         "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
                         "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                        "regime": mode,
-                        "resolved": "0"
+                        "regime": mode, "resolved": "0"
                     })
 
         except Exception as e:
@@ -809,22 +786,20 @@ def main() -> None:
     execA.sort(key=lambda x: x[0], reverse=True)
     execB.sort(key=lambda x: x[0], reverse=True)
     watch.sort(key=lambda x: x[0], reverse=True)
-
     execA = execA[:12]
     execB = execB[:12]
-    watch = watch[:15]
-
+    watch = watch[:7]
     near = near[:10]
 
     emp = empirical_prob_by_score_bin(mode)
 
-    msg = [f"[{now}] ### V7_PREOPEN_FULL ### Microcap scanner (RANKED)"]
+    msg = [f"[{now}] ### V7_1_PREOPEN_FULL_TOP7 ### Microcap scanner (RANKED)"]
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
         f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH={len(watch)} | nodata={no_data} | "
         f"PX<={MAX_PX:.0f} DV20<={MAX_DV20/1e6:.0f}M | VOLx>={VOL_CONFIRM_MULT:.2f} | dist<={DIST_LIMIT:.0f}% | MIN_R%={MIN_R_PCT:.0f}"
     )
-    msg.append(f"{emp}")
+    msg.append(emp)
     msg.append(f"LEARNING: outcomes_updated={upd['updated']} | resolved_total={upd['resolved_total']}")
     if hits_limited:
         msg.append("NOTA: Stooq rate-limit atingido; universo pode ter ficado incompleto.")
@@ -855,9 +830,12 @@ def main() -> None:
         msg.append("")
 
     if watch:
-        msg.append("AGUARDAR (perto do trigger; setups a amadurecer):")
+        msg.append("AGUARDAR (TOP 7 EV pré-breakout):")
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch:
             flags = []
+            ideal = (dist <= 4 and oh <= 5 and Rp >= 12 and 5_000_000 <= dv <= 30_000_000)
+            if ideal:
+                flags.append("IDEAL_PRE_BREAKOUT")
             if boost > 0:
                 flags.append("MATURING")
             if stale > 0:
