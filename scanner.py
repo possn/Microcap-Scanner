@@ -623,34 +623,42 @@ def main() -> None:
     VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
     DIST_LIMIT = max(6.0, DIST_MAX_PCT + reg["dist_adj"])
 
+    # --- 1) Universo combinado (dedup) ---
     all_tickers = (
         get_universe_from_holdings(IWC_URL) +
         get_universe_from_holdings(IWM_URL) +
         get_universe_from_holdings(IJR_URL)
     )
+    # ordenação estável base (só para determinismo inicial)
     universe = sorted(set(all_tickers))
 
-    pool = universe[:min(CANDIDATE_POOL, len(universe))]
-    scored: list[tuple[str, float]] = []
-    unscored: list[str] = []
+    # --- 2) Ranking determinístico por liquidez (DV20) usando cache ---
+    # IMPORTANT: Não cortar por ordem alfabética ANTES de rankear.
+    ranked = []     # (ticker, dv20)
+    unscored = []   # tickers sem cache dv20 ainda
 
-    for t in pool:
+    for t in universe:
         dv = read_cached_dv20(t)
         if dv is None:
             unscored.append(t)
         else:
-            scored.append((t, dv))
+            ranked.append((t, float(dv)))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
-    unscored.sort()
-    ordered = [t for t, _ in scored] + unscored
-    tickers = ordered[:MAX_TICKERS]
+    # Ordenar por dv20 desc, e por ticker asc como tie-breaker (determinístico)
+    ranked.sort(key=lambda x: (-x[1], x[0]))
 
-    execA: list[tuple] = []
-    execB: list[tuple] = []
-    watch: list[tuple] = []
-    near: list[tuple] = []
+    # pool primeiro = top CANDIDATE_POOL por dv20, depois (se necessário) completar com unscored
+    pool = [t for t, _ in ranked[:min(CANDIDATE_POOL, len(ranked))]]
 
+    if len(pool) < CANDIDATE_POOL:
+        # manter determinístico: unscored já vem de universe sorted
+        need = CANDIDATE_POOL - len(pool)
+        pool.extend(unscored[:need])
+
+    # Tickes finais avaliados = MAX_TICKERS, primeiro por dv20 (pool já é top por dv20)
+    tickers = pool[:min(MAX_TICKERS, len(pool))]
+
+    execA, execB, watch, near = [], [], [], []
     hits_limited = False
     no_data = 0
     hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
@@ -658,7 +666,6 @@ def main() -> None:
     for i, t in enumerate(tickers):
         if hits_limited:
             break
-
         try:
             df = fetch_ohlcv_equity(t)
             for c in ["open", "high", "low", "close", "volume"]:
@@ -744,11 +751,8 @@ def main() -> None:
 
             if breakout_now and vol_confirm and no_big_gap and quality_ok and not_too_extended:
                 sig = "EXEC_B" if prev_above else "EXEC_A"
-                item = (
-                    sc, t, close_now, dv20, bbz_last, atr_pctl,
-                    trig, stop, overshoot_pct, R_pct, vol_mult,
-                    overhead, win, dist_pct
-                )
+                item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop,
+                        overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct)
                 (execB if sig == "EXEC_B" else execA).append(item)
 
                 append_signal_row({
@@ -765,14 +769,10 @@ def main() -> None:
                     "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
                     "regime": mode, "resolved": "0"
                 })
-
             else:
                 if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT:
-                    watch.append((
-                        sc, t, close_now, dv20, bbz_last, atr_pctl,
-                        trig, stop, dist_pct, R_pct, overhead, win,
-                        boost, stale_pen
-                    ))
+                    watch.append((sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop,
+                                  dist_pct, R_pct, overhead, win, boost, stale_pen))
 
                     append_signal_row({
                         "date": now.split(" ")[0], "ticker": t, "signal": "WATCH",
@@ -795,15 +795,12 @@ def main() -> None:
                 no_data += 1
             elif "HITS_LIMIT" in s:
                 hits_limited = True
-            # swallow errors
             pass
 
         if (i + 1) % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SECONDS)
 
-    # -------------------------
-    # sort + trim + split watch
-    # -------------------------
+    # Sort outputs
     execA.sort(key=lambda x: x[0], reverse=True)
     execB.sort(key=lambda x: x[0], reverse=True)
     watch.sort(key=lambda x: x[0], reverse=True)
@@ -811,10 +808,12 @@ def main() -> None:
     execA = execA[:12]
     execB = execB[:12]
 
-    # overhead = position 10 in watch tuple
-    watch_clean = [w for w in watch if w[10] <= 3][:7]
-    watch_over = [w for w in watch if w[10] > 10][:7]
+    # split watch into clean vs overhead
+    watch_clean = [w for w in watch if w[10] <= 5]   # overhead index
+    watch_over = [w for w in watch if w[10] > 5]
 
+    watch_clean = watch_clean[:7]
+    watch_over = watch_over[:7]
     near = near[:10]
 
     emp = empirical_prob_by_score_bin(mode)
@@ -858,18 +857,9 @@ def main() -> None:
     if watch_clean:
         msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
-            flags = []
-            ideal = (dist <= 4 and oh <= 5 and Rp >= 12 and 5_000_000 <= dv <= 30_000_000)
-            if ideal:
-                flags.append("IDEAL_PRE_BREAKOUT")
-            if boost > 0:
-                flags.append("MATURING")
-            if stale > 0:
-                flags.append("STALE")
-            flg = f" [{' '.join(flags)}]" if flags else ""
             msg.append(
                 f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}{flg}"
+                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
             )
         msg.append("")
     else:
@@ -877,12 +867,15 @@ def main() -> None:
         msg.append("")
 
     if watch_over:
-        msg.append("AGUARDAR_COM_TETO (overhead>10; probabilidade menor):")
+        msg.append("AGUARDAR_COM_TETO (overhead>5; probabilidade menor):")
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_over:
             msg.append(
                 f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
                 f"BBz={bbz:.2f} | trig={trig:.2f} | R%={Rp:.1f} | overhead={oh} [OVERHEAD]"
             )
+        msg.append("")
+    else:
+        msg.append("AGUARDAR_COM_TETO: (vazio)")
         msg.append("")
 
     if near:
