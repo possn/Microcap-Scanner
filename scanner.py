@@ -47,7 +47,7 @@ DRYUP_MAX = float(os.environ.get("DRYUP_MAX", "0.95"))
 # execution rules
 VOL_CONFIRM_MULT_BASE = float(os.environ.get("VOL_CONFIRM_MULT", "1.15"))
 MAX_GAP_UP = float(os.environ.get("MAX_GAP_UP", "1.12"))
-DIST_MAX_PCT = float(os.environ.get("DIST_MAX_PCT", "12.0"))
+DIST_MAX_PCT = float(os.environ.get("DIST_MAX_PCT", "10.0"))
 EXEC_MAX_OVERSHOOT_PCT = float(os.environ.get("EXEC_MAX_OVERSHOOT_PCT", "6.0"))
 
 # quality gates for EXECUTAR
@@ -890,7 +890,7 @@ def main() -> None:
 
             else:
                 # Pre-breakout watchlist
-                if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT:
+                if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT and atr_pctl <= 0.30:
                     item = (
                         sc, t, close_now, dv20, bbz_last, atr_pctl,
                         trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
