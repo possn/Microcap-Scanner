@@ -947,8 +947,10 @@ def main() -> None:
         msg.append("")
 
     if watch_clean:
-        def _prio_key(x):
-            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
+
+    # Função de prioridade para ordenação
+    def _prio_key(x):
+        sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
 
         prioridade = 0
         if dist <= 4:
@@ -956,13 +958,14 @@ def main() -> None:
         if oh <= 3:
             prioridade += 1      # pouco overhead supply
         if atrp <= 0.20:
-            prioridade += 1      # baixa volatilidade (boa compressão)
+            prioridade += 1      # boa compressão
         if Rp >= 12:
-            prioridade += 1      # payoff reconhecido
+            prioridade += 1      # payoff aceitável
 
+        # ordenar por prioridade primeiro, score depois
         return (prioridade, sc)
 
-    # ordenar primeiro por prioridade depois por score
+    # ORDENAR WATCH_CLEAN
     watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
 
     msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
@@ -996,10 +999,10 @@ def main() -> None:
         )
 
     msg.append("")
-    
-    else:
-        msg.append("AGUARDAR_LIMPO: (vazio)")
-        msg.append("")
+
+else:
+    msg.append("AGUARDAR_LIMPO: (vazio)")
+    msg.append("")
 
     if watch_over:
         msg.append("AGUARDAR_COM_TETO (overhead>5; probabilidade menor):")
