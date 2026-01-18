@@ -948,61 +948,59 @@ def main() -> None:
 
     if watch_clean:
 
-    # Função de prioridade para ordenação
-    def _prio_key(x):
-        sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
+        # Função de prioridade para ordenação
+        def _prio_key(x):
+            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
 
-        prioridade = 0
-        if dist <= 4:
-            prioridade += 1      # perto do breakout
-        if oh <= 3:
-            prioridade += 1      # pouco overhead supply
-        if atrp <= 0.20:
-            prioridade += 1      # boa compressão
-        if Rp >= 12:
-            prioridade += 1      # payoff aceitável
+            prioridade = 0
+            if dist <= 4:
+                prioridade += 1
+            if oh <= 3:
+                prioridade += 1
+            if atrp <= 0.20:
+                prioridade += 1
+            if Rp >= 12:
+                prioridade += 1
 
-        # ordenar por prioridade primeiro, score depois
-        return (prioridade, sc)
+            return (prioridade, sc)
 
-    # ORDENAR WATCH_CLEAN
-    watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
+        # ORDENAR WATCH_CLEAN (prioridade primeiro, score depois)
+        watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
 
-    msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
+        msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
 
-    for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
+        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
 
-        prioridade = 0
-        if dist <= 4:
-            prioridade += 1
-        if oh <= 3:
-            prioridade += 1
-        if atrp <= 0.20:
-            prioridade += 1
-        if Rp >= 12:
-            prioridade += 1
+            prioridade = 0
+            if dist <= 4:
+                prioridade += 1
+            if oh <= 3:
+                prioridade += 1
+            if atrp <= 0.20:
+                prioridade += 1
+            if Rp >= 12:
+                prioridade += 1
 
-        # Emoji visual
-        if prioridade == 4:
-            emoji = "🔥"
-        elif prioridade == 3:
-            emoji = "✅"
-        elif prioridade == 2:
-            emoji = "⚠️"
-        else:
-            emoji = "❌"
+            if prioridade == 4:
+                emoji = "🔥"
+            elif prioridade == 3:
+                emoji = "✅"
+            elif prioridade == 2:
+                emoji = "⚠️"
+            else:
+                emoji = "❌"
 
-        msg.append(
-            f"- {emoji} {t} | PRIORIDADE={prioridade}/4 | score={sc:.2f} | close={c:.2f} | "
-            f"dist={dist:.1f}% | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} ATRp={atrp:.2f} | "
-            f"trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
-        )
+            msg.append(
+                f"- {emoji} {t} | PRIORIDADE={prioridade}/4 | score={sc:.2f} | close={c:.2f} | "
+                f"dist={dist:.1f}% | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} ATRp={atrp:.2f} | "
+                f"trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
+            )
 
-    msg.append("")
+        msg.append("")
 
-else:
-    msg.append("AGUARDAR_LIMPO: (vazio)")
-    msg.append("")
+    else:
+        msg.append("AGUARDAR_LIMPO: (vazio)")
+        msg.append("")
 
     if watch_over:
         msg.append("AGUARDAR_COM_TETO (overhead>5; probabilidade menor):")
