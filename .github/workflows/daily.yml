@@ -9,7 +9,6 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +55,7 @@ jobs:
           CONTRACTION_MAX: "0.85"
           DRYUP_MAX: "0.95"
 
-          VOL_CONFIRM_MULT: "1.15"
+          VOL_CONFIRM_MULT: "1.18"
           MAX_GAP_UP: "1.12"
           DIST_MAX_PCT: "12.0"
           EXEC_MAX_OVERSHOOT_PCT: "6.0"
@@ -80,6 +79,5 @@ jobs:
 
           SLEEP_EVERY: "40"
           SLEEP_SECONDS: "2.0"
-
         run: |
           python scanner.py
