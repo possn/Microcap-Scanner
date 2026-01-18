@@ -182,6 +182,33 @@ def get_universe_from_holdings(url: str) -> list[str]:
 # =========================
 # OHLCV / cache
 # =========================
+def load_cached_ohlcv_local(ticker: str) -> pd.DataFrame | None:
+    path = cache_path(ticker)
+    if not path.exists():
+        return None
+    try:
+        df = pd.read_csv(path)
+        df.columns = [c.strip().lower() for c in df.columns]
+        need = ["date", "open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in need):
+            return None
+
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+        df = df.dropna(subset=["close","volume"])
+
+        if len(df) < 260:
+            return None
+
+        return df
+
+    except Exception:
+        return None
+
 def cache_path(t: str) -> Path:
     return OHLCV_DIR / f"{t}.csv"
 
