@@ -6,9 +6,6 @@ on:
     - cron: "0 12 * * *"
     - cron: "0 11 * * *"
 
-permissions:
-  contents: write
-  
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -37,73 +34,52 @@ jobs:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-          # Holdings (secrets já existentes)
           IWC_HOLDINGS_CSV_URL: ${{ secrets.IWC_HOLDINGS_CSV_URL }}
           IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
           IJR_HOLDINGS_CSV_URL: ${{ secrets.IJR_HOLDINGS_CSV_URL }}
 
-          # OHLCV (Stooq)
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
 
-          # Universe scope
           MAX_TICKERS: "450"
           CANDIDATE_POOL: "2600"
 
-          # Small/micro proxy caps
           MIN_PX: "1.0"
           MAX_PX: "25"
           MIN_DV20: "3000000"
           MAX_DV20: "80000000"
           MIN_SV20: "600000"
 
-          # Compression gates (mais permissivo para gerar mais sinais, mas ainda filtrado)
           BBZ_GATE: "-0.70"
           ATRPCTL_GATE: "0.45"
 
-          # Base & dry-up
           BASE_DD_MAX: "0.55"
           CONTRACTION_MAX: "0.85"
           DRYUP_MAX: "0.95"
 
-          # EXECUTAR rules (pre-open, EOD confirmed)
-          VOL_CONFIRM_MULT: "1.12"          # mais EXECUTAR do que 1.15, sem cair muito a qualidade
+          VOL_CONFIRM_MULT: "1.15"
           MAX_GAP_UP: "1.12"
           DIST_MAX_PCT: "12.0"
           EXEC_MAX_OVERSHOOT_PCT: "6.0"
 
-          # EXEC quality gates (evita muito lixo)
           EXEC_BBZ_MAX: "-1.10"
           EXEC_ATRPCTL_MAX: "0.30"
 
-          # Payoff filter (remove R% demasiado pequeno)
           MIN_R_PCT: "8.0"
 
-          # Overhead supply proxy (penaliza teto logo acima)
           OVERHEAD_WINDOW: "200"
           OVERHEAD_BAND_PCT: "8.0"
           OVERHEAD_MAX_TOUCHES: "10"
 
-          # Watch maturation / stale
           WATCH_BOOST_MIN_DAYS: "3"
           WATCH_STALE_DAYS: "10"
 
-          # Learning horizon
           HORIZON_SESS: "40"
 
-          # Regime symbols (EOD)
           REG_QQQ: "QQQ"
           REG_VIX: "VIX"
 
-          # Rate-limit hygiene
           SLEEP_EVERY: "40"
           SLEEP_SECONDS: "2.0"
 
-        - name: Commit signals.csv (keep history)
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add cache/signals.csv || true
-          git diff --staged --quiet || git commit -m "Update signals.csv"
-          git push
         run: |
           python scanner.py
