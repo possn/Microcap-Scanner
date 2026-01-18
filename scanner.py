@@ -623,11 +623,12 @@ def main() -> None:
     VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
     DIST_LIMIT = max(6.0, DIST_MAX_PCT + reg["dist_adj"])
 
-    universe = list(set(
+    all_tickers = (
         get_universe_from_holdings(IWC_URL) +
         get_universe_from_holdings(IWM_URL) +
         get_universe_from_holdings(IJR_URL)
-    ))
+    )
+    universe = sorted(set(all_tickers))
 
     pool = universe[:min(CANDIDATE_POOL, len(universe))]
     scored = []
