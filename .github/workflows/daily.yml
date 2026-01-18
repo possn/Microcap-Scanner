@@ -50,16 +50,16 @@ jobs:
           MAX_DV20: "80000000"
           MIN_SV20: "600000"
 
-          BBZ_GATE: "-0.65"
-          ATRPCTL_GATE: "0.45"
+          BBZ_GATE: "-0.80"
+          ATRPCTL_GATE: "0.35"
 
           BASE_DD_MAX: "0.55"
           CONTRACTION_MAX: "0.85"
-          DRYUP_MAX: "1.05"
+          DRYUP_MAX: "0.95"
 
           VOL_CONFIRM_MULT: "1.18"
           MAX_GAP_UP: "1.12"
-          DIST_MAX_PCT: "16.0"
+          DIST_MAX_PCT: "12.0"
           EXEC_MAX_OVERSHOOT_PCT: "6.0"
 
           EXEC_BBZ_MAX: "-1.10"
@@ -69,7 +69,7 @@ jobs:
 
           OVERHEAD_WINDOW: "200"
           OVERHEAD_BAND_PCT: "8.0"
-          OVERHEAD_MAX_TOUCHES: "15"
+          OVERHEAD_MAX_TOUCHES: "10"
 
           WATCH_BOOST_MIN_DAYS: "3"
           WATCH_STALE_DAYS: "10"
