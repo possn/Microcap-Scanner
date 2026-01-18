@@ -82,6 +82,7 @@ SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "1.0"))
 CACHE_DIR = Path("cache")
 OHLCV_DIR = CACHE_DIR / "ohlcv"
 SIGNALS_CSV = CACHE_DIR / "signals.csv"
+STOOQ_HITSLIMIT = False
 
 # =========================
 # Telegram
@@ -246,43 +247,77 @@ def read_cached_dv20(ticker: str) -> float | None:
         return None
 
 def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
+    """
+    Fetch EOD OHLCV for ticker, with disk cache.
+    - Tenta ir ao Stooq e atualizar o CSV local.
+    - Se Stooq der HITS_LIMIT / falhar / BAD_FORMAT, usa o cache existente (se houver).
+    - Se não houver cache e falhar, levanta erro.
+    """
     ensure_dirs()
+    OHLCV_DIR.mkdir(parents=True, exist_ok=True)
     path = cache_path(ticker)
 
+    # 1) Lê cache (se existir)
     cached = None
     if path.exists():
         try:
             cached = pd.read_csv(path)
+            cached.columns = [c.strip().lower() for c in cached.columns]
+            if "date" in cached.columns:
+                cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+                cached = cached.dropna(subset=["date"]).sort_values("date")
         except Exception:
             cached = None
 
-    url = build_ohlcv_url_equity(ticker)
-    text = fetch_text(url).strip()
-    low = text.lower()
+    # 2) Tenta buscar dados frescos ao Stooq
+    try:
+        url = build_ohlcv_url_equity(ticker)
+        text = fetch_text(url).strip()
+        low = text.lower()
 
-    if low.startswith("no data") or low == "no data":
-        raise RuntimeError("NO_DATA")
-    if "exceeded the daily hits limit" in low:
-        raise RuntimeError("HITS_LIMIT")
+        if low.startswith("no data") or low == "no data":
+            raise RuntimeError("NO_DATA")
+        if "exceeded the daily hits limit" in low:
+            raise RuntimeError("HITS_LIMIT")
 
-    df = pd.read_csv(io.StringIO(text))
-    df.columns = [c.strip().lower() for c in df.columns]
-    need = ["date", "open", "high", "low", "close", "volume"]
-    if not all(c in df.columns for c in need):
-        raise RuntimeError("BAD_FORMAT")
+        df = pd.read_csv(io.StringIO(text))
+        df.columns = [c.strip().lower() for c in df.columns]
+        need = ["date", "open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in need):
+            raise RuntimeError("BAD_FORMAT")
 
-    df = df[need].copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date")
+        df = df[need].copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
 
-    if cached is not None and len(cached) > 0:
-        cached.columns = [c.strip().lower() for c in cached.columns]
-        if "date" in cached.columns:
-            cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
-            cached = cached.dropna(subset=["date"]).sort_values("date")
-            df = pd.concat([cached, df], ignore_index=True)
-            df = df.drop_duplicates(subset=["date"], keep="last").sort_values("date")
+        # numéricos
+        for c in ["open", "high", "low", "close", "volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
 
+        # 3) Faz merge com cache (se existir)
+        if cached is not None and len(cached) > 0:
+            if all(c in cached.columns for c in need):
+                merged = pd.concat([cached[need], df[need]], ignore_index=True)
+                merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+                df = merged
+
+        # 4) Guarda sempre se o fetch correu bem
+        df.to_csv(path, index=False)
+        return df.reset_index(drop=True)
+
+    except Exception:
+        # 5) Fallback: se já houver cache, usa-o
+        if cached is not None and len(cached) >= 120:
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in cached.columns:
+                    cached[c] = pd.to_numeric(cached[c], errors="coerce")
+            cached = cached.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+            return cached
+
+        # 6) Sem cache -> falha mesmo
+        raise
+        
     df.to_csv(path, index=False)
     return df.reset_index(drop=True)
 
