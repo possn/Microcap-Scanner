@@ -14,6 +14,8 @@ from pathlib import Path
 # =========================
 # ENV / CONFIG
 # =========================
+CACHE_ONLY = os.environ.get("CACHE_ONLY", "0") == "1"
+
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 
