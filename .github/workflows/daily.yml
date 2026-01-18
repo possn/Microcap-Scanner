@@ -6,6 +6,9 @@ on:
     - cron: "0 12 * * *"
     - cron: "0 11 * * *"
 
+permissions:
+  contents: write
+  
 jobs:
   run:
     runs-on: ubuntu-latest
@@ -94,5 +97,13 @@ jobs:
           # Rate-limit hygiene
           SLEEP_EVERY: "40"
           SLEEP_SECONDS: "2.0"
+
+        - name: Commit signals.csv (keep history)
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add cache/signals.csv || true
+          git diff --staged --quiet || git commit -m "Update signals.csv"
+          git push
         run: |
           python scanner.py
