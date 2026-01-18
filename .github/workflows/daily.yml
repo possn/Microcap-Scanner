@@ -77,7 +77,7 @@ jobs:
           REG_QQQ: "QQQ"
           REG_VIX: "VIX"
 
-          SLEEP_EVERY: "40"
-          SLEEP_SECONDS: "2.0"
+          SLEEP_EVERY: "25"
+          SLEEP_SECONDS: "3.0"
         run: |
           python scanner.py
