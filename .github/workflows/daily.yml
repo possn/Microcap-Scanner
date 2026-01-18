@@ -26,7 +26,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: cache
-          key: microcap-cache-v1
+          key: microcap-cache-${{ github.run_id }}
+          restore-keys: |
+            microcap-cache- 
 
       - name: Run scanner
         env:
