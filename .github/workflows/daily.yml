@@ -92,7 +92,7 @@ jobs:
           REG_VIX: "VIX"
 
           # Rate-limit hygiene
-          SLEEP_EVERY: "60"
-          SLEEP_SECONDS: "1.0"
+          SLEEP_EVERY: "40"
+          SLEEP_SECONDS: "2.0"
         run: |
           python scanner.py
