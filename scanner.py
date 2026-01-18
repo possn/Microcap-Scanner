@@ -691,34 +691,36 @@ def main() -> None:
 
     # --- build universe (NO alphabetical bias) ---
     all_tickers = (
-        get_universe_from_holdings(IWC_URL) +
-        get_universe_from_holdings(IWM_URL) +
-        get_universe_from_holdings(IJR_URL)
+        get_universe_from_holdings(IWC_URL)
+        + get_universe_from_holdings(IWM_URL)
+        + get_universe_from_holdings(IJR_URL)
     )
 
-    # remove obvious junk/dupes but DO NOT sort
-    universe = list(set([t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()]))
+    # remove junk/dupes but DO NOT sort
+    universe = list(
+        set(
+            [
+                t.strip().upper()
+                for t in all_tickers
+                if isinstance(t, str) and t.strip()
+            ]
+        )
+    )
 
-    # If you want to cap the *universe source* size (not scan order), do it after ranking logic.
-    # We'll build a liquidity-ranked scan list using cached dv20 first.
+    # Rank scan order by cached dv20 (best effort) to use limited fetch budget well
     scored: list[tuple[str, float]] = []
     unscored: list[str] = []
 
-    # Use the whole universe to form the candidate pool, but ranking by cached dv20 will prefer liquid names.
-    # CANDIDATE_POOL limits the number we consider for ranking (helps CPU).
     pool = universe[: min(CANDIDATE_POOL, len(universe))]
-
     for t in pool:
         dv = read_cached_dv20(t)
-        if dv is None or not np.isfinite(dv) or dv <= 0:
+        if dv is None or (not np.isfinite(dv)) or dv <= 0:
             unscored.append(t)
         else:
             scored.append((t, float(dv)))
 
-    # Evaluate highest cached liquidity first -> better use of limited fetch budget
     scored.sort(key=lambda x: x[1], reverse=True)
     ordered = [t for t, _ in scored] + unscored
-
     tickers = ordered[:MAX_TICKERS]
 
     # --- containers ---
@@ -735,7 +737,10 @@ def main() -> None:
     cache_used = 0
     cache_miss = 0
 
-    # helper: load cached OHLCV if rate-limited (or if you want cache-first later)
+    # optional global CACHE_ONLY (if exists). If not, defaults to False.
+    cache_only = bool(globals().get("CACHE_ONLY", False))
+
+    # helper: load cached OHLCV
     def load_cached_ohlcv_local(ticker: str) -> pd.DataFrame | None:
         p = cache_path(ticker)
         if not p.exists():
@@ -756,22 +761,18 @@ def main() -> None:
         except Exception:
             return None
 
+    # --- scan loop ---
     for i, t in enumerate(tickers):
         try:
-            # If rate-limited: do NOT stop. Switch to cache-only evaluation.
-            if hits_limited:
+            # If rate-limited: switch to cache-only for the remaining tickers (DO NOT stop)
+            if hits_limited or cache_only:
                 df = load_cached_ohlcv_local(t)
                 if df is None:
                     cache_miss += 1
                     continue
                 cache_used += 1
             else:
-                if CACHE_ONLY:
-                    df = load_cached_ohlcv_local(t)
-                    if df is None:
-                     continue
-                else:
-                    df = fetch_ohlcv_equity(t)
+                df = fetch_ohlcv_equity(t)
 
             # numeric safety
             for c in ["open", "high", "low", "close", "volume"]:
@@ -836,7 +837,7 @@ def main() -> None:
             dist_pct = ((trig - close_now) / close_now * 100.0) if close_now > 0 else np.nan
             overshoot_pct = ((close_now - trig) / trig * 100.0) if trig > 0 else 0.0
 
-            # overhead
+            # overhead supply proxy
             overhead = overhead_supply_touches(df, trig)
 
             # watch maturation/stale (from signals.csv)
@@ -889,17 +890,19 @@ def main() -> None:
                 })
 
             else:
-                # Pre-breakout watchlist
-                else:
-    # Pre-breakout watchlist
-    if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT and atr_pctl <= 0.30:
-        item = (
-            sc, t, close_now, dv20, bbz_last, atr_pctl,
-            trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
-        )
-        watch.append(item)
+                # Pre-breakout watchlist (extra filtro: atr_pctl <= 0.30)
+                if (
+                    np.isfinite(dist_pct)
+                    and dist_pct <= DIST_LIMIT
+                    and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT
+                    and atr_pctl <= 0.30
+                ):
+                    item = (
+                        sc, t, close_now, dv20, bbz_last, atr_pctl,
+                        trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
+                    )
 
-                    # split clean vs overhead (key tweak)
+                    # split clean vs overhead
                     if overhead <= 5:
                         watch_clean.append(item)
                     else:
@@ -925,8 +928,7 @@ def main() -> None:
             if "NO_DATA" in s:
                 no_data += 1
             elif "HITS_LIMIT" in s:
-                # switch to cache-only; DO NOT break the loop
-                hits_limited = True
+                hits_limited = True   # switch to cache-only; DO NOT break the loop
             # swallow other errors to keep scanner running
             pass
 
@@ -947,7 +949,7 @@ def main() -> None:
 
     emp = empirical_prob_by_score_bin(mode)
 
-    # --- message ---
+    # --- message header ---
     msg = [f"[{now}] ### V7_1_PREOPEN_FULL_TOP7 ### Microcap scanner (RANKED)"]
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
@@ -956,12 +958,11 @@ def main() -> None:
     )
     msg.append(emp)
     msg.append(f"LEARNING: outcomes_updated={upd['updated']} | resolved_total={upd['resolved_total']}")
-    if STOOQ_HITSLIMIT:
-        hits_limited = True
-    if hits_limited:
+    if hits_limited or cache_only:
         msg.append(f"NOTA: Stooq rate-limit; modo CACHE_ONLY ativado (cache_used={cache_used} cache_miss={cache_miss}).")
     msg.append("")
 
+    # --- EXEC sections ---
     if execB:
         msg.append("EXECUTAR_B (2-day confirmação; maior probabilidade):")
         for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execB:
@@ -986,12 +987,11 @@ def main() -> None:
         msg.append("EXECUTAR: (vazio)")
         msg.append("")
 
+    # --- WATCH_CLEAN with PRIORIDADE + emoji (ordered) ---
     if watch_clean:
 
-        # Função de prioridade para ordenação
         def _prio_key(x):
             sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
-
             prioridade = 0
             if dist <= 4:
                 prioridade += 1
@@ -1001,14 +1001,11 @@ def main() -> None:
                 prioridade += 1
             if Rp >= 12:
                 prioridade += 1
-
             return (prioridade, sc)
 
-        # ORDENAR WATCH_CLEAN (prioridade primeiro, score depois)
         watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
 
         msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
-
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
 
             prioridade = 0
@@ -1035,13 +1032,13 @@ def main() -> None:
                 f"dist={dist:.1f}% | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} ATRp={atrp:.2f} | "
                 f"trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
             )
-
         msg.append("")
 
     else:
         msg.append("AGUARDAR_LIMPO: (vazio)")
         msg.append("")
 
+    # --- WATCH_OVER ---
     if watch_over:
         msg.append("AGUARDAR_COM_TETO (overhead>5; probabilidade menor):")
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_over:
@@ -1054,6 +1051,7 @@ def main() -> None:
         msg.append("AGUARDAR_COM_TETO: (vazio)")
         msg.append("")
 
+    # --- NEAR / debug ---
     if near:
         msg.append("QUASE (debug):")
         for t, c, dv, bbz, reason in near:
@@ -1062,6 +1060,7 @@ def main() -> None:
         msg.append("QUASE: (vazio)")
 
     tg_send("\n".join(msg))
+
 
 if __name__ == "__main__":
     main()
