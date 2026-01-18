@@ -57,7 +57,7 @@ jobs:
 
           VOL_CONFIRM_MULT: "1.18"
           MAX_GAP_UP: "1.12"
-          DIST_MAX_PCT: "15.0"
+          DIST_MAX_PCT: "16.0"
           EXEC_MAX_OVERSHOOT_PCT: "6.0"
 
           EXEC_BBZ_MAX: "-1.10"
