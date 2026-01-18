@@ -731,7 +731,12 @@ def main() -> None:
                     continue
                 cache_used += 1
             else:
-                df = fetch_ohlcv_equity(t)
+                if CACHE_ONLY:
+                    df = load_cached_ohlcv_local(t)
+                    if df is None:
+                     continue
+                else:
+                    df = fetch_ohlcv_equity(t)
 
             # numeric safety
             for c in ["open", "high", "low", "close", "volume"]:
