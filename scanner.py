@@ -631,19 +631,26 @@ def main() -> None:
     universe = sorted(set(all_tickers))
 
     pool = universe[:min(CANDIDATE_POOL, len(universe))]
-    scored = []
-    unscored = []
+    scored: list[tuple[str, float]] = []
+    unscored: list[str] = []
+
     for t in pool:
         dv = read_cached_dv20(t)
         if dv is None:
             unscored.append(t)
         else:
             scored.append((t, dv))
+
     scored.sort(key=lambda x: x[1], reverse=True)
+    unscored.sort()
     ordered = [t for t, _ in scored] + unscored
     tickers = ordered[:MAX_TICKERS]
 
-    execA, execB, watch, near = [], [], [], []
+    execA: list[tuple] = []
+    execB: list[tuple] = []
+    watch: list[tuple] = []
+    near: list[tuple] = []
+
     hits_limited = False
     no_data = 0
     hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
@@ -651,6 +658,7 @@ def main() -> None:
     for i, t in enumerate(tickers):
         if hits_limited:
             break
+
         try:
             df = fetch_ohlcv_equity(t)
             for c in ["open", "high", "low", "close", "volume"]:
@@ -736,7 +744,11 @@ def main() -> None:
 
             if breakout_now and vol_confirm and no_big_gap and quality_ok and not_too_extended:
                 sig = "EXEC_B" if prev_above else "EXEC_A"
-                item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct)
+                item = (
+                    sc, t, close_now, dv20, bbz_last, atr_pctl,
+                    trig, stop, overshoot_pct, R_pct, vol_mult,
+                    overhead, win, dist_pct
+                )
                 (execB if sig == "EXEC_B" else execA).append(item)
 
                 append_signal_row({
@@ -756,7 +768,11 @@ def main() -> None:
 
             else:
                 if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT:
-                    watch.append((sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen))
+                    watch.append((
+                        sc, t, close_now, dv20, bbz_last, atr_pctl,
+                        trig, stop, dist_pct, R_pct, overhead, win,
+                        boost, stale_pen
+                    ))
 
                     append_signal_row({
                         "date": now.split(" ")[0], "ticker": t, "signal": "WATCH",
@@ -779,17 +795,26 @@ def main() -> None:
                 no_data += 1
             elif "HITS_LIMIT" in s:
                 hits_limited = True
+            # swallow errors
             pass
 
         if (i + 1) % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SECONDS)
 
+    # -------------------------
+    # sort + trim + split watch
+    # -------------------------
     execA.sort(key=lambda x: x[0], reverse=True)
     execB.sort(key=lambda x: x[0], reverse=True)
     watch.sort(key=lambda x: x[0], reverse=True)
+
     execA = execA[:12]
     execB = execB[:12]
-    watch = watch[:7]
+
+    # overhead = position 10 in watch tuple
+    watch_clean = [w for w in watch if w[10] <= 10][:7]
+    watch_over = [w for w in watch if w[10] > 10][:7]
+
     near = near[:10]
 
     emp = empirical_prob_by_score_bin(mode)
@@ -797,7 +822,7 @@ def main() -> None:
     msg = [f"[{now}] ### V7_1_PREOPEN_FULL_TOP7 ### Microcap scanner (RANKED)"]
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
-        f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH={len(watch)} | nodata={no_data} | "
+        f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH_CLEAN={len(watch_clean)} WATCH_OVER={len(watch_over)} | nodata={no_data} | "
         f"PX<={MAX_PX:.0f} DV20<={MAX_DV20/1e6:.0f}M | VOLx>={VOL_CONFIRM_MULT:.2f} | dist<={DIST_LIMIT:.0f}% | MIN_R%={MIN_R_PCT:.0f}"
     )
     msg.append(emp)
@@ -830,9 +855,9 @@ def main() -> None:
         msg.append("EXECUTAR: (vazio)")
         msg.append("")
 
-    if watch:
-        msg.append("AGUARDAR (TOP 7 EV pré-breakout):")
-        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch:
+    if watch_clean:
+        msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
+        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
             flags = []
             ideal = (dist <= 4 and oh <= 5 and Rp >= 12 and 5_000_000 <= dv <= 30_000_000)
             if ideal:
@@ -841,8 +866,6 @@ def main() -> None:
                 flags.append("MATURING")
             if stale > 0:
                 flags.append("STALE")
-            if oh > OVERHEAD_MAX_TOUCHES:
-                flags.append("OVERHEAD")
             flg = f" [{' '.join(flags)}]" if flags else ""
             msg.append(
                 f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
@@ -850,7 +873,16 @@ def main() -> None:
             )
         msg.append("")
     else:
-        msg.append("AGUARDAR: (vazio)")
+        msg.append("AGUARDAR_LIMPO: (vazio)")
+        msg.append("")
+
+    if watch_over:
+        msg.append("AGUARDAR_COM_TETO (overhead>10; probabilidade menor):")
+        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_over:
+            msg.append(
+                f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
+                f"BBz={bbz:.2f} | trig={trig:.2f} | R%={Rp:.1f} | overhead={oh} [OVERHEAD]"
+            )
         msg.append("")
 
     if near:
