@@ -616,58 +616,95 @@ def main() -> None:
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     ensure_dirs()
 
+    # --- learning update (EOD-only outcomes from cache) ---
     upd = update_outcomes_using_cache()
 
+    # --- regime ---
     reg = regime_snapshot()
     mode = reg["mode"]
     VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
     DIST_LIMIT = max(6.0, DIST_MAX_PCT + reg["dist_adj"])
 
-    # --- 1) Universo combinado (dedup) ---
+    # --- build universe (NO alphabetical bias) ---
     all_tickers = (
         get_universe_from_holdings(IWC_URL) +
         get_universe_from_holdings(IWM_URL) +
         get_universe_from_holdings(IJR_URL)
     )
-    # ordenação estável base (só para determinismo inicial)
-    universe = sorted(set(all_tickers))
 
-    # --- 2) Ranking determinístico por liquidez (DV20) usando cache ---
-    # IMPORTANT: Não cortar por ordem alfabética ANTES de rankear.
-    ranked = []     # (ticker, dv20)
-    unscored = []   # tickers sem cache dv20 ainda
+    # remove obvious junk/dupes but DO NOT sort
+    universe = list(set([t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()]))
 
-    for t in universe:
+    # If you want to cap the *universe source* size (not scan order), do it after ranking logic.
+    # We'll build a liquidity-ranked scan list using cached dv20 first.
+    scored: list[tuple[str, float]] = []
+    unscored: list[str] = []
+
+    # Use the whole universe to form the candidate pool, but ranking by cached dv20 will prefer liquid names.
+    # CANDIDATE_POOL limits the number we consider for ranking (helps CPU).
+    pool = universe[: min(CANDIDATE_POOL, len(universe))]
+
+    for t in pool:
         dv = read_cached_dv20(t)
-        if dv is None:
+        if dv is None or not np.isfinite(dv) or dv <= 0:
             unscored.append(t)
         else:
-            ranked.append((t, float(dv)))
+            scored.append((t, float(dv)))
 
-    # Ordenar por dv20 desc, e por ticker asc como tie-breaker (determinístico)
-    ranked.sort(key=lambda x: (-x[1], x[0]))
+    # Evaluate highest cached liquidity first -> better use of limited fetch budget
+    scored.sort(key=lambda x: x[1], reverse=True)
+    ordered = [t for t, _ in scored] + unscored
 
-    # pool primeiro = top CANDIDATE_POOL por dv20, depois (se necessário) completar com unscored
-    pool = [t for t, _ in ranked[:min(CANDIDATE_POOL, len(ranked))]]
+    tickers = ordered[:MAX_TICKERS]
 
-    if len(pool) < CANDIDATE_POOL:
-        # manter determinístico: unscored já vem de universe sorted
-        need = CANDIDATE_POOL - len(pool)
-        pool.extend(unscored[:need])
+    # --- containers ---
+    execA: list[tuple] = []
+    execB: list[tuple] = []
+    watch_clean: list[tuple] = []
+    watch_over: list[tuple] = []
+    near: list[tuple] = []
 
-    # Tickes finais avaliados = MAX_TICKERS, primeiro por dv20 (pool já é top por dv20)
-    tickers = pool[:min(MAX_TICKERS, len(pool))]
-
-    execA, execB, watch, near = [], [], [], []
+    # --- diagnostics ---
     hits_limited = False
     no_data = 0
     hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
+    cache_used = 0
+    cache_miss = 0
+
+    # helper: load cached OHLCV if rate-limited (or if you want cache-first later)
+    def load_cached_ohlcv_local(ticker: str) -> pd.DataFrame | None:
+        p = cache_path(ticker)
+        if not p.exists():
+            return None
+        try:
+            df = pd.read_csv(p)
+            df.columns = [c.strip().lower() for c in df.columns]
+            need = ["date", "open", "high", "low", "close", "volume"]
+            if not all(c in df.columns for c in need):
+                return None
+            df = df[need].copy()
+            df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+            for c in ["open", "high", "low", "close", "volume"]:
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+            return df
+        except Exception:
+            return None
 
     for i, t in enumerate(tickers):
-        if hits_limited:
-            break
         try:
-            df = fetch_ohlcv_equity(t)
+            # If rate-limited: do NOT stop. Switch to cache-only evaluation.
+            if hits_limited:
+                df = load_cached_ohlcv_local(t)
+                if df is None:
+                    cache_miss += 1
+                    continue
+                cache_used += 1
+            else:
+                df = fetch_ohlcv_equity(t)
+
+            # numeric safety
             for c in ["open", "high", "low", "close", "volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
             df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
@@ -680,6 +717,7 @@ def main() -> None:
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
             sv20 = float(df["volume"].iloc[-20:].mean())
 
+            # liquidity / proxy caps
             if close_now < MIN_PX or close_now > MAX_PX:
                 continue
             if dv20 < MIN_DV20 or dv20 > MAX_DV20:
@@ -688,6 +726,7 @@ def main() -> None:
                 continue
             liq_ok += 1
 
+            # compression
             bbw = compute_bb_width(df, 20)
             bbz = zscore(bbw, 120)
             atrp = compute_atr(df, 14) / df["close"]
@@ -703,37 +742,46 @@ def main() -> None:
                 continue
             comp_ok += 1
 
+            # base
             ok, trig, lowb, dd, contr, win = base_scan(df)
             if not ok:
                 near.append((t, close_now, dv20, bbz_last, "BASE"))
                 continue
             base_ok += 1
 
+            # dry-up
             dry = dryup_ratio(df)
-            if not np.isfinite(dry) or dry >= DRYUP_MAX:
+            if (not np.isfinite(dry)) or (dry >= DRYUP_MAX):
                 near.append((t, close_now, dv20, bbz_last, "DRY"))
                 continue
             dry_ok += 1
 
+            # stop / R
             stop = lowb * 0.99
             R_pct = ((trig - stop) / trig * 100.0) if trig > 0 else np.nan
             if (not np.isfinite(R_pct)) or (R_pct < MIN_R_PCT):
                 near.append((t, close_now, dv20, bbz_last, f"LOW_R({R_pct:.1f}%)"))
                 continue
 
+            # distances
             dist_pct = ((trig - close_now) / close_now * 100.0) if close_now > 0 else np.nan
             overshoot_pct = ((close_now - trig) / trig * 100.0) if trig > 0 else 0.0
 
+            # overhead
             overhead = overhead_supply_touches(df, trig)
+
+            # watch maturation/stale (from signals.csv)
             stats = recent_watch_stats(t)
             boost, stale_pen = watch_boost_and_stale_penalty(stats["dists"])
 
+            # score
             sc = score_candidate(
                 bbz_last, atr_pctl, dd, contr, dry, dv20,
-                dist_pct if np.isfinite(dist_pct) else (DIST_LIMIT + 99.0),
+                dist_pct if np.isfinite(dist_pct) else (DIST_LIMIT + 999.0),
                 overhead, boost, stale_pen
             )
 
+            # EXEC logic (EOD confirmed)
             open_now = float(df["open"].iloc[-1])
             close_prev = float(df["close"].iloc[-2])
             vol_now = float(df["volume"].iloc[-1])
@@ -746,13 +794,14 @@ def main() -> None:
 
             quality_ok = (bbz_last <= EXEC_BBZ_MAX) or (atr_pctl <= EXEC_ATRPCTL_MAX)
             not_too_extended = overshoot_pct <= EXEC_MAX_OVERSHOOT_PCT
-
             prev_above = float(df["close"].iloc[-2]) > trig
 
             if breakout_now and vol_confirm and no_big_gap and quality_ok and not_too_extended:
                 sig = "EXEC_B" if prev_above else "EXEC_A"
-                item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop,
-                        overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct)
+                item = (
+                    sc, t, close_now, dv20, bbz_last, atr_pctl,
+                    trig, stop, overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct
+                )
                 (execB if sig == "EXEC_B" else execA).append(item)
 
                 append_signal_row({
@@ -769,10 +818,20 @@ def main() -> None:
                     "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
                     "regime": mode, "resolved": "0"
                 })
+
             else:
+                # Pre-breakout watchlist
                 if np.isfinite(dist_pct) and dist_pct <= DIST_LIMIT and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT:
-                    watch.append((sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop,
-                                  dist_pct, R_pct, overhead, win, boost, stale_pen))
+                    item = (
+                        sc, t, close_now, dv20, bbz_last, atr_pctl,
+                        trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
+                    )
+
+                    # split clean vs overhead (key tweak)
+                    if overhead <= 5:
+                        watch_clean.append(item)
+                    else:
+                        watch_over.append(item)
 
                     append_signal_row({
                         "date": now.split(" ")[0], "ticker": t, "signal": "WATCH",
@@ -794,30 +853,29 @@ def main() -> None:
             if "NO_DATA" in s:
                 no_data += 1
             elif "HITS_LIMIT" in s:
+                # switch to cache-only; DO NOT break the loop
                 hits_limited = True
+            # swallow other errors to keep scanner running
             pass
 
         if (i + 1) % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SECONDS)
 
-    # Sort outputs
+    # --- sorting / tops ---
     execA.sort(key=lambda x: x[0], reverse=True)
     execB.sort(key=lambda x: x[0], reverse=True)
-    watch.sort(key=lambda x: x[0], reverse=True)
+    watch_clean.sort(key=lambda x: x[0], reverse=True)
+    watch_over.sort(key=lambda x: x[0], reverse=True)
 
     execA = execA[:12]
     execB = execB[:12]
-
-    # split watch into clean vs overhead
-    watch_clean = [w for w in watch if w[10] <= 5]   # overhead index
-    watch_over = [w for w in watch if w[10] > 5]
-
     watch_clean = watch_clean[:7]
     watch_over = watch_over[:7]
     near = near[:10]
 
     emp = empirical_prob_by_score_bin(mode)
 
+    # --- message ---
     msg = [f"[{now}] ### V7_1_PREOPEN_FULL_TOP7 ### Microcap scanner (RANKED)"]
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
@@ -827,7 +885,7 @@ def main() -> None:
     msg.append(emp)
     msg.append(f"LEARNING: outcomes_updated={upd['updated']} | resolved_total={upd['resolved_total']}")
     if hits_limited:
-        msg.append("NOTA: Stooq rate-limit atingido; universo pode ter ficado incompleto.")
+        msg.append(f"NOTA: Stooq rate-limit; modo CACHE_ONLY ativado (cache_used={cache_used} cache_miss={cache_miss}).")
     msg.append("")
 
     if execB:
@@ -859,7 +917,8 @@ def main() -> None:
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
             msg.append(
                 f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
+                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
+                f"R%={Rp:.1f} | overhead={oh}"
             )
         msg.append("")
     else:
@@ -886,7 +945,6 @@ def main() -> None:
         msg.append("QUASE: (vazio)")
 
     tg_send("\n".join(msg))
-
 
 if __name__ == "__main__":
     main()
