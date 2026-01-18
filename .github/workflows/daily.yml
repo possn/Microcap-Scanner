@@ -48,7 +48,7 @@ jobs:
           MAX_DV20: "80000000"
           MIN_SV20: "600000"
 
-          BBZ_GATE: "-0.70"
+          BBZ_GATE: "-0.65"
           ATRPCTL_GATE: "0.45"
 
           BASE_DD_MAX: "0.55"
