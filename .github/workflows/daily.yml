@@ -1,16 +1,20 @@
-name: microcap-scanner
+name: microcap-scanner-daily
 
 on:
   workflow_dispatch: {}
   schedule:
     - cron: "0 12 * * *"
-    
+
+permissions:
+  contents: write
 
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -26,9 +30,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: cache
-          key: microcap-cache-${{ github.run_id }}
+          key: microcap-cache-v1
           restore-keys: |
-            microcap-cache- 
+            microcap-cache-
 
       - name: Run scanner
         env:
@@ -83,3 +87,11 @@ jobs:
           SLEEP_SECONDS: "3.0"
         run: |
           python scanner.py
+
+      - name: Save signals history to repo (commit)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add cache/signals.csv || true
+          git commit -m "Update signals.csv" || exit 0
+          git push
