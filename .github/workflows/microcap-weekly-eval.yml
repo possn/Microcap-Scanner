@@ -1,94 +1,45 @@
-name: microcap-scanner
+name: microcap-weekly-eval
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
   schedule:
-    - cron: "0 12 * * *"   # diário às 12:00 UTC (13:00 PT inverno / 14:00 PT verão)
-
-permissions:
-  contents: write
+    # Sábado 08:30 UTC (em Portugal: 08:30 no inverno, 09:30 no verão)
+    - cron: "30 8 * * 6"
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-
-      # 1) Checkout do repositório
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2) Setup Python
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 3) Instalar dependências
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # 4) CACHE DOS DADOS (CRÍTICO PARA STOOQ / PERFORMANCE)
       - name: Cache data
         uses: actions/cache@v4
         with:
           path: cache
           key: microcap-cache-v1
+          restore-keys: |
+            microcap-cache-
 
-      # 5) Executar scanner
-      - name: Run scanner
+      # Se já tiveres weekly_eval.py no repo, isto corre a avaliação semanal real.
+      # Se NÃO tiveres, este job vai falhar — e aí eu digo-te exactamente a alternativa.
+      - name: Run weekly evaluation
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
-          IWC_HOLDINGS_CSV_URL: ${{ secrets.IWC_HOLDINGS_CSV_URL }}
-          IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
-          IJR_HOLDINGS_CSV_URL: ${{ secrets.IJR_HOLDINGS_CSV_URL }}
-
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
-
-          MAX_TICKERS: "650"
-          CANDIDATE_POOL: "2600"
-
-          MIN_PX: "1.0"
-          MAX_PX: "25"
-          MIN_DV20: "3000000"
-          MAX_DV20: "80000000"
-          MIN_SV20: "600000"
-
-          BBZ_GATE: "-0.65"
-          ATRPCTL_GATE: "0.45"
-
-          BASE_DD_MAX: "0.55"
-          CONTRACTION_MAX: "0.85"
-          DRYUP_MAX: "1.05"
-
-          VOL_CONFIRM_MULT: "1.18"
-          MAX_GAP_UP: "1.12"
-
-          DIST_MAX_PCT: "16.0"
-          EXEC_MAX_OVERSHOOT_PCT: "6.0"
-
-          EXEC_BBZ_MAX: "-1.10"
-          EXEC_ATRPCTL_MAX: "0.30"
-
-          MIN_R_PCT: "8.0"
-
-          OVERHEAD_WINDOW: "200"
-          OVERHEAD_BAND_PCT: "8.0"
-          OVERHEAD_MAX_TOUCHES: "15"
-
-          WATCH_BOOST_MIN_DAYS: "3"
-          WATCH_STALE_DAYS: "10"
-
-          HORIZON_SESS: "40"
-
           REG_QQQ: "QQQ"
           REG_VIX: "VIX"
-
-          SLEEP_EVERY: "25"
-          SLEEP_SECONDS: "3.0"
-
-        run: python scanner.py
+        run: |
+          python weekly_eval.py
