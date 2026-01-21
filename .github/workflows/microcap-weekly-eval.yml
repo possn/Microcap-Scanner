@@ -1,0 +1,41 @@
+name: microcap-weekly-eval
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # Domingo 18:00 UTC (ajusta se quiseres)
+    - cron: "0 18 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Restore cache (ohlcv/signals)
+        uses: actions/cache@v4
+        with:
+          path: cache
+          restore-keys: |
+            microcap-cache-
+
+      - name: Run weekly evaluation (EXEC only)
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          HORIZON_SESS: "40"
+        run: |
+          python evaluate_results.py
