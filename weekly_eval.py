@@ -1,3 +1,7 @@
+# weekly_eval.py  (QUANT v5 - rolling 4 semanas)
+# - Mantém v4: sanity, alinhamento T/T-1/T+1, buckets, persistência weekly_summary.csv
+# - NOVO: calcula ROLLING-4 (média móvel 4 semanas) e imprime bloco para decisão estrutural
+
 import os
 import io
 import csv
@@ -14,15 +18,19 @@ OHLCV_FMT = os.getenv("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i
 
 SIGNALS_CSV = Path("cache/signals.csv")
 CACHE_OHLCV_DIR = Path("cache/ohlcv")
-
 SUMMARY_CSV = Path("cache/weekly_summary.csv")
 
 HORIZON_SESS = int(os.getenv("WEEKLY_HORIZON_SESS", "5"))
 WATCH_OVERHEAD_CLEAN_MAX = int(os.getenv("WATCH_OVERHEAD_CLEAN_MAX", "5"))
 
-# sanity thresholds (tune only if needed)
+# sanity thresholds
 SANITY_MIN_COVERAGE_PCT = float(os.getenv("SANITY_MIN_COVERAGE_PCT", "0.65"))  # 65%
 SANITY_MAX_WEEKLY_JUMP_PP = float(os.getenv("SANITY_MAX_WEEKLY_JUMP_PP", "20")) # 20pp jump as "suspect"
+
+# rolling decision thresholds (apenas informativos)
+ROLL_MIN_WEEKS_STRUCTURAL = int(os.getenv("ROLL_MIN_WEEKS_STRUCTURAL", "4"))
+ROLL_SUCCESS_UP_PP = float(os.getenv("ROLL_SUCCESS_UP_PP", "10"))  # +10pp vs baseline
+ROLL_MAE_WORSEN_PP = float(os.getenv("ROLL_MAE_WORSEN_PP", "1"))    # não piorar mais que 1pp
 
 # -------------------------
 # Telegram
@@ -135,7 +143,7 @@ def _align_index_T_Tm1_Tp1(o: pd.DataFrame, target_date: datetime.date) -> int |
     if len(idxs) > 0:
         return int(idxs[0])
 
-    # T+1 (next trading day after target)
+    # T+1
     after = np.where(o_dates > target_date)[0]
     if len(after) > 0:
         return int(after[0])
@@ -159,10 +167,6 @@ def retfmt(x: float | None) -> str:
 # Metric computation
 # -------------------------
 def compute_metrics(df_sig: pd.DataFrame, horizon: int) -> dict:
-    """
-    Success definition (shared for EXEC + WATCH):
-      success = exists close > trig within horizon
-    """
     res = {
         "n": int(len(df_sig)),
         "coverage": 0,
@@ -217,7 +221,6 @@ def compute_metrics(df_sig: pd.DataFrame, horizon: int) -> dict:
             first = int(np.argmax(above))
             if first + 1 < len(closes):
                 h = bool(closes[first + 1] > trig)
-            # fail-fast proxy: falls below trig within 2 sessions after first success
             j2 = min(first + 2, len(closes) - 1)
             if np.any(closes[first:j2 + 1] < trig):
                 ff = True
@@ -245,16 +248,12 @@ def compute_metrics(df_sig: pd.DataFrame, horizon: int) -> dict:
     return res
 
 # -------------------------
-# Buckets
+# Buckets (compact)
 # -------------------------
 def bucket_series(x: pd.Series, edges: list[float], labels: list[str]) -> pd.Series:
     return pd.cut(x, bins=edges, labels=labels, include_lowest=True)
 
 def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
-    """
-    Compact: bucket -> n, cov, success%, MFE_med, MAE
-    Only prints buckets with cov >= 5 to reduce noise.
-    """
     out = []
     if df.empty:
         return out
@@ -269,7 +268,6 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
 
     out.append(title)
 
-    # Overhead
     if "overhead_touches" in df.columns:
         oh = df["overhead_touches"].fillna(-1)
         b = bucket_series(oh, [-1, 3, 8, 15, 30, 10_000], ["0-3", "4-8", "9-15", "16-30", "31+"])
@@ -280,7 +278,6 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
             if m["coverage"] >= 5:
                 out.append(line(g, f"OH {name}"))
 
-    # Dist
     if "dist_pct" in df.columns:
         d = df["dist_pct"]
         b = bucket_series(d, [-999, 2, 4, 8, 12, 999], ["≤2", "2-4", "4-8", "8-12", ">12"])
@@ -291,7 +288,6 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
             if m["coverage"] >= 5:
                 out.append(line(g, f"DIST {name}%"))
 
-    # BBZ
     if "bbz" in df.columns:
         z = df["bbz"]
         b = bucket_series(z, [-999, -1.4, -1.2, -1.0, -0.8, 999], ["≤-1.4", "-1.4..-1.2", "-1.2..-1.0", "-1.0..-0.8", ">-0.8"])
@@ -302,7 +298,6 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
             if m["coverage"] >= 5:
                 out.append(line(g, f"BBZ {name}"))
 
-    # ATRpctl
     if "atrpctl" in df.columns:
         a = df["atrpctl"]
         b = bucket_series(a, [-999, 0.15, 0.20, 0.25, 0.30, 999], ["≤0.15", "0.15..0.20", "0.20..0.25", "0.25..0.30", ">0.30"])
@@ -357,53 +352,106 @@ def append_week_summary(row: dict) -> None:
         w = csv.DictWriter(f, fieldnames=cols)
         w.writerow({c: row.get(c, "") for c in cols})
 
-def read_last_summary() -> dict | None:
+def load_summary_df() -> pd.DataFrame:
     if not SUMMARY_CSV.exists():
-        return None
+        return pd.DataFrame()
     try:
         s = pd.read_csv(SUMMARY_CSV)
         if s.empty:
-            return None
-        last = s.iloc[-1].to_dict()
-        return last
+            return pd.DataFrame()
+        return s
     except Exception:
-        return None
+        return pd.DataFrame()
 
 # -------------------------
-# SANITY + INSIGHTS policy
+# SANITY + ROLLING
 # -------------------------
-def sanity_checks(total: int, watch_m: dict, last: dict | None) -> list[str]:
-    """
-    Returns list of FAIL reasons. Empty => OK.
-    """
+def sanity_checks(total: int, watch_m: dict, prev_week: dict | None) -> list[str]:
     fails = []
     if total <= 0:
         fails.append("Sinais=0 (weekly sem dados)")
 
-    # Coverage
     if watch_m["n"] > 0:
         cov_pct = (watch_m["coverage"] / max(1, watch_m["n"]))
         if cov_pct < SANITY_MIN_COVERAGE_PCT:
             fails.append(f"Coverage baixo em WATCH ({cov_pct*100:.0f}%) — provável cache/OHLCV/alinhamento")
 
-    # Sudden jump vs last week (if exists and comparable)
-    if last is not None:
+    if prev_week is not None:
         try:
-            prev = float(last.get("watch_success", "nan"))
+            prev = float(prev_week.get("watch_success", "nan"))
             cur = float(watch_m["success_rate"]) if np.isfinite(watch_m["success_rate"]) else np.nan
             if np.isfinite(prev) and np.isfinite(cur):
                 diff_pp = abs((cur - prev) * 100.0)
                 if diff_pp >= SANITY_MAX_WEEKLY_JUMP_PP:
-                    fails.append(f"Salto anómalo na success WATCH vs semana anterior ({diff_pp:.0f}pp) — verificar alinhamento T/T-1/T+1 e cache")
+                    fails.append(f"Salto anómalo na success WATCH vs semana anterior ({diff_pp:.0f}pp) — verificar alinhamento e cache")
         except Exception:
             pass
 
     return fails
 
-def insights_monitoring_note(weeks_observed: int) -> str:
-    if weeks_observed < 4:
-        return f"INSIGHTS: em modo MONITORIZAR (amostra={weeks_observed} semanas; só propor mudanças estruturais ≥4 semanas)."
-    return f"INSIGHTS: amostra={weeks_observed} semanas (elegível para propostas estruturais se efeitos forem consistentes)."
+def _to_float(x):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else np.nan
+    except Exception:
+        return np.nan
+
+def rolling4_block(sdf: pd.DataFrame) -> list[str]:
+    """
+    Mostra rolling-4 (média) das métricas chave.
+    Se <4 semanas, mostra "em construção".
+    """
+    out = []
+    if sdf.empty:
+        out.append("📈 ROLLING-4: sem histórico (weekly_summary.csv vazio).")
+        return out
+
+    # sort by week_end
+    try:
+        sdf["week_end_dt"] = pd.to_datetime(sdf["week_end"], errors="coerce")
+        sdf = sdf.dropna(subset=["week_end_dt"]).sort_values("week_end_dt")
+    except Exception:
+        pass
+
+    n_weeks = len(sdf)
+    tail = sdf.tail(min(ROLL_MIN_WEEKS_STRUCTURAL, n_weeks)).copy()
+
+    # numeric columns
+    for c in ["watch_success","watch_clean_success","watch_over_success","watch_mae","watch_mfe_med","watch_cov_pct"]:
+        if c in tail.columns:
+            tail[c] = pd.to_numeric(tail[c], errors="coerce")
+
+    if n_weeks < ROLL_MIN_WEEKS_STRUCTURAL:
+        out.append(f"📈 ROLLING-4: em construção ({n_weeks}/{ROLL_MIN_WEEKS_STRUCTURAL} semanas).")
+    else:
+        out.append("📈 ROLLING-4 (últimas 4 semanas):")
+
+    def mean_col(c):
+        if c not in tail.columns:
+            return np.nan
+        v = tail[c].dropna()
+        return float(v.mean()) if len(v) else np.nan
+
+    r_cov = mean_col("watch_cov_pct")
+    r_all = mean_col("watch_success")
+    r_clean = mean_col("watch_clean_success")
+    r_over = mean_col("watch_over_success")
+    r_mae = mean_col("watch_mae")
+    r_mfe = mean_col("watch_mfe_med")
+
+    out.append(f"- WATCH cov%: {pct(r_cov)}")
+    out.append(f"- WATCH success: {pct(r_all)} | LIMPO: {pct(r_clean)} | TETO: {pct(r_over)}")
+    out.append(f"- WATCH MFE_med: {retfmt(r_mfe)} | MAE: {retfmt(r_mae)}")
+
+    # Optional: eligibility hint (não altera modelo, apenas “semáforo”)
+    if n_weeks >= ROLL_MIN_WEEKS_STRUCTURAL and np.isfinite(r_all):
+        # comparar LIMPO vs TETO se ambos existem
+        if np.isfinite(r_clean) and np.isfinite(r_over):
+            diff_pp = (r_over - r_clean) * 100.0
+            out.append(f"- Δ(TETO-LIMPO) success: {diff_pp:+.0f}pp (rolling-4)")
+        out.append("Critério p/ mudar estruturalmente (guia): efeito ≥ +10pp e MAE não piorar >1pp, consistente.")
+
+    return out
 
 # -------------------------
 # MAIN
@@ -435,7 +483,6 @@ def main() -> None:
     exec_df = wdf[wdf["signal"].astype(str).isin(["EXEC_A", "EXEC_B"])].copy()
     watch_df = wdf[wdf["signal"].astype(str) == "WATCH"].copy()
 
-    # WATCH split
     watch_df["overhead_touches"] = pd.to_numeric(watch_df.get("overhead_touches", np.nan), errors="coerce")
     watch_clean = watch_df[watch_df["overhead_touches"] <= WATCH_OVERHEAD_CLEAN_MAX].copy()
     watch_over = watch_df[watch_df["overhead_touches"] > WATCH_OVERHEAD_CLEAN_MAX].copy()
@@ -465,29 +512,17 @@ def main() -> None:
         "watch_mfe_med": round(float(m_watch_all["mfe_median"]), 6) if np.isfinite(m_watch_all["mfe_median"]) else "",
     })
 
-    # Determine weeks observed
-    weeks_observed = 1
-    try:
-        s = pd.read_csv(SUMMARY_CSV)
-        weeks_observed = int(len(s))
-    except Exception:
-        pass
+    sdf = load_summary_df()
+    prev_week = None
+    if len(sdf) >= 2:
+        prev_week = sdf.iloc[-2].to_dict()
 
-    last = read_last_summary()  # after append => "this week"; for sanity vs previous we need previous
-    prev = None
-    try:
-        s = pd.read_csv(SUMMARY_CSV)
-        if len(s) >= 2:
-            prev = s.iloc[-2].to_dict()
-    except Exception:
-        prev = None
-
-    # SANITY checks
-    sanity_fails = sanity_checks(total, m_watch_all, prev)
+    # SANITY
+    sanity_fails = sanity_checks(total, m_watch_all, prev_week)
 
     # Build message
     msg = []
-    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v4)")
+    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v5)")
     msg.append(f"Janela (últimos 5 dias úteis): {start} → {end}")
     msg.append(f"Horizonte métricas: {HORIZON_SESS} sessões")
     msg.append("")
@@ -502,20 +537,19 @@ def main() -> None:
     msg.append(f"  TETO(>{WATCH_OVERHEAD_CLEAN_MAX}):  cov={m_watch_over['coverage']}/{m_watch_over['n']}  S={pct(m_watch_over['success_rate'])}  MFE_med={retfmt(m_watch_over['mfe_median'])}  MAE={retfmt(m_watch_over['mae_mean'])}")
     msg.append("")
 
-    # SANITY block
     if sanity_fails:
         msg.append("🧯 SANITY: FAIL (corrigir já)")
         for f in sanity_fails:
             msg.append(f"- {f}")
-        msg.append("Ação típica: verificar cache restore, rate-limit Stooq, e alinhamento de datas (T/T-1/T+1).")
+        msg.append("Ação típica: verificar cache restore, rate-limit Stooq, e alinhamento de datas.")
     else:
         msg.append("✅ SANITY: OK (sem bugs críticos detectados)")
 
     msg.append("")
-    msg.append(insights_monitoring_note(weeks_observed))
+    msg.extend(rolling4_block(sdf))
     msg.append("")
 
-    # INSIGHTS buckets (WATCH always; EXEC only if exists)
+    # Buckets
     if len(watch_df) > 0:
         msg.extend(bucket_report(watch_df, HORIZON_SESS, "Buckets WATCH (monitorizar):"))
         msg.append("")
@@ -523,11 +557,10 @@ def main() -> None:
         msg.extend(bucket_report(exec_df, HORIZON_SESS, "Buckets EXEC (monitorizar):"))
         msg.append("")
 
-    # Minimal, non-structural suggestion (only classification)
     msg.append("Ações:")
     msg.append("• Bugs: corrigir imediatamente se SANITY=FAIL.")
-    msg.append("• Modelo: manter parâmetros; acumular 4 semanas antes de alterações estruturais.")
-    msg.append("• Histórico: weekly_summary.csv actualizado (serve de base para decisões em 4 semanas).")
+    msg.append(f"• Modelo: sem alterações estruturais até acumular ≥{ROLL_MIN_WEEKS_STRUCTURAL} semanas (usar ROLLING-4).")
+    msg.append("• Histórico: weekly_summary.csv actualizado (base para decisões).")
 
     tg_send("\n".join(msg))
 
