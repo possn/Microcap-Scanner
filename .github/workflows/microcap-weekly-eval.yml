@@ -6,7 +6,7 @@ on:
     - cron: "0 13 * * 6"   # Sábado 13:00 UTC
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   run:
@@ -26,7 +26,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Restore cache/ (inclui cache/ohlcv do daily) para aumentar coverage
       - name: Cache data (restore)
         uses: actions/cache@v4
         with:
@@ -41,8 +40,18 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
 
-          # parâmetros do weekly_eval.py v2
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
+
+          SANITY_MIN_COVERAGE_PCT: "0.65"
+          SANITY_MAX_WEEKLY_JUMP_PP: "20"
         run: |
           python weekly_eval.py
+
+      - name: Save weekly summary to repo (commit)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add cache/weekly_summary.csv || true
+          git commit -m "Update weekly_summary.csv" || exit 0
+          git push
