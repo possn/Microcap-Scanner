@@ -7,25 +7,21 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
-# =========================
-# ENV
-# =========================
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 OHLCV_FMT = os.getenv("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d")
 
 SIGNALS_CSV = Path("cache/signals.csv")
 
-# horizonte para métricas semanais (curto prazo)
-HORIZON_SESS = int(os.getenv("WEEKLY_HORIZON_SESS", "5"))  # 5 sessões por defeito
+HORIZON_SESS = int(os.getenv("WEEKLY_HORIZON_SESS", "5"))  # horizonte default = 5 sessões
+WATCH_OVERHEAD_CLEAN_MAX = int(os.getenv("WATCH_OVERHEAD_CLEAN_MAX", "5"))  # LIMPO <=5 (alinha com scanner)
 
 
-# =========================
+# -------------------------
 # Telegram
-# =========================
+# -------------------------
 def tg_send(text: str) -> None:
     if not TG_TOKEN or not TG_CHAT_ID:
-        print("Telegram secrets missing; printing only.")
         print(text)
         return
     url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
@@ -33,21 +29,18 @@ def tg_send(text: str) -> None:
     try:
         r = requests.post(url, json=payload, timeout=30)
         r.raise_for_status()
-    except Exception as e:
-        print("Telegram send failed:", e)
+    except Exception:
         print(text)
 
 
-# =========================
-# OHLCV fetch (EOD)
-# =========================
+# -------------------------
+# OHLCV fetch (best effort)
+# -------------------------
 def _build_symbol_for_stooq(ticker: str) -> str:
-    # no teu scanner: t.replace("-", ".") antes do format
     return ticker.lower().replace("-", ".")
 
 def _candidate_urls(ticker: str) -> list[str]:
     sym = _build_symbol_for_stooq(ticker)
-    # tenta as duas variações para maximizar robustez
     if ".us" in OHLCV_FMT.lower():
         return [OHLCV_FMT.format(symbol=sym), OHLCV_FMT.format(symbol=f"{sym}.us")]
     return [OHLCV_FMT.format(symbol=sym), OHLCV_FMT.format(symbol=f"{sym}.us")]
@@ -83,11 +76,10 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame | None:
     return None
 
 
-# =========================
-# Date helpers
-# =========================
+# -------------------------
+# Helpers
+# -------------------------
 def last_n_business_days(end_date: datetime, n: int = 5) -> list[datetime.date]:
-    # considera dias úteis; suficiente para o teu objectivo semanal (proxy)
     d = end_date.date()
     out = []
     while len(out) < n:
@@ -101,46 +93,37 @@ def pct(x: float | None) -> str:
         return "—"
     return f"{x*100:.0f}%"
 
-def pct1(x: float | None) -> str:
-    if x is None or (not np.isfinite(x)):
-        return "—"
-    return f"{x*100:.1f}%"
-
 def retfmt(x: float | None) -> str:
     if x is None or (not np.isfinite(x)):
         return "—"
     return f"{x*100:.1f}%"
 
 
-# =========================
-# Metrics for EXEC_A / EXEC_B
-# =========================
+# -------------------------
+# Metrics engines
+# -------------------------
+def _align_index_by_date(o: pd.DataFrame, target_date: datetime.date) -> int | None:
+    o_dates = o["date"].dt.date.values
+    idxs = np.where(o_dates == target_date)[0]
+    if len(idxs) == 0:
+        return None
+    return int(idxs[0])
+
 def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
-    """
-    Métricas:
-      - breakout_rate: houve algum close > trig nos próximos 'horizon' dias (inclui dia do sinal)
-      - hold1_rate: após o 1º close > trig, o close do dia seguinte também > trig
-      - fail_fast_rate: após 1º close > trig, existe close < trig dentro de 2 dias (proxy de falso breakout)
-      - mfe/mae: max(high)/entry - 1 ; min(low)/entry - 1 no horizonte
-    """
     res = {
         "n": int(len(exec_df)),
+        "coverage": 0,
         "breakout_rate": np.nan,
         "hold1_rate": np.nan,
         "fail_fast_rate": np.nan,
         "mfe_mean": np.nan,
         "mfe_median": np.nan,
         "mae_mean": np.nan,
-        "coverage": 0,  # quantos conseguiram OHLCV+matching date
     }
     if exec_df.empty:
         return res
 
-    breakout = []
-    hold1 = []
-    fail_fast = []
-    mfe = []
-    mae = []
+    breakout, hold1, fail_fast, mfe, mae = [], [], [], [], []
 
     for _, r in exec_df.iterrows():
         t = str(r.get("ticker", "")).strip().upper()
@@ -150,7 +133,6 @@ def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
         dt = pd.to_datetime(r.get("date", None), errors="coerce")
         trig = pd.to_numeric(r.get("trig", np.nan), errors="coerce")
         entry = pd.to_numeric(r.get("close", np.nan), errors="coerce")
-
         if pd.isna(dt) or (not np.isfinite(trig)) or trig <= 0 or (not np.isfinite(entry)) or entry <= 0:
             continue
 
@@ -158,14 +140,10 @@ def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
         if o is None or o.empty:
             continue
 
-        # alinhar com a data do sinal
-        o_dates = o["date"].dt.date.values
-        target = dt.date()
-        idxs = np.where(o_dates == target)[0]
-        if len(idxs) == 0:
+        i0 = _align_index_by_date(o, dt.date())
+        if i0 is None:
             continue
 
-        i0 = int(idxs[0])
         i1 = min(i0 + horizon, len(o) - 1)
         sl = o.iloc[i0:i1 + 1].copy()
         if sl.empty:
@@ -178,7 +156,6 @@ def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
         b = bool(np.any(above))
         breakout.append(b)
 
-        # hold+1
         h = False
         ff = False
         if b:
@@ -186,7 +163,6 @@ def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
             if first + 1 < len(closes):
                 h = bool(closes[first + 1] > trig)
 
-            # fail-fast: fecha abaixo do trig em <=2 dias após o 1º acima
             j2 = min(first + 2, len(closes) - 1)
             if np.any(closes[first:j2 + 1] < trig):
                 ff = True
@@ -194,7 +170,6 @@ def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
         hold1.append(h)
         fail_fast.append(ff)
 
-        # MFE/MAE vs entry close do sinal
         mx = float(sl["high"].max())
         mn = float(sl["low"].min())
         mfe.append((mx / entry) - 1.0)
@@ -214,10 +189,95 @@ def compute_exec_metrics(exec_df: pd.DataFrame, horizon: int) -> dict:
 
     return res
 
+def compute_watch_metrics_B(watch_df: pd.DataFrame, horizon: int) -> dict:
+    """
+    Definição B:
+      sucesso = existe pelo menos 1 sessão com close > trig no horizonte.
+    """
+    res = {
+        "n": int(len(watch_df)),
+        "coverage": 0,
+        "success_rate": np.nan,
+        "hold1_rate": np.nan,
+        "fail_fast_rate": np.nan,
+        "mfe_mean": np.nan,
+        "mfe_median": np.nan,
+        "mae_mean": np.nan,
+    }
+    if watch_df.empty:
+        return res
 
-# =========================
-# MAIN weekly eval
-# =========================
+    success, hold1, fail_fast, mfe, mae = [], [], [], [], []
+
+    for _, r in watch_df.iterrows():
+        t = str(r.get("ticker", "")).strip().upper()
+        if not t:
+            continue
+
+        dt = pd.to_datetime(r.get("date", None), errors="coerce")
+        trig = pd.to_numeric(r.get("trig", np.nan), errors="coerce")
+        entry = pd.to_numeric(r.get("close", np.nan), errors="coerce")
+
+        if pd.isna(dt) or (not np.isfinite(trig)) or trig <= 0 or (not np.isfinite(entry)) or entry <= 0:
+            continue
+
+        o = fetch_ohlcv_equity(t)
+        if o is None or o.empty:
+            continue
+
+        i0 = _align_index_by_date(o, dt.date())
+        if i0 is None:
+            continue
+
+        i1 = min(i0 + horizon, len(o) - 1)
+        sl = o.iloc[i0:i1 + 1].copy()
+        if sl.empty:
+            continue
+
+        res["coverage"] += 1
+
+        closes = sl["close"].values
+        above = closes > trig
+        s = bool(np.any(above))
+        success.append(s)
+
+        h = False
+        ff = False
+        if s:
+            first = int(np.argmax(above))
+            if first + 1 < len(closes):
+                h = bool(closes[first + 1] > trig)
+
+            j2 = min(first + 2, len(closes) - 1)
+            if np.any(closes[first:j2 + 1] < trig):
+                ff = True
+
+        hold1.append(h)
+        fail_fast.append(ff)
+
+        mx = float(sl["high"].max())
+        mn = float(sl["low"].min())
+        mfe.append((mx / entry) - 1.0)
+        mae.append((mn / entry) - 1.0)
+
+    if success:
+        res["success_rate"] = float(np.mean(success))
+    if hold1:
+        res["hold1_rate"] = float(np.mean(hold1))
+    if fail_fast:
+        res["fail_fast_rate"] = float(np.mean(fail_fast))
+    if mfe:
+        res["mfe_mean"] = float(np.mean(mfe))
+        res["mfe_median"] = float(np.median(mfe))
+    if mae:
+        res["mae_mean"] = float(np.mean(mae))
+
+    return res
+
+
+# -------------------------
+# MAIN
+# -------------------------
 def main() -> None:
     now = datetime.now(ZoneInfo("Europe/Lisbon"))
     days = last_n_business_days(now, 5)
@@ -237,34 +297,37 @@ def main() -> None:
         tg_send("⚠ MICROCAP WEEKLY REVIEW\nsignals.csv está vazio.")
         return
 
-    # normalizar
     df["date"] = pd.to_datetime(df.get("date", None), errors="coerce")
     df = df.dropna(subset=["date"]).copy()
     df["day"] = df["date"].dt.date
 
     wdf = df[(df["day"] >= start) & (df["day"] <= end)].copy()
 
-    # contagens
     total = int(len(wdf))
     execB = wdf[wdf.get("signal", "").astype(str) == "EXEC_B"].copy()
     execA = wdf[wdf.get("signal", "").astype(str) == "EXEC_A"].copy()
     watch = wdf[wdf.get("signal", "").astype(str) == "WATCH"].copy()
 
-    # WATCH split: por overhead_touches (já logado pelo scanner)
+    # WATCH split por overhead_touches
     watch["overhead_touches"] = pd.to_numeric(watch.get("overhead_touches", np.nan), errors="coerce")
-    watch_clean = watch[watch["overhead_touches"] <= 5]
-    watch_over = watch[watch["overhead_touches"] > 5]
+    watch_clean = watch[watch["overhead_touches"] <= WATCH_OVERHEAD_CLEAN_MAX]
+    watch_over = watch[watch["overhead_touches"] > WATCH_OVERHEAD_CLEAN_MAX]
 
     # métricas EXEC
     mB = compute_exec_metrics(execB, HORIZON_SESS)
     mA = compute_exec_metrics(execA, HORIZON_SESS)
 
-    # mensagem
+    # métricas WATCH (B)
+    wAll = compute_watch_metrics_B(watch, HORIZON_SESS)
+    wC = compute_watch_metrics_B(watch_clean, HORIZON_SESS)
+    wO = compute_watch_metrics_B(watch_over, HORIZON_SESS)
+
     msg = []
-    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT)")
+    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v2)")
     msg.append(f"Janela (últimos 5 dias úteis): {start} → {end}")
     msg.append(f"Horizonte métricas: {HORIZON_SESS} sessões")
     msg.append("")
+
     msg.append(f"Sinais na janela: {total}")
     msg.append(
         f"• EXEC_B: {len(execB)} | EXEC_A: {len(execA)} | WATCH: {len(watch)} "
@@ -272,29 +335,34 @@ def main() -> None:
     )
     msg.append("")
 
-    msg.append(f"EXEC_B (coverage={mB['coverage']}/{mB['n']} com OHLCV+data):")
-    msg.append(f"• Breakout: {pct(mB['breakout_rate'])} | Hold+1: {pct(mB['hold1_rate'])} | Fail-fast: {pct(mB['fail_fast_rate'])}")
-    msg.append(f"• MFE mean/med: {retfmt(mB['mfe_mean'])} / {retfmt(mB['mfe_median'])} | MAE mean: {retfmt(mB['mae_mean'])}")
+    # EXEC
+    msg.append(f"EXEC_B (coverage={mB['coverage']}/{mB['n']}): Breakout {pct(mB['breakout_rate'])} | Hold+1 {pct(mB['hold1_rate'])} | Fail-fast {pct(mB['fail_fast_rate'])}")
+    msg.append(f"      MFE mean/med {retfmt(mB['mfe_mean'])}/{retfmt(mB['mfe_median'])} | MAE mean {retfmt(mB['mae_mean'])}")
+    msg.append(f"EXEC_A (coverage={mA['coverage']}/{mA['n']}): Breakout {pct(mA['breakout_rate'])} | Hold+1 {pct(mA['hold1_rate'])} | Fail-fast {pct(mA['fail_fast_rate'])}")
+    msg.append(f"      MFE mean/med {retfmt(mA['mfe_mean'])}/{retfmt(mA['mfe_median'])} | MAE mean {retfmt(mA['mae_mean'])}")
     msg.append("")
 
-    msg.append(f"EXEC_A (coverage={mA['coverage']}/{mA['n']} com OHLCV+data):")
-    msg.append(f"• Breakout: {pct(mA['breakout_rate'])} | Hold+1: {pct(mA['hold1_rate'])} | Fail-fast: {pct(mA['fail_fast_rate'])}")
-    msg.append(f"• MFE mean/med: {retfmt(mA['mfe_mean'])} / {retfmt(mA['mfe_median'])} | MAE mean: {retfmt(mA['mae_mean'])}")
+    # WATCH (B)
+    msg.append("WATCH (definição B: sucesso = close > trig em ≤ horizonte)")
+    msg.append(f"• WATCH_ALL   (coverage={wAll['coverage']}/{wAll['n']}): Success {pct(wAll['success_rate'])} | Hold+1 {pct(wAll['hold1_rate'])} | Fail-fast {pct(wAll['fail_fast_rate'])}")
+    msg.append(f"             MFE mean/med {retfmt(wAll['mfe_mean'])}/{retfmt(wAll['mfe_median'])} | MAE mean {retfmt(wAll['mae_mean'])}")
+    msg.append(f"• WATCH_LIMPO (≤{WATCH_OVERHEAD_CLEAN_MAX}) (coverage={wC['coverage']}/{wC['n']}): Success {pct(wC['success_rate'])} | Hold+1 {pct(wC['hold1_rate'])} | Fail-fast {pct(wC['fail_fast_rate'])}")
+    msg.append(f"             MFE mean/med {retfmt(wC['mfe_mean'])}/{retfmt(wC['mfe_median'])} | MAE mean {retfmt(wC['mae_mean'])}")
+    msg.append(f"• WATCH_TETO  (>{WATCH_OVERHEAD_CLEAN_MAX}) (coverage={wO['coverage']}/{wO['n']}): Success {pct(wO['success_rate'])} | Hold+1 {pct(wO['hold1_rate'])} | Fail-fast {pct(wO['fail_fast_rate'])}")
+    msg.append(f"             MFE mean/med {retfmt(wO['mfe_mean'])}/{retfmt(wO['mfe_median'])} | MAE mean {retfmt(wO['mae_mean'])}")
     msg.append("")
 
-    # diagnóstico operacional simples
+    # Diagnóstico automático mínimo
     msg.append("Diagnóstico automático:")
-    if np.isfinite(mB["fail_fast_rate"]) and mB["fail_fast_rate"] >= 0.35:
-        msg.append("• Fail-fast elevado em EXEC_B → overhead supply / distância / gaps demasiado permissivos.")
-    if np.isfinite(mB["breakout_rate"]) and mB["breakout_rate"] <= 0.40 and len(execB) >= 5:
-        msg.append("• Breakout baixo em EXEC_B → triggers demasiado altos ou regime desfavorável.")
-    if len(watch_over) > len(watch_clean) and (len(watch) >= 6):
-        msg.append("• WATCH_TETO domina → filtro overhead (ou scoring) está frouxo.")
-    if (mB["coverage"] + mA["coverage"]) == 0 and (mB["n"] + mA["n"]) > 0:
-        msg.append("• Sem coverage OHLCV → Stooq/URL indisponível ou datas não alinham.")
-    if msg[-1] == "Diagnóstico automático:":
-        msg.append("• Sem alertas críticos na semana.")
-
+    if len(watch) >= 10 and np.isfinite(wC["success_rate"]) and np.isfinite(wO["success_rate"]):
+        if wC["success_rate"] >= wO["success_rate"] + 0.10:
+            msg.append("• LIMPO supera TETO de forma material → reforçar penalização/filtragem de overhead faz sentido.")
+        elif wO["success_rate"] >= wC["success_rate"] + 0.10:
+            msg.append("• TETO supera LIMPO de forma material → overhead proxy pode estar a penalizar setups bons (rever banda/janela).")
+        else:
+            msg.append("• LIMPO ~ TETO → overhead proxy está neutro nesta semana (manter, acumular amostra).")
+    else:
+        msg.append("• Amostra insuficiente para comparar LIMPO vs TETO com confiança.")
     tg_send("\n".join(msg))
 
 
