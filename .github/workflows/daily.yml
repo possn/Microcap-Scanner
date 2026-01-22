@@ -45,8 +45,8 @@ jobs:
 
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
 
-          MAX_TICKERS: "650"
-          CANDIDATE_POOL: "2600"
+          MAX_TICKERS: "450"
+          CANDIDATE_POOL: "2000"
 
           MIN_PX: "1.0"
           MAX_PX: "25"
