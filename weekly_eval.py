@@ -1,5 +1,6 @@
 import os
 import io
+import csv
 import requests
 import pandas as pd
 import numpy as np
@@ -14,8 +15,14 @@ OHLCV_FMT = os.getenv("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i
 SIGNALS_CSV = Path("cache/signals.csv")
 CACHE_OHLCV_DIR = Path("cache/ohlcv")
 
+SUMMARY_CSV = Path("cache/weekly_summary.csv")
+
 HORIZON_SESS = int(os.getenv("WEEKLY_HORIZON_SESS", "5"))
 WATCH_OVERHEAD_CLEAN_MAX = int(os.getenv("WATCH_OVERHEAD_CLEAN_MAX", "5"))
+
+# sanity thresholds (tune only if needed)
+SANITY_MIN_COVERAGE_PCT = float(os.getenv("SANITY_MIN_COVERAGE_PCT", "0.65"))  # 65%
+SANITY_MAX_WEEKLY_JUMP_PP = float(os.getenv("SANITY_MAX_WEEKLY_JUMP_PP", "20")) # 20pp jump as "suspect"
 
 # -------------------------
 # Telegram
@@ -111,18 +118,28 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame | None:
             continue
     return None
 
-def _align_index_by_date(o: pd.DataFrame, target_date: datetime.date) -> int | None:
-    # exact match first
+# -------------------------
+# Align: T -> T-1 -> T+1
+# -------------------------
+def _align_index_T_Tm1_Tp1(o: pd.DataFrame, target_date: datetime.date) -> int | None:
     o_dates = o["date"].dt.date.values
+
+    # T
     idxs = np.where(o_dates == target_date)[0]
     if len(idxs) > 0:
         return int(idxs[0])
 
-    # fallback: next trading day (T+1) if exact date absent
-    # (ex: signals date logged in UTC vs local; or missing candle)
+    # T-1
+    t_minus = target_date - timedelta(days=1)
+    idxs = np.where(o_dates == t_minus)[0]
+    if len(idxs) > 0:
+        return int(idxs[0])
+
+    # T+1 (next trading day after target)
     after = np.where(o_dates > target_date)[0]
     if len(after) > 0:
         return int(after[0])
+
     return None
 
 # -------------------------
@@ -139,13 +156,12 @@ def retfmt(x: float | None) -> str:
     return f"{x*100:.1f}%"
 
 # -------------------------
-# Core metric computation
+# Metric computation
 # -------------------------
-def compute_metrics(df_sig: pd.DataFrame, horizon: int, success_def: str) -> dict:
+def compute_metrics(df_sig: pd.DataFrame, horizon: int) -> dict:
     """
-    success_def:
-      - "EXEC": success = exists close > trig (breakout confirmation) within horizon
-      - "WATCH_B": success = exists close > trig within horizon (your definition B)
+    Success definition (shared for EXEC + WATCH):
+      success = exists close > trig within horizon
     """
     res = {
         "n": int(len(df_sig)),
@@ -178,7 +194,7 @@ def compute_metrics(df_sig: pd.DataFrame, horizon: int, success_def: str) -> dic
         if o is None or o.empty:
             continue
 
-        i0 = _align_index_by_date(o, dt.date())
+        i0 = _align_index_T_Tm1_Tp1(o, dt.date())
         if i0 is None:
             continue
 
@@ -201,7 +217,7 @@ def compute_metrics(df_sig: pd.DataFrame, horizon: int, success_def: str) -> dic
             first = int(np.argmax(above))
             if first + 1 < len(closes):
                 h = bool(closes[first + 1] > trig)
-            # fail-fast proxy: falls back below trig within 2 days after first success
+            # fail-fast proxy: falls below trig within 2 sessions after first success
             j2 = min(first + 2, len(closes) - 1)
             if np.any(closes[first:j2 + 1] < trig):
                 ff = True
@@ -229,122 +245,165 @@ def compute_metrics(df_sig: pd.DataFrame, horizon: int, success_def: str) -> dic
     return res
 
 # -------------------------
-# Bucketing analysis
+# Buckets
 # -------------------------
 def bucket_series(x: pd.Series, edges: list[float], labels: list[str]) -> pd.Series:
-    # edges must be len(labels)+1
     return pd.cut(x, bins=edges, labels=labels, include_lowest=True)
 
-def bucket_report(df: pd.DataFrame, horizon: int, title: str, success_def: str) -> list[str]:
+def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
     """
-    Produz linhas compactas: bucket -> n, cov, success%, hold1%, MFE med, MAE mean
+    Compact: bucket -> n, cov, success%, MFE_med, MAE
+    Only prints buckets with cov >= 5 to reduce noise.
     """
     out = []
     if df.empty:
         return out
 
-    def _one(group: pd.DataFrame, name: str) -> str:
-        m = compute_metrics(group, horizon, success_def)
-        return (
-            f"- {name}: n={m['n']} cov={m['coverage']} "
-            f"S={pct(m['success_rate'])} H1={pct(m['hold1_rate'])} "
-            f"MFE_med={retfmt(m['mfe_median'])} MAE={retfmt(m['mae_mean'])}"
-        )
-
-    # Ensure numeric
     for col in ["overhead_touches", "dist_pct", "bbz", "atrpctl"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    def line(g: pd.DataFrame, name: str) -> str:
+        m = compute_metrics(g, horizon)
+        return f"- {name}: n={m['n']} cov={m['coverage']} S={pct(m['success_rate'])} MFE_med={retfmt(m['mfe_median'])} MAE={retfmt(m['mae_mean'])}"
+
     out.append(title)
 
-    # Overhead buckets
+    # Overhead
     if "overhead_touches" in df.columns:
-        oh = df["overhead_touches"].copy()
-        b = bucket_series(
-            oh.fillna(-1),
-            edges=[-1, 3, 8, 15, 30, 10_000],
-            labels=["0-3", "4-8", "9-15", "16-30", "31+"],
-        )
+        oh = df["overhead_touches"].fillna(-1)
+        b = bucket_series(oh, [-1, 3, 8, 15, 30, 10_000], ["0-3", "4-8", "9-15", "16-30", "31+"])
         for name, g in df.groupby(b, dropna=False):
-            if name is not None:
-                out.append(_one(g, f"OH {name}"))
+            if name is None:
+                continue
+            m = compute_metrics(g, horizon)
+            if m["coverage"] >= 5:
+                out.append(line(g, f"OH {name}"))
 
-    # Dist buckets
+    # Dist
     if "dist_pct" in df.columns:
-        d = df["dist_pct"].copy()
-        b = bucket_series(
-            d,
-            edges=[-999, 2, 4, 8, 12, 999],
-            labels=["≤2", "2-4", "4-8", "8-12", ">12"],
-        )
+        d = df["dist_pct"]
+        b = bucket_series(d, [-999, 2, 4, 8, 12, 999], ["≤2", "2-4", "4-8", "8-12", ">12"])
         for name, g in df.groupby(b, dropna=False):
-            if name is not None:
-                out.append(_one(g, f"DIST {name}%"))
+            if name is None:
+                continue
+            m = compute_metrics(g, horizon)
+            if m["coverage"] >= 5:
+                out.append(line(g, f"DIST {name}%"))
 
-    # BBZ buckets (more negative = tighter)
+    # BBZ
     if "bbz" in df.columns:
-        z = df["bbz"].copy()
-        b = bucket_series(
-            z,
-            edges=[-999, -1.4, -1.2, -1.0, -0.8, 999],
-            labels=["≤-1.4", "-1.4..-1.2", "-1.2..-1.0", "-1.0..-0.8", ">-0.8"],
-        )
+        z = df["bbz"]
+        b = bucket_series(z, [-999, -1.4, -1.2, -1.0, -0.8, 999], ["≤-1.4", "-1.4..-1.2", "-1.2..-1.0", "-1.0..-0.8", ">-0.8"])
         for name, g in df.groupby(b, dropna=False):
-            if name is not None:
-                out.append(_one(g, f"BBZ {name}"))
+            if name is None:
+                continue
+            m = compute_metrics(g, horizon)
+            if m["coverage"] >= 5:
+                out.append(line(g, f"BBZ {name}"))
 
-    # ATRpctl buckets (lower = more compressed)
+    # ATRpctl
     if "atrpctl" in df.columns:
-        a = df["atrpctl"].copy()
-        b = bucket_series(
-            a,
-            edges=[-999, 0.15, 0.20, 0.25, 0.30, 999],
-            labels=["≤0.15", "0.15..0.20", "0.20..0.25", "0.25..0.30", ">0.30"],
-        )
+        a = df["atrpctl"]
+        b = bucket_series(a, [-999, 0.15, 0.20, 0.25, 0.30, 999], ["≤0.15", "0.15..0.20", "0.20..0.25", "0.25..0.30", ">0.30"])
         for name, g in df.groupby(b, dropna=False):
-            if name is not None:
-                out.append(_one(g, f"ATRp {name}"))
+            if name is None:
+                continue
+            m = compute_metrics(g, horizon)
+            if m["coverage"] >= 5:
+                out.append(line(g, f"ATRp {name}"))
 
     return out
 
 # -------------------------
-# Recommendations engine
+# Weekly summary persistence
 # -------------------------
-def recommend(execA: dict, execB: dict, w_clean: dict, w_over: dict) -> list[str]:
-    rec = ["Recomendações (baseadas em dados desta semana):"]
+def summary_init_if_needed() -> None:
+    if SUMMARY_CSV.exists():
+        return
+    SUMMARY_CSV.parent.mkdir(parents=True, exist_ok=True)
+    with SUMMARY_CSV.open("w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "week_end",
+            "window_start", "window_end",
+            "horizon",
+            "signals_total",
+            "exec_total", "watch_total",
+            "watch_cov_pct",
+            "watch_success",
+            "watch_clean_success",
+            "watch_over_success",
+            "watch_mae",
+            "watch_mfe_med",
+        ])
 
-    # If EXEC is persistently zero, suggest a minimal relaxation path (not automatic change)
-    # Here we only comment if EXEC n=0.
-    if execA["n"] == 0 and execB["n"] == 0:
-        rec.append("• EXEC=0: não há breakouts confirmados. Antes de mexer no modelo, acumular 2–4 semanas. Se persistir:")
-        rec.append("  - rever VOL_CONFIRM_MULT (p.ex. -0.05) OU permitir EXEC_A com qualidade extrema (BBZ<=-1.3 AND ATRpctl<=0.20).")
-        rec.append("  - rever MAX_GAP_UP (p.ex. 1.12→1.15) apenas se o gap filter estiver a cortar execuções reais.")
-    else:
-        rec.append("• EXEC presente: usar EXEC_B como base; medir diferença EXEC_B vs EXEC_A e ajustar gates por bins (score/BBZ/ATRpctl).")
+def append_week_summary(row: dict) -> None:
+    summary_init_if_needed()
+    cols = [
+        "week_end",
+        "window_start", "window_end",
+        "horizon",
+        "signals_total",
+        "exec_total", "watch_total",
+        "watch_cov_pct",
+        "watch_success",
+        "watch_clean_success",
+        "watch_over_success",
+        "watch_mae",
+        "watch_mfe_med",
+    ]
+    with SUMMARY_CSV.open("a", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols)
+        w.writerow({c: row.get(c, "") for c in cols})
 
-    # Overhead vs clean for WATCH
-    if np.isfinite(w_clean["success_rate"]) and np.isfinite(w_over["success_rate"]):
-        diff = w_over["success_rate"] - w_clean["success_rate"]
-        if diff >= 0.12:
-            rec.append("• WATCH_TETO supera WATCH_LIMPO de forma material: não apertar overhead agora; considerar reduzir penalização de overhead em setups de compressão extrema.")
-        elif diff <= -0.12:
-            rec.append("• WATCH_LIMPO supera WATCH_TETO de forma material: reforçar penalização/filtragem de overhead (ou reduzir OVERHEAD_BAND/OVERHEAD_WINDOW).")
-        else:
-            rec.append("• WATCH_LIMPO ~ WATCH_TETO: overhead proxy neutro; manter parâmetros e aumentar amostra.")
-    else:
-        rec.append("• Comparação LIMPO vs TETO: amostra/coverage insuficiente; manter e acumular.")
+def read_last_summary() -> dict | None:
+    if not SUMMARY_CSV.exists():
+        return None
+    try:
+        s = pd.read_csv(SUMMARY_CSV)
+        if s.empty:
+            return None
+        last = s.iloc[-1].to_dict()
+        return last
+    except Exception:
+        return None
 
-    # Risk envelope hint (MAE)
-    if np.isfinite(w_clean["mae_mean"]) and np.isfinite(w_over["mae_mean"]):
-        if w_over["mae_mean"] < w_clean["mae_mean"] - 0.01:
-            rec.append("• Nota risco: TETO teve MAE mais profunda; operacionalmente, stops/posição mais conservadores em TETO.")
-        elif w_clean["mae_mean"] < w_over["mae_mean"] - 0.01:
-            rec.append("• Nota risco: LIMPO teve MAE mais profunda; rever dist/qualidade nos LIMPO.")
-        else:
-            rec.append("• Nota risco: MAE semelhante; risco comparável nesta semana.")
+# -------------------------
+# SANITY + INSIGHTS policy
+# -------------------------
+def sanity_checks(total: int, watch_m: dict, last: dict | None) -> list[str]:
+    """
+    Returns list of FAIL reasons. Empty => OK.
+    """
+    fails = []
+    if total <= 0:
+        fails.append("Sinais=0 (weekly sem dados)")
 
-    return rec
+    # Coverage
+    if watch_m["n"] > 0:
+        cov_pct = (watch_m["coverage"] / max(1, watch_m["n"]))
+        if cov_pct < SANITY_MIN_COVERAGE_PCT:
+            fails.append(f"Coverage baixo em WATCH ({cov_pct*100:.0f}%) — provável cache/OHLCV/alinhamento")
+
+    # Sudden jump vs last week (if exists and comparable)
+    if last is not None:
+        try:
+            prev = float(last.get("watch_success", "nan"))
+            cur = float(watch_m["success_rate"]) if np.isfinite(watch_m["success_rate"]) else np.nan
+            if np.isfinite(prev) and np.isfinite(cur):
+                diff_pp = abs((cur - prev) * 100.0)
+                if diff_pp >= SANITY_MAX_WEEKLY_JUMP_PP:
+                    fails.append(f"Salto anómalo na success WATCH vs semana anterior ({diff_pp:.0f}pp) — verificar alinhamento T/T-1/T+1 e cache")
+        except Exception:
+            pass
+
+    return fails
+
+def insights_monitoring_note(weeks_observed: int) -> str:
+    if weeks_observed < 4:
+        return f"INSIGHTS: em modo MONITORIZAR (amostra={weeks_observed} semanas; só propor mudanças estruturais ≥4 semanas)."
+    return f"INSIGHTS: amostra={weeks_observed} semanas (elegível para propostas estruturais se efeitos forem consistentes)."
 
 # -------------------------
 # MAIN
@@ -356,78 +415,119 @@ def main() -> None:
     end = days[-1]
 
     if not SIGNALS_CSV.exists():
-        tg_send(
-            "❌ MICROCAP WEEKLY REVIEW\n"
-            "Não existe cache/signals.csv no repositório.\n"
-            "O daily tem de fazer commit de cache/signals.csv."
-        )
+        tg_send("❌ WEEKLY: falta cache/signals.csv (BUG: daily não commitou ou cache não restaurada).")
         return
 
     df = pd.read_csv(SIGNALS_CSV)
     if df.empty:
-        tg_send("⚠ MICROCAP WEEKLY REVIEW\nsignals.csv está vazio.")
+        tg_send("⚠ WEEKLY: signals.csv vazio (BUG: daily não está a escrever sinais).")
         return
 
     df["date"] = pd.to_datetime(df.get("date", None), errors="coerce")
     df = df.dropna(subset=["date"]).copy()
     df["day"] = df["date"].dt.date
-
     wdf = df[(df["day"] >= start) & (df["day"] <= end)].copy()
-    total = int(len(wdf))
 
-    # Normalise columns
+    total = int(len(wdf))
     if "signal" not in wdf.columns:
         wdf["signal"] = ""
 
-    execB_df = wdf[wdf["signal"].astype(str) == "EXEC_B"].copy()
-    execA_df = wdf[wdf["signal"].astype(str) == "EXEC_A"].copy()
+    exec_df = wdf[wdf["signal"].astype(str).isin(["EXEC_A", "EXEC_B"])].copy()
     watch_df = wdf[wdf["signal"].astype(str) == "WATCH"].copy()
 
-    # WATCH split by overhead
+    # WATCH split
     watch_df["overhead_touches"] = pd.to_numeric(watch_df.get("overhead_touches", np.nan), errors="coerce")
     watch_clean = watch_df[watch_df["overhead_touches"] <= WATCH_OVERHEAD_CLEAN_MAX].copy()
     watch_over = watch_df[watch_df["overhead_touches"] > WATCH_OVERHEAD_CLEAN_MAX].copy()
 
-    # Base summary metrics
-    m_execB = compute_metrics(execB_df, HORIZON_SESS, "EXEC")
-    m_execA = compute_metrics(execA_df, HORIZON_SESS, "EXEC")
-    m_watch_all = compute_metrics(watch_df, HORIZON_SESS, "WATCH_B")
-    m_watch_clean = compute_metrics(watch_clean, HORIZON_SESS, "WATCH_B")
-    m_watch_over = compute_metrics(watch_over, HORIZON_SESS, "WATCH_B")
+    # Metrics
+    m_exec = compute_metrics(exec_df, HORIZON_SESS)
+    m_watch_all = compute_metrics(watch_df, HORIZON_SESS)
+    m_watch_clean = compute_metrics(watch_clean, HORIZON_SESS)
+    m_watch_over = compute_metrics(watch_over, HORIZON_SESS)
 
+    # Persist summary
+    cov_pct = (m_watch_all["coverage"] / max(1, m_watch_all["n"])) if m_watch_all["n"] > 0 else np.nan
+
+    append_week_summary({
+        "week_end": str(end),
+        "window_start": str(start),
+        "window_end": str(end),
+        "horizon": HORIZON_SESS,
+        "signals_total": total,
+        "exec_total": int(len(exec_df)),
+        "watch_total": int(len(watch_df)),
+        "watch_cov_pct": round(float(cov_pct), 4) if np.isfinite(cov_pct) else "",
+        "watch_success": round(float(m_watch_all["success_rate"]), 6) if np.isfinite(m_watch_all["success_rate"]) else "",
+        "watch_clean_success": round(float(m_watch_clean["success_rate"]), 6) if np.isfinite(m_watch_clean["success_rate"]) else "",
+        "watch_over_success": round(float(m_watch_over["success_rate"]), 6) if np.isfinite(m_watch_over["success_rate"]) else "",
+        "watch_mae": round(float(m_watch_all["mae_mean"]), 6) if np.isfinite(m_watch_all["mae_mean"]) else "",
+        "watch_mfe_med": round(float(m_watch_all["mfe_median"]), 6) if np.isfinite(m_watch_all["mfe_median"]) else "",
+    })
+
+    # Determine weeks observed
+    weeks_observed = 1
+    try:
+        s = pd.read_csv(SUMMARY_CSV)
+        weeks_observed = int(len(s))
+    except Exception:
+        pass
+
+    last = read_last_summary()  # after append => "this week"; for sanity vs previous we need previous
+    prev = None
+    try:
+        s = pd.read_csv(SUMMARY_CSV)
+        if len(s) >= 2:
+            prev = s.iloc[-2].to_dict()
+    except Exception:
+        prev = None
+
+    # SANITY checks
+    sanity_fails = sanity_checks(total, m_watch_all, prev)
+
+    # Build message
     msg = []
-    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v3)")
+    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v4)")
     msg.append(f"Janela (últimos 5 dias úteis): {start} → {end}")
     msg.append(f"Horizonte métricas: {HORIZON_SESS} sessões")
     msg.append("")
+
     msg.append(f"Sinais na janela: {total}")
-    msg.append(f"• EXEC_B: {len(execB_df)} | EXEC_A: {len(execA_df)} | WATCH: {len(watch_df)} (LIMPO: {len(watch_clean)} | TETO: {len(watch_over)})")
+    msg.append(f"• EXEC: {len(exec_df)} | WATCH: {len(watch_df)} (LIMPO: {len(watch_clean)} | TETO: {len(watch_over)})")
     msg.append("")
 
-    # EXEC summary
-    msg.append(f"EXEC_B: cov={m_execB['coverage']}/{m_execB['n']}  S={pct(m_execB['success_rate'])} H1={pct(m_execB['hold1_rate'])} FF={pct(m_execB['fail_fast_rate'])}  MFE_med={retfmt(m_execB['mfe_median'])}  MAE={retfmt(m_execB['mae_mean'])}")
-    msg.append(f"EXEC_A: cov={m_execA['coverage']}/{m_execA['n']}  S={pct(m_execA['success_rate'])} H1={pct(m_execA['hold1_rate'])} FF={pct(m_execA['fail_fast_rate'])}  MFE_med={retfmt(m_execA['mfe_median'])}  MAE={retfmt(m_execA['mae_mean'])}")
+    msg.append(f"EXEC:  cov={m_exec['coverage']}/{m_exec['n']}  S={pct(m_exec['success_rate'])} H1={pct(m_exec['hold1_rate'])} FF={pct(m_exec['fail_fast_rate'])}  MFE_med={retfmt(m_exec['mfe_median'])}  MAE={retfmt(m_exec['mae_mean'])}")
+    msg.append(f"WATCH: cov={m_watch_all['coverage']}/{m_watch_all['n']}  S={pct(m_watch_all['success_rate'])} H1={pct(m_watch_all['hold1_rate'])} FF={pct(m_watch_all['fail_fast_rate'])}  MFE_med={retfmt(m_watch_all['mfe_median'])}  MAE={retfmt(m_watch_all['mae_mean'])}")
+    msg.append(f"  LIMPO(≤{WATCH_OVERHEAD_CLEAN_MAX}): cov={m_watch_clean['coverage']}/{m_watch_clean['n']}  S={pct(m_watch_clean['success_rate'])}  MFE_med={retfmt(m_watch_clean['mfe_median'])}  MAE={retfmt(m_watch_clean['mae_mean'])}")
+    msg.append(f"  TETO(>{WATCH_OVERHEAD_CLEAN_MAX}):  cov={m_watch_over['coverage']}/{m_watch_over['n']}  S={pct(m_watch_over['success_rate'])}  MFE_med={retfmt(m_watch_over['mfe_median'])}  MAE={retfmt(m_watch_over['mae_mean'])}")
     msg.append("")
 
-    # WATCH summary
-    msg.append("WATCH (definição B: sucesso = close > trig em ≤ horizonte)")
-    msg.append(f"ALL:   cov={m_watch_all['coverage']}/{m_watch_all['n']}  S={pct(m_watch_all['success_rate'])} H1={pct(m_watch_all['hold1_rate'])} FF={pct(m_watch_all['fail_fast_rate'])}  MFE_med={retfmt(m_watch_all['mfe_median'])}  MAE={retfmt(m_watch_all['mae_mean'])}")
-    msg.append(f"LIMPO: cov={m_watch_clean['coverage']}/{m_watch_clean['n']}  S={pct(m_watch_clean['success_rate'])} H1={pct(m_watch_clean['hold1_rate'])} FF={pct(m_watch_clean['fail_fast_rate'])}  MFE_med={retfmt(m_watch_clean['mfe_median'])}  MAE={retfmt(m_watch_clean['mae_mean'])}")
-    msg.append(f"TETO:  cov={m_watch_over['coverage']}/{m_watch_over['n']}  S={pct(m_watch_over['success_rate'])} H1={pct(m_watch_over['hold1_rate'])} FF={pct(m_watch_over['fail_fast_rate'])}  MFE_med={retfmt(m_watch_over['mfe_median'])}  MAE={retfmt(m_watch_over['mae_mean'])}")
+    # SANITY block
+    if sanity_fails:
+        msg.append("🧯 SANITY: FAIL (corrigir já)")
+        for f in sanity_fails:
+            msg.append(f"- {f}")
+        msg.append("Ação típica: verificar cache restore, rate-limit Stooq, e alinhamento de datas (T/T-1/T+1).")
+    else:
+        msg.append("✅ SANITY: OK (sem bugs críticos detectados)")
+
+    msg.append("")
+    msg.append(insights_monitoring_note(weeks_observed))
     msg.append("")
 
-    # Buckets (compact but informative)
-    # limit output length by focusing on WATCH and EXEC separately
+    # INSIGHTS buckets (WATCH always; EXEC only if exists)
     if len(watch_df) > 0:
-        msg.extend(bucket_report(watch_df, HORIZON_SESS, "Buckets WATCH (OH / DIST / BBZ / ATRpctl):", "WATCH_B"))
+        msg.extend(bucket_report(watch_df, HORIZON_SESS, "Buckets WATCH (monitorizar):"))
         msg.append("")
-    if len(execA_df) + len(execB_df) > 0:
-        exec_all = pd.concat([execB_df, execA_df], ignore_index=True)
-        msg.extend(bucket_report(exec_all, HORIZON_SESS, "Buckets EXEC (OH / DIST / BBZ / ATRpctl):", "EXEC"))
+    if len(exec_df) > 0:
+        msg.extend(bucket_report(exec_df, HORIZON_SESS, "Buckets EXEC (monitorizar):"))
         msg.append("")
 
-    # Recommendations
-    msg.extend(recommend(m_execA, m_execB, m_watch_clean, m_watch_over))
+    # Minimal, non-structural suggestion (only classification)
+    msg.append("Ações:")
+    msg.append("• Bugs: corrigir imediatamente se SANITY=FAIL.")
+    msg.append("• Modelo: manter parâmetros; acumular 4 semanas antes de alterações estruturais.")
+    msg.append("• Histórico: weekly_summary.csv actualizado (serve de base para decisões em 4 semanas).")
 
     tg_send("\n".join(msg))
 
