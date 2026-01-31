@@ -3,10 +3,14 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * 6"   # Sábado 13:00 UTC
+    - cron: "0 2 * * 6"   # Sábado 02:00 UTC (após fechar semana + commits do daily)
 
 permissions:
   contents: write
+
+concurrency:
+  group: microcap-weekly-eval
+  cancel-in-progress: true
 
 jobs:
   run:
@@ -15,41 +19,36 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ RESTAURA O MESMO CACHE DO DAILY
-      - name: Cache data (shared)
-        uses: actions/cache@v4
-        with:
-          path: cache
-          key: microcap-cache-shared-v1
-          restore-keys: |
-            microcap-cache-shared-
-
       - name: Run weekly evaluation
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
         run: |
           python weekly_eval.py
 
-      - name: Save weekly summary to repo (commit)
+      - name: Commit weekly summary (weekly_summary.csv)
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git pull --rebase || true
+
           git add cache/weekly_summary.csv || true
           git commit -m "Update weekly_summary.csv" || exit 0
-          git pull --rebase || true
           git push
