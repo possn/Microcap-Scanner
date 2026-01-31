@@ -3,7 +3,7 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * 6"   # Sábado 13:00 UTC
+    - cron: "0 13 * * 6"  # Sábado 13:00 UTC (ajusta se quiseres)
 
 permissions:
   contents: write
@@ -26,11 +26,11 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Cache data (restore)
+      - name: Cache data
         uses: actions/cache@v4
         with:
           path: cache
-          key: microcap-cache-weekly-${{ github.run_id }}
+          key: microcap-cache-v1
           restore-keys: |
             microcap-cache-
 
@@ -40,11 +40,10 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
 
+          # opcional (se quiseres fixar defaults aqui)
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
 
-          SANITY_MIN_COVERAGE_PCT: "0.65"
-          SANITY_MAX_WEEKLY_JUMP_PP: "20"
         run: |
           python weekly_eval.py
 
@@ -52,6 +51,13 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
+
+          # garante que apanha o ficheiro
           git add cache/weekly_summary.csv || true
+
+          # se não houver alterações, sai sem erro
           git commit -m "Update weekly_summary.csv" || exit 0
+
+          # evita falha se entretanto houver commits
+          git pull --rebase || true
           git push
