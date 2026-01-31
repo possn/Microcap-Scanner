@@ -3,7 +3,7 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 13 * * 6"  # Sábado 13:00 UTC
+    - cron: "0 13 * * 6"   # Sábado 13:00 UTC
 
 permissions:
   contents: write
@@ -26,29 +26,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore cache (ohlcv + signals + weekly summary)
+      # ✅ RESTAURA O MESMO CACHE DO DAILY
+      - name: Cache data (shared)
         uses: actions/cache@v4
         with:
           path: cache
-          key: microcap-cache-v1
+          key: microcap-cache-shared-v1
           restore-keys: |
-            microcap-cache-
+            microcap-cache-shared-
 
       - name: Run weekly evaluation
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
+
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
         run: |
           python weekly_eval.py
 
-      - name: Commit weekly summary
+      - name: Save weekly summary to repo (commit)
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git pull --rebase || true
           git add cache/weekly_summary.csv || true
           git commit -m "Update weekly_summary.csv" || exit 0
+          git pull --rebase || true
           git push
