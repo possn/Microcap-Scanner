@@ -3,17 +3,24 @@ name: microcap-scanner-daily
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 12 * * *"   # 12:00 UTC (13:00 em PT no inverno; 12:00 no verão)
+    - cron: "0 12 * * *"
 
 permissions:
   contents: write
 
+concurrency:
+  group: microcap-scanner-daily
+  cancel-in-progress: true
+
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -25,8 +32,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ CACHE PERSISTENTE (não usar run_id)
-      - name: Cache data
+      - name: Restore cache (persistente)
         uses: actions/cache@v4
         with:
           path: cache
@@ -85,17 +91,18 @@ jobs:
 
           SLEEP_EVERY: "25"
           SLEEP_SECONDS: "3.0"
+
         run: |
           python scanner.py
 
-      # ✅ commit robusto (evita conflitos)
-      - name: Save signals history to repo (commit)
+      - name: Commit cache outputs (signals + ohlcv)
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git pull --rebase || true
+          git add cache/signals.csv cache/ohlcv || true
 
-          git add cache/signals.csv || true
-          git commit -m "Update signals.csv" || exit 0
+          git commit -m "Update cache (signals + ohlcv)" || exit 0
+
+          git pull --rebase || true
           git push
