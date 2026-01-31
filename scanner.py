@@ -1,11 +1,14 @@
-# scanner.py  (V7_1_PREOPEN_FULL_TOP7_CLEAN)
+# scanner.py  (V7_1_PREOPEN_FULL_TOP7_CLEAN) — FIXED (DETERMINISTIC + ASOF + SCHEMA MIGRATION)
 # EOD-only, public/free, cache-first, ranked, pre-open actionable.
-# FIXES:
-#  - No duplicate rows in cache/signals.csv for same (date,ticker,signal)
-#  - Single cache loader (removed duplicate nested function)
-#  - Robust CACHE_ONLY + auto-switch on Stooq HITS_LIMIT
-#  - ASOF reflects last market date actually observed in used OHLCV
-#  - Safer parsing + consistent diagnostics
+#
+# CRITICAL FIXES (root-cause):
+#  1) Determinismo: universo e pool deixam de depender de set() (ordem aleatória) → runs deixam de “mudar sozinhos”
+#  2) signals.csv passa a registar ASOF (data de mercado) por linha; weekly_eval usa ASOF com match robusto
+#  3) Dedup passa a ser por (ASOF,ticker,signal) (não pelo dia UTC do run)
+#  4) Migração automática do schema: se signals.csv existir sem 'asof', reescreve com coluna 'asof' preservando dados
+#  5) Outcomes update usa ASOF (se existir) para casar com OHLCV
+#
+# Nota: Mantém 'date' como data do run (UTC) para auditoria; 'asof' é a data do mercado.
 
 import os, io, time, csv
 import requests
@@ -277,7 +280,6 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
         return df.reset_index(drop=True)
 
     except Exception:
-        # fallback cache
         if cached is not None and len(cached) >= 120:
             need = ["date", "open", "high", "low", "close", "volume"]
             if all(c in cached.columns for c in need):
@@ -392,7 +394,6 @@ def score_candidate(
     if np.isfinite(dist_to_trig_pct):
         s += max(0.0, (DIST_MAX_PCT - dist_to_trig_pct)) * 0.10
 
-    # Overhead penalty tiers
     if overhead_touches >= 60:
         s -= 1.5
     elif overhead_touches >= 30:
@@ -454,66 +455,141 @@ def regime_snapshot() -> dict:
     return out
 
 # =========================
-# signals.csv helpers (NO DUPES)
+# signals.csv helpers (ASOF + NO DUPES + SCHEMA MIGRATION)
 # =========================
 SIGNALS_COLS = [
-    "date","ticker","signal","score","close","trig","stop","dist_pct","dv20",
+    "date",          # data do RUN (UTC)
+    "asof",          # data de mercado (EOD do OHLCV usado)
+    "ticker","signal","score","close","trig","stop","dist_pct","dv20",
     "bbz","atrpctl","dd","contr","dry","overhead_touches","vol_mult","overshoot_pct",
     "R_pct","regime",
     "ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
 ]
 
-def signals_csv_init_if_needed() -> None:
-    if SIGNALS_CSV.exists():
-        return
-    ensure_dirs()
-    with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(SIGNALS_COLS)
+def _read_signals_header() -> list[str] | None:
+    if not SIGNALS_CSV.exists():
+        return None
+    try:
+        with SIGNALS_CSV.open("r", encoding="utf-8") as f:
+            first = f.readline().strip()
+        if not first:
+            return None
+        return [c.strip() for c in first.split(",")]
+    except Exception:
+        return None
 
-def load_existing_keys_for_date(date_str: str) -> set[tuple[str,str,str]]:
+def signals_csv_ensure_schema() -> None:
     """
-    Carrega keys (date,ticker,signal) já existentes para o dia corrente.
-    Evita duplicados mesmo com múltiplos runs.
+    Garante que signals.csv existe e tem coluna 'asof'.
+    Se existir sem 'asof', faz migração automática preservando dados.
     """
+    ensure_dirs()
+
+    if not SIGNALS_CSV.exists():
+        with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(SIGNALS_COLS)
+        return
+
+    hdr = _read_signals_header()
+    if not hdr:
+        # ficheiro corrompido/vazio → recria
+        with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(SIGNALS_COLS)
+        return
+
+    if "asof" in [h.lower() for h in hdr]:
+        return  # ok
+
+    # MIGRAÇÃO: reescrever com coluna ASOF vazia (mantém o resto)
+    try:
+        df = pd.read_csv(SIGNALS_CSV)
+    except Exception:
+        # se não der para ler, recomeça (melhor do que quebrar tudo)
+        with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(SIGNALS_COLS)
+        return
+
+    if "asof" not in df.columns:
+        df.insert(1, "asof", "")
+
+    # garantir todas as colunas (as novas ficam vazias)
+    for c in SIGNALS_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df[SIGNALS_COLS].copy()
+
+    df.to_csv(SIGNALS_CSV, index=False)
+
+# cache interno de keys por asof_day (lazy)
+_KEYS_BY_ASOF: dict[str, set[tuple[str,str,str]]] = {}
+
+def load_existing_keys_for_asof(asof_str: str) -> set[tuple[str,str,str]]:
+    """
+    Carrega keys (asof,ticker,signal) já existentes para a data de mercado.
+    Evita duplicados mesmo com múltiplos runs no mesmo dia.
+    """
+    if asof_str in _KEYS_BY_ASOF:
+        return _KEYS_BY_ASOF[asof_str]
+
     keys: set[tuple[str,str,str]] = set()
     if not SIGNALS_CSV.exists():
+        _KEYS_BY_ASOF[asof_str] = keys
         return keys
+
     try:
-        df = pd.read_csv(SIGNALS_CSV, usecols=["date","ticker","signal"])
+        usecols = ["asof","ticker","signal"] if "asof" in pd.read_csv(SIGNALS_CSV, nrows=1).columns else ["date","ticker","signal"]
+        df = pd.read_csv(SIGNALS_CSV, usecols=usecols)
         df = df.dropna()
-        df["date"] = df["date"].astype(str)
+        if "asof" in df.columns:
+            df["asof"] = df["asof"].astype(str)
+            df = df[df["asof"] == asof_str]
+            dcol = "asof"
+        else:
+            # fallback antigo: usa date (não ideal, mas não quebra)
+            df["date"] = df["date"].astype(str)
+            df = df[df["date"] == asof_str]
+            dcol = "date"
+
         df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
         df["signal"] = df["signal"].astype(str).str.upper().str.strip()
-        df = df[df["date"] == date_str]
+
         for _, r in df.iterrows():
-            keys.add((r["date"], r["ticker"], r["signal"]))
+            keys.add((str(r[dcol]), r["ticker"], r["signal"]))
     except Exception:
         pass
+
+    _KEYS_BY_ASOF[asof_str] = keys
     return keys
 
-def append_signal_row(row: dict, keyset: set[tuple[str,str,str]]) -> None:
-    signals_csv_init_if_needed()
+def append_signal_row(row: dict) -> None:
+    signals_csv_ensure_schema()
 
-    d = str(row.get("date", "")).strip()
+    asof = str(row.get("asof", "")).strip()
     t = str(row.get("ticker", "")).strip().upper()
     s = str(row.get("signal", "")).strip().upper()
-    k = (d, t, s)
-    if d and t and s and (k in keyset):
+
+    if not asof or not t or not s:
+        return
+
+    keyset = load_existing_keys_for_asof(asof)
+    k = (asof, t, s)
+    if k in keyset:
         return
 
     with SIGNALS_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=SIGNALS_COLS)
         w.writerow({c: row.get(c, "") for c in SIGNALS_COLS})
 
-    if d and t and s:
-        keyset.add(k)
+    keyset.add(k)
 
 def recent_watch_stats(ticker: str, lookback_days: int = 15) -> dict:
     if not SIGNALS_CSV.exists():
         return {"days": 0, "dists": []}
     try:
-        df = pd.read_csv(SIGNALS_CSV, usecols=["date","ticker","dist_pct"])
+        df = pd.read_csv(SIGNALS_CSV, usecols=["ticker","dist_pct","asof","date"])
     except Exception:
         return {"days": 0, "dists": []}
     if df.empty:
@@ -524,15 +600,21 @@ def recent_watch_stats(ticker: str, lookback_days: int = 15) -> dict:
     if df.empty:
         return {"days": 0, "dists": []}
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date")
-    cutoff = df["date"].max() - pd.Timedelta(days=lookback_days)
-    df = df[df["date"] >= cutoff]
+    # preferir ASOF; fallback date
+    if "asof" in df.columns:
+        df["asof"] = pd.to_datetime(df["asof"], errors="coerce")
+        daycol = "asof"
+    else:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        daycol = "date"
+
+    df = df.dropna(subset=[daycol]).sort_values(daycol)
+    cutoff = df[daycol].max() - pd.Timedelta(days=lookback_days)
+    df = df[df[daycol] >= cutoff]
 
     dists = []
-    if "dist_pct" in df.columns:
-        dd = pd.to_numeric(df["dist_pct"], errors="coerce").dropna()
-        dists = dd.tolist()[-WATCH_STALE_DAYS:]
+    dd = pd.to_numeric(df.get("dist_pct", np.nan), errors="coerce").dropna()
+    dists = dd.tolist()[-WATCH_STALE_DAYS:]
 
     return {"days": int(len(df)), "dists": dists}
 
@@ -558,11 +640,10 @@ def watch_boost_and_stale_penalty(dist_series: list[float]) -> tuple[float, floa
     return (boost, penalty)
 
 # =========================
-# outcomes update (EOD-only, from cache)
+# outcomes update (EOD-only, from cache) — USE ASOF
 # =========================
 def update_outcomes_using_cache() -> dict:
-    if not SIGNALS_CSV.exists():
-        return {"updated": 0, "resolved_total": 0}
+    signals_csv_ensure_schema()
     try:
         df = pd.read_csv(SIGNALS_CSV)
     except Exception:
@@ -576,23 +657,39 @@ def update_outcomes_using_cache() -> dict:
         return {"updated": 0, "resolved_total": int((df["resolved"] == "1").sum())}
 
     updated = 0
+
     for idx in unresolved_idx[:800]:
         try:
             ticker = str(df.at[idx, "ticker"]).strip().upper()
-            sig_date = pd.to_datetime(df.at[idx, "date"], errors="coerce")
-            if pd.isna(sig_date):
+
+            # prefer ASOF for mapping to OHLCV
+            sig_day = None
+            if "asof" in df.columns:
+                sig_day = pd.to_datetime(df.at[idx, "asof"], errors="coerce")
+            if sig_day is None or pd.isna(sig_day):
+                sig_day = pd.to_datetime(df.at[idx, "date"], errors="coerce")
+
+            if pd.isna(sig_day):
                 continue
 
             o = load_cached_ohlcv_local(ticker, min_rows=260)
             if o is None:
                 continue
 
-            o_dates = o["date"].dt.date
-            target = sig_date.date()
-            positions = np.where(o_dates.values == target)[0]
-            if len(positions) == 0:
-                continue
-            pos = int(positions[0])
+            o_dates = o["date"].dt.date.values
+            target = sig_day.date()
+
+            # robust match: exact; se não existir, usa último <= target
+            pos_candidates = np.where(o_dates == target)[0]
+            if len(pos_candidates) == 0:
+                # último <= target
+                pos_candidates = np.where(o_dates <= target)[0]
+                if len(pos_candidates) == 0:
+                    continue
+                pos = int(pos_candidates[-1])
+            else:
+                pos = int(pos_candidates[0])
+
             if pos + HORIZON >= len(o):
                 continue
 
@@ -619,6 +716,7 @@ def update_outcomes_using_cache() -> dict:
             df.at[idx, "hit_50"] = hit50
             df.at[idx, "resolved"] = "1"
             updated += 1
+
         except Exception:
             continue
 
@@ -675,14 +773,12 @@ def empirical_prob_by_score_bin(regime: str) -> str:
 def main() -> None:
     now_dt = datetime.now(timezone.utc)
     now = now_dt.strftime("%Y-%m-%d %H:%M UTC")
-    today = now_dt.strftime("%Y-%m-%d")
+    run_day = now_dt.strftime("%Y-%m-%d")  # auditoria (data do RUN, não é a data de mercado)
 
     ensure_dirs()
+    signals_csv_ensure_schema()
 
-    # prevent duplicate writes for same day
-    keyset = load_existing_keys_for_date(today)
-
-    # learning update
+    # learning update (uses ASOF)
     upd = update_outcomes_using_cache()
 
     # regime
@@ -691,15 +787,16 @@ def main() -> None:
     VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
     DIST_LIMIT = max(6.0, DIST_MAX_PCT + reg["dist_adj"])
 
-    # universe
+    # universe (DETERMINISTIC)
     all_tickers = (
         get_universe_from_holdings(IWC_URL)
         + get_universe_from_holdings(IWM_URL)
         + get_universe_from_holdings(IJR_URL)
     )
-    universe = list(set([t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()]))
+    # sorted(set()) para eliminar aleatoriedade dos runs
+    universe = sorted(set([t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()]))
 
-    # rank scan order by cached dv20 (best effort)
+    # rank scan order by cached dv20 (best effort), deterministic on ties
     scored: list[tuple[str, float]] = []
     unscored: list[str] = []
     pool = universe[: min(CANDIDATE_POOL, len(universe))]
@@ -710,7 +807,9 @@ def main() -> None:
         else:
             scored.append((t, float(dv)))
 
-    scored.sort(key=lambda x: x[1], reverse=True)
+    # determinístico: dv desc, ticker asc
+    scored.sort(key=lambda x: (-x[1], x[0]))
+    unscored.sort()
     ordered = [t for t, _ in scored] + unscored
     tickers = ordered[:MAX_TICKERS]
 
@@ -727,7 +826,7 @@ def main() -> None:
     cache_miss = 0
 
     # ASOF = max market date observed in used OHLCV
-    asof_date = None
+    asof_date_global = None
 
     for i, t in enumerate(tickers):
         try:
@@ -744,15 +843,16 @@ def main() -> None:
             if df is None or df.empty:
                 continue
 
-            # update ASOF
-            try:
-                dmax = pd.to_datetime(df["date"], errors="coerce").dropna().max()
-                if pd.notna(dmax):
-                    dmax = dmax.normalize()
-                    if asof_date is None or dmax > asof_date:
-                        asof_date = dmax
-            except Exception:
-                pass
+            # per-ticker ASOF (data de mercado real)
+            asof_row = pd.to_datetime(df["date"], errors="coerce").dropna().max()
+            if pd.isna(asof_row):
+                continue
+            asof_row = asof_row.normalize()
+            asof_str = asof_row.strftime("%Y-%m-%d")
+
+            # update ASOF global
+            if asof_date_global is None or asof_row > asof_date_global:
+                asof_date_global = asof_row
 
             if len(df) < 260:
                 continue
@@ -846,19 +946,28 @@ def main() -> None:
                 (execB if sig == "EXEC_B" else execA).append(item)
 
                 append_signal_row({
-                    "date": today, "ticker": t, "signal": sig,
-                    "score": round(sc, 6), "close": round(close_now, 6),
-                    "trig": round(trig, 6), "stop": round(stop, 6),
+                    "date": run_day,
+                    "asof": asof_str,
+                    "ticker": t,
+                    "signal": sig,
+                    "score": round(sc, 6),
+                    "close": round(close_now, 6),
+                    "trig": round(trig, 6),
+                    "stop": round(stop, 6),
                     "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                    "dv20": round(dv20, 2), "bbz": round(bbz_last, 6),
-                    "atrpctl": round(atr_pctl, 6), "dd": round(dd, 6),
-                    "contr": round(contr, 6), "dry": round(dry, 6),
+                    "dv20": round(dv20, 2),
+                    "bbz": round(bbz_last, 6),
+                    "atrpctl": round(atr_pctl, 6),
+                    "dd": round(dd, 6),
+                    "contr": round(contr, 6),
+                    "dry": round(dry, 6),
                     "overhead_touches": overhead,
                     "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
                     "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
                     "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                    "regime": mode, "resolved": "0"
-                }, keyset)
+                    "regime": mode,
+                    "resolved": "0"
+                })
 
             else:
                 # WATCH
@@ -879,19 +988,28 @@ def main() -> None:
                         watch_over.append(item)
 
                     append_signal_row({
-                        "date": today, "ticker": t, "signal": "WATCH",
-                        "score": round(sc, 6), "close": round(close_now, 6),
-                        "trig": round(trig, 6), "stop": round(stop, 6),
+                        "date": run_day,
+                        "asof": asof_str,
+                        "ticker": t,
+                        "signal": "WATCH",
+                        "score": round(sc, 6),
+                        "close": round(close_now, 6),
+                        "trig": round(trig, 6),
+                        "stop": round(stop, 6),
                         "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                        "dv20": round(dv20, 2), "bbz": round(bbz_last, 6),
-                        "atrpctl": round(atr_pctl, 6), "dd": round(dd, 6),
-                        "contr": round(contr, 6), "dry": round(dry, 6),
+                        "dv20": round(dv20, 2),
+                        "bbz": round(bbz_last, 6),
+                        "atrpctl": round(atr_pctl, 6),
+                        "dd": round(dd, 6),
+                        "contr": round(contr, 6),
+                        "dry": round(dry, 6),
                         "overhead_touches": overhead,
                         "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
                         "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
                         "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                        "regime": mode, "resolved": "0"
-                    }, keyset)
+                        "regime": mode,
+                        "resolved": "0"
+                    })
 
         except Exception as e:
             s = str(e).upper()
@@ -899,7 +1017,6 @@ def main() -> None:
                 no_data += 1
             elif "HITS_LIMIT" in s:
                 hits_limited = True
-            # swallow other errors
             pass
 
         if (i + 1) % SLEEP_EVERY == 0:
@@ -918,10 +1035,10 @@ def main() -> None:
 
     emp = empirical_prob_by_score_bin(mode)
 
-    asof_str = asof_date.strftime("%Y-%m-%d") if asof_date is not None else "—"
+    asof_str_global = asof_date_global.strftime("%Y-%m-%d") if asof_date_global is not None else "—"
 
     msg = [f"[{now}] ### V7_1_PREOPEN_FULL_TOP7 ### Microcap scanner (RANKED)"]
-    msg.append(f"ASOF={asof_str} (data de mercado)")
+    msg.append(f"ASOF={asof_str_global} (data de mercado)")
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
         f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH_CLEAN={len(watch_clean)} WATCH_OVER={len(watch_over)} | nodata={no_data} | "
