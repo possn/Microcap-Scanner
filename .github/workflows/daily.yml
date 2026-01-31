@@ -1,15 +1,15 @@
-name: microcap-weekly-eval
+name: microcap-scanner-daily
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 2 * * 6"   # Sábado 02:00 UTC (após fecho semanal)
+    - cron: "0 12 * * *"   # 12:00 UTC
 
 permissions:
   contents: write
 
 concurrency:
-  group: microcap-weekly-eval
+  group: microcap-scanner-daily
   cancel-in-progress: true
 
 jobs:
@@ -17,12 +17,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository (full history)
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Python 3.11 (with pip cache)
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -33,34 +33,74 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ RESTAURA E PERSISTE O DIRECTÓRIO cache/
-      # Isto garante que weekly vê ohlcv + signals acumulados (não apenas o que está no repo)
-      - name: Restore cache (shared rolling)
-        uses: actions/cache@v4
-        with:
-          path: cache
-          key: microcap-cache-shared-${{ github.run_id }}
-          restore-keys: |
-            microcap-cache-shared-
+      # Opcional mas seguro: garante que estás em cima do último commit do cache
+      - name: Sync latest repo state
+        run: |
+          git pull --rebase || true
 
-      - name: Run weekly evaluation
+      - name: Run scanner
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-          WEEKLY_HORIZON_SESS: "5"
-          WATCH_OVERHEAD_CLEAN_MAX: "5"
-        run: |
-          python weekly_eval.py
 
-      - name: Commit weekly summary (weekly_summary.csv)
-        if: github.ref == 'refs/heads/main'
+          IWC_HOLDINGS_CSV_URL: ${{ secrets.IWC_HOLDINGS_CSV_URL }}
+          IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
+          IJR_HOLDINGS_CSV_URL: ${{ secrets.IJR_HOLDINGS_CSV_URL }}
+
+          OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
+
+          MAX_TICKERS: "450"
+          CANDIDATE_POOL: "2000"
+
+          MIN_PX: "1.0"
+          MAX_PX: "25"
+          MIN_DV20: "3000000"
+          MAX_DV20: "80000000"
+          MIN_SV20: "600000"
+
+          BBZ_GATE: "-0.80"
+          ATRPCTL_GATE: "0.35"
+
+          BASE_DD_MAX: "0.55"
+          CONTRACTION_MAX: "0.85"
+          DRYUP_MAX: "0.95"
+
+          VOL_CONFIRM_MULT: "1.18"
+          MAX_GAP_UP: "1.12"
+          DIST_MAX_PCT: "12.0"
+          EXEC_MAX_OVERSHOOT_PCT: "6.0"
+
+          EXEC_BBZ_MAX: "-1.10"
+          EXEC_ATRPCTL_MAX: "0.30"
+
+          MIN_R_PCT: "8.0"
+
+          OVERHEAD_WINDOW: "200"
+          OVERHEAD_BAND_PCT: "8.0"
+          OVERHEAD_MAX_TOUCHES: "10"
+
+          WATCH_BOOST_MIN_DAYS: "3"
+          WATCH_STALE_DAYS: "10"
+
+          HORIZON_SESS: "40"
+
+          REG_QQQ: "QQQ"
+          REG_VIX: "VIX"
+
+          SLEEP_EVERY: "25"
+          SLEEP_SECONDS: "3.0"
+        run: |
+          python scanner.py
+
+      - name: Commit cache outputs (signals + ohlcv)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Rebase para evitar conflitos com commits do daily
-          git pull --rebase || true
+          git add cache/signals.csv cache/ohlcv || true
+          git status --porcelain
 
-          git add cache/weekly_summary.csv || true
-          git commit -m "Update weekly_summary.csv" || exit 0
+          git commit -m "Update cache (signals + ohlcv)" || exit 0
+
+          git pull --rebase || true
           git push
