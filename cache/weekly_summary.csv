@@ -1,0 +1,2 @@
+week_end,window_start,window_end,horizon,signals_total,exec_count,watch_count,watch_clean,watch_over,watch_cov,watch_success,watch_h1,watch_ff,watch_mfe_med,watch_mae_mean,clean_success,clean_mfe_med,clean_mae_mean,over_success,over_mfe_med,over_mae_mean,baseline_cov,baseline_success,baseline_mfe_med,baseline_mae_mean,edge_pp,regime_mode
+2026-01-31,2026-01-27,2026-01-31,5,22,0,22,10,12,0,,,,,,,,,,,,0,,,,,RISK_ON
