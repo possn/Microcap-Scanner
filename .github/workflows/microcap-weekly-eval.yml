@@ -3,7 +3,7 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 2 * * 6"   # Sábado 02:00 UTC (após fechar semana + commits do daily)
+    - cron: "30 12 * * 6"   # Sábado 12:30 UTC (depois do daily das 12:00)
 
 permissions:
   contents: write
@@ -33,6 +33,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Sync latest repo state (ensure latest cache)
+        run: |
+          git pull --rebase || true
+
       - name: Run weekly evaluation
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -47,8 +51,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git pull --rebase || true
-
           git add cache/weekly_summary.csv || true
+          git status --porcelain
+
           git commit -m "Update weekly_summary.csv" || exit 0
+
+          git pull --rebase || true
           git push
