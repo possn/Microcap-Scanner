@@ -1,12 +1,11 @@
-# weekly_eval.py — QUANT v6 (schema FIXO + rolling-4)
+# weekly_eval.py — QUANT v6 (schema FIXO + rolling-4) [ROBUST DATE MATCH]
 # Lê cache/signals.csv + cache/ohlcv/*.csv
-# Calcula métricas semanais (últimos 5 dias úteis de sinais)
+# Calcula métricas semanais (últimos 5 dias úteis de sinais/ASOF)
 # Escreve cache/weekly_summary.csv com colunas fixas (sem corrupção)
 # Envia resumo para Telegram
 
-import os, csv, io, random
+import os, csv, random
 from pathlib import Path
-from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
 import requests
@@ -16,6 +15,7 @@ import requests
 # =========================
 TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
+
 OHLCV_DIR = Path("cache") / "ohlcv"
 SIGNALS_CSV = Path("cache") / "signals.csv"
 SUMMARY_CSV = Path("cache") / "weekly_summary.csv"
@@ -47,13 +47,13 @@ def load_ohlcv(ticker: str) -> pd.DataFrame | None:
     try:
         df = pd.read_csv(p)
         df.columns = [c.strip().lower() for c in df.columns]
-        need = ["date","open","high","low","close","volume"]
+        need = ["date", "open", "high", "low", "close", "volume"]
         if not all(c in df.columns for c in need):
             return None
         df = df[need].copy()
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-        for c in ["open","high","low","close","volume"]:
+        for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["close"]).reset_index(drop=True)
         return df
@@ -102,26 +102,48 @@ def read_weekly_summary() -> pd.DataFrame:
         return pd.DataFrame()
 
 # =========================
-# metrics
+# Formatting helpers
 # =========================
-def pct(x: float) -> str:
+def pct(x: float | None) -> str:
     if x is None or (not np.isfinite(x)):
         return "—"
     return f"{x*100:.0f}%"
 
-def fmt(x: float, nd=1) -> str:
+def fmt_pct_from_ret(x: float | None, nd=1) -> str:
+    # x vem em "retorno" (ex: 0.023); imprime em percent
     if x is None or (not np.isfinite(x)):
         return "—"
-    return f"{x:.{nd}f}%"
+    return f"{x*100:.{nd}f}%"
 
-def business_last_n(dates: pd.Series, n: int = 5) -> list[pd.Timestamp]:
-    # devolve as últimas n datas únicas (assumindo que já são dias úteis)
-    u = pd.to_datetime(dates, errors="coerce").dropna().dt.normalize().unique()
+# =========================
+# Date window helpers
+# =========================
+def last_n_unique_days(series: pd.Series, n: int = 5) -> list[pd.Timestamp]:
+    u = pd.to_datetime(series, errors="coerce").dropna().dt.normalize().unique()
     u = sorted(u)
+    if len(u) == 0:
+        return []
     return [pd.Timestamp(x) for x in u[-n:]]
 
-def mfe_mae_from_entry(df: pd.DataFrame, pos: int, horizon: int, entry: float) -> tuple[float|None, float|None]:
-    # MFE = max retorno no horizonte; MAE = min retorno no horizonte
+def pick_target_date_from_row(row: pd.Series) -> pd.Timestamp | None:
+    """
+    Prioridade:
+    1) asof (se existir e for parseável)
+    2) date
+    """
+    if "asof" in row.index:
+        d = pd.to_datetime(row.get("asof", None), errors="coerce")
+        if pd.notna(d):
+            return d.normalize()
+    d0 = pd.to_datetime(row.get("date", None), errors="coerce")
+    if pd.isna(d0):
+        return None
+    return d0.normalize()
+
+# =========================
+# MFE/MAE
+# =========================
+def mfe_mae_from_entry(df: pd.DataFrame, pos: int, horizon: int, entry: float) -> tuple[float | None, float | None]:
     if entry <= 0:
         return (None, None)
     end = min(len(df)-1, pos + horizon)
@@ -133,58 +155,68 @@ def mfe_mae_from_entry(df: pd.DataFrame, pos: int, horizon: int, entry: float) -
     mae = float(np.nanmin(rets.values))
     return (mfe, mae)
 
-def eval_watch_row(row, horizon: int) -> dict:
+def find_pos_best_effort(df: pd.DataFrame, target: pd.Timestamp) -> int | None:
     """
-    Sucesso (def B): close > trig em <= horizonte
+    1) tenta match exacto (normalizado)
+    2) se falhar: usa o último dia <= target
+    """
+    dates = df["date"].dt.normalize().values
+    t64 = target.to_datetime64()
+
+    idx = np.where(dates == t64)[0]
+    if len(idx) > 0:
+        return int(idx[0])
+
+    idx2 = np.where(dates <= t64)[0]
+    if len(idx2) > 0:
+        return int(idx2[-1])
+
+    return None
+
+def eval_watch_row(row: pd.Series, horizon: int) -> dict:
+    """
+    Sucesso (def B): algum close > trig em <= horizonte
     H1: close_{+1} > trig
     Fail-fast: close < stop em <=2 sessões (pos+1 ou pos+2)
     """
     out = {"covered": 0, "success": 0, "h1": 0, "ff": 0, "mfe": None, "mae": None}
-    t = str(row["ticker"]).strip().upper()
+
+    t = str(row.get("ticker", "")).strip().upper()
     trig = float(pd.to_numeric(row.get("trig", np.nan), errors="coerce"))
     stop = float(pd.to_numeric(row.get("stop", np.nan), errors="coerce"))
     entry_close = float(pd.to_numeric(row.get("close", np.nan), errors="coerce"))
-    d0 = pd.to_datetime(row.get("date", None), errors="coerce")
-    if not np.isfinite(trig) or not np.isfinite(entry_close) or pd.isna(d0):
+
+    target = pick_target_date_from_row(row)
+    if not t or pd.isna(target) or (not np.isfinite(trig)) or (not np.isfinite(entry_close)):
         return out
 
     df = load_ohlcv(t)
     if df is None or df.empty:
         return out
 
-    # localizar o dia do sinal
-    dates = df["date"].dt.normalize()
-    target = d0.normalize()
-    idx = np.where(dates.values == target.to_datetime64())[0]
-    if len(idx) == 0:
+    pos = find_pos_best_effort(df, target)
+    if pos is None:
         return out
-    pos = int(idx[0])
 
-    # precisa de horizonte suficiente
     if pos + 1 >= len(df):
         return out
 
     out["covered"] = 1
 
-    # sucesso: algum close > trig no horizonte
     end = min(len(df)-1, pos + horizon)
     future = df.iloc[pos:end+1]["close"].values
     out["success"] = 1 if np.any(future > trig) else 0
 
-    # H1: dia seguinte > trig
-    if pos + 1 < len(df):
-        out["h1"] = 1 if float(df["close"].iloc[pos+1]) > trig else 0
+    out["h1"] = 1 if float(df["close"].iloc[pos+1]) > trig else 0
 
-    # fail-fast: < stop em <=2 sessões
     ff = 0
-    for j in [pos+1, pos+2]:
-        if j < len(df) and np.isfinite(stop):
-            if float(df["close"].iloc[j]) < stop:
+    if np.isfinite(stop):
+        for j in [pos+1, pos+2]:
+            if j < len(df) and float(df["close"].iloc[j]) < stop:
                 ff = 1
                 break
     out["ff"] = ff
 
-    # mfe/mae
     mfe, mae = mfe_mae_from_entry(df, pos, horizon, entry_close)
     out["mfe"] = mfe
     out["mae"] = mae
@@ -192,14 +224,15 @@ def eval_watch_row(row, horizon: int) -> dict:
 
 def aggregate_metrics(rows_eval: list[dict]) -> dict:
     if not rows_eval:
-        return {"cov":0,"succ":None,"h1":None,"ff":None,"mfe_med":None,"mae_mean":None}
+        return {"cov": 0, "succ": None, "h1": None, "ff": None, "mfe_med": None, "mae_mean": None}
+
     cov = sum(r["covered"] for r in rows_eval)
     if cov == 0:
-        return {"cov":0,"succ":None,"h1":None,"ff":None,"mfe_med":None,"mae_mean":None}
+        return {"cov": 0, "succ": None, "h1": None, "ff": None, "mfe_med": None, "mae_mean": None}
 
-    suc = np.mean([r["success"] for r in rows_eval if r["covered"]])
-    h1 = np.mean([r["h1"] for r in rows_eval if r["covered"]])
-    ff = np.mean([r["ff"] for r in rows_eval if r["covered"]])
+    suc = float(np.mean([r["success"] for r in rows_eval if r["covered"]]))
+    h1 = float(np.mean([r["h1"] for r in rows_eval if r["covered"]]))
+    ff = float(np.mean([r["ff"] for r in rows_eval if r["covered"]]))
 
     mfes = [r["mfe"] for r in rows_eval if r["covered"] and r["mfe"] is not None and np.isfinite(r["mfe"])]
     maes = [r["mae"] for r in rows_eval if r["covered"] and r["mae"] is not None and np.isfinite(r["mae"])]
@@ -207,7 +240,7 @@ def aggregate_metrics(rows_eval: list[dict]) -> dict:
     mfe_med = float(np.median(mfes)) if mfes else None
     mae_mean = float(np.mean(maes)) if maes else None
 
-    return {"cov":cov,"succ":float(suc),"h1":float(h1),"ff":float(ff),"mfe_med":mfe_med,"mae_mean":mae_mean}
+    return {"cov": cov, "succ": suc, "h1": h1, "ff": ff, "mfe_med": mfe_med, "mae_mean": mae_mean}
 
 # =========================
 # BASELINE (aprox. "random matched DIST%")
@@ -218,40 +251,43 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
     - escolhe tickers aleatórios do cache/ohlcv
     - define trig_baseline = max(close últimos 20 dias antes do window_end)
     - dist% = (trig - close)/close
-    - aceita ticker se dist% cair no mesmo bucket do alvo (bucket por quartis simples)
+    - match por buckets (quartis) para aproximar distribuição DIST%
     - avalia sucesso close>trig em <= horizonte
     """
     if k <= 0:
         return []
 
-    # buckets pelos targets do modelo
     tt = [x for x in dist_targets if np.isfinite(x)]
     if len(tt) < 6:
-        return []  # sem dist suficiente para match
+        return []
 
     qs = np.quantile(tt, [0.25, 0.50, 0.75])
-    def bucket(x):
-        if x <= qs[0]: return 0
-        if x <= qs[1]: return 1
-        if x <= qs[2]: return 2
+
+    def bucket(x: float) -> int:
+        if x <= qs[0]:
+            return 0
+        if x <= qs[1]:
+            return 1
+        if x <= qs[2]:
+            return 2
         return 3
 
     target_buckets = [bucket(x) for x in tt]
-    # distribuição desejada
-    want = {b: target_buckets.count(b) for b in [0,1,2,3]}
+    want = {b: target_buckets.count(b) for b in [0, 1, 2, 3]}
 
-    # universo baseline = ficheiros no cache
     if not OHLCV_DIR.exists():
         return []
-    all_files = [p for p in OHLCV_DIR.iterdir() if p.is_file() and p.name.endswith(".csv")]
-    random.shuffle(all_files)
 
-    picked = []
-    got = {0:0,1:0,2:0,3:0}
+    files = [p for p in OHLCV_DIR.iterdir() if p.is_file() and p.name.endswith(".csv")]
+    if not files:
+        return []
+    random.shuffle(files)
 
-    # tenta até 1500 tickers para preencher
+    picked: list[dict] = []
+    got = {0: 0, 1: 0, 2: 0, 3: 0}
+
     tries = 0
-    for p in all_files:
+    for p in files:
         if len(picked) >= k:
             break
         tries += 1
@@ -263,22 +299,14 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         if df is None or len(df) < 60:
             continue
 
-        # encontrar pos do window_end (ou último antes)
-        dates = df["date"].dt.normalize()
-        # usa o último dia <= window_end
-        mask = dates <= window_end.normalize()
-        if not mask.any():
-            continue
-        pos = int(np.where(mask.values)[0][-1])
-
-        if pos < 25 or pos + 1 >= len(df):
+        pos = find_pos_best_effort(df, window_end.normalize())
+        if pos is None or pos < 25 or pos + 1 >= len(df):
             continue
 
         close0 = float(df["close"].iloc[pos])
         if close0 <= 0:
             continue
 
-        # trigger baseline: máximo close dos 20 dias anteriores
         trig = float(df["close"].iloc[pos-20:pos].max())
         if trig <= 0:
             continue
@@ -291,14 +319,13 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         if got[b] >= want.get(b, 0):
             continue
 
-        # avaliar sucesso no horizonte (close>trig)
         end = min(len(df)-1, pos + horizon)
         future = df["close"].iloc[pos:end+1].values
         success = 1 if np.any(future > trig) else 0
 
         mfe, mae = mfe_mae_from_entry(df, pos, horizon, close0)
 
-        picked.append({"covered":1,"success":success,"mfe":mfe,"mae":mae})
+        picked.append({"covered": 1, "success": success, "mfe": mfe, "mae": mae})
         got[b] += 1
 
     return picked
@@ -307,7 +334,7 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
 # MAIN
 # =========================
 def main():
-    # Sanity: signals.csv
+    # Sanity
     if not SIGNALS_CSV.exists():
         tg_send("WEEKLY REVIEW: FAIL — cache/signals.csv não existe.")
         return
@@ -322,89 +349,98 @@ def main():
         tg_send("WEEKLY REVIEW: FAIL — signals.csv vazio.")
         return
 
-    # normalizar
     sig.columns = [c.strip().lower() for c in sig.columns]
-    need_cols = {"date","ticker","signal","close","trig","stop","dist_pct","overhead_touches","regime"}
+
+    # Colunas mínimas
+    need_cols = {"date", "ticker", "signal", "close", "trig", "stop", "dist_pct", "overhead_touches", "regime"}
     missing = [c for c in need_cols if c not in sig.columns]
     if missing:
         tg_send(f"WEEKLY REVIEW: FAIL — signals.csv sem colunas: {missing}")
         return
 
-    sig["date"] = pd.to_datetime(sig["date"], errors="coerce")
+    # data principal
+    sig["date"] = pd.to_datetime(sig["date"], errors="coerce").dt.normalize()
     sig = sig.dropna(subset=["date"]).copy()
-    sig["date"] = sig["date"].dt.normalize()
 
-    # janela: últimos 5 dias de sinais
-    last5 = business_last_n(sig["date"], 5)
+    # se existir ASOF, usar como "data de mercado" para janela
+    if "asof" in sig.columns:
+        sig["asof"] = pd.to_datetime(sig["asof"], errors="coerce").dt.normalize()
+        # se asof falhar, cai para date
+        sig["eval_day"] = sig["asof"].where(sig["asof"].notna(), sig["date"])
+    else:
+        sig["eval_day"] = sig["date"]
+
+    # janela: últimos 5 dias únicos do eval_day
+    last5 = last_n_unique_days(sig["eval_day"], 5)
     if len(last5) == 0:
         tg_send("WEEKLY REVIEW: FAIL — sem datas válidas.")
         return
 
-    window_start = last5[0].strftime("%Y-%m-%d")
-    window_end = last5[-1].strftime("%Y-%m-%d")
-    week_end = window_end  # simplificação: week_end = último dia da janela
+    window_start_ts = last5[0]
+    window_end_ts = last5[-1]
 
-    w = sig[(sig["date"] >= last5[0]) & (sig["date"] <= last5[-1])].copy()
+    window_start = window_start_ts.strftime("%Y-%m-%d")
+    window_end = window_end_ts.strftime("%Y-%m-%d")
+    week_end = window_end
 
-    # focar apenas WATCH/EXEC
+    w = sig[(sig["eval_day"] >= window_start_ts) & (sig["eval_day"] <= window_end_ts)].copy()
+
     w_exec = w[w["signal"].astype(str).str.contains("EXEC", na=False)].copy()
     w_watch = w[w["signal"].astype(str).str.upper().eq("WATCH")].copy()
 
-    # split limpo/teto para WATCH (overhead)
+    # split limpo/teto (WATCH)
     w_watch["overhead_touches"] = pd.to_numeric(w_watch["overhead_touches"], errors="coerce")
     w_watch["dist_pct"] = pd.to_numeric(w_watch["dist_pct"], errors="coerce")
     w_watch_clean = w_watch[w_watch["overhead_touches"] <= CLEAN_MAX_OH].copy()
     w_watch_over = w_watch[w_watch["overhead_touches"] > CLEAN_MAX_OH].copy()
 
-    # regime dominante no WATCH (modo)
+    # regime dominante no WATCH
     regime_mode = "—"
     if not w_watch.empty:
         vc = w_watch["regime"].astype(str).value_counts()
         if len(vc) > 0:
             regime_mode = str(vc.index[0])
 
-    # avaliar WATCH
+    # avaliar WATCH/EXEC (mesma função; o que muda é só o universo)
     eval_all = [eval_watch_row(r, HORIZON) for _, r in w_watch.iterrows()]
     eval_clean = [eval_watch_row(r, HORIZON) for _, r in w_watch_clean.iterrows()]
     eval_over = [eval_watch_row(r, HORIZON) for _, r in w_watch_over.iterrows()]
+    eval_exec = [eval_watch_row(r, HORIZON) for _, r in w_exec.iterrows()]
 
     m_all = aggregate_metrics(eval_all)
     m_clean = aggregate_metrics(eval_clean)
     m_over = aggregate_metrics(eval_over)
-
-    # avaliar EXEC (opcional; em muitos períodos dá 0)
-    eval_exec = [eval_watch_row(r, HORIZON) for _, r in w_exec.iterrows()]
     m_exec = aggregate_metrics(eval_exec)
 
-    # baseline (random matched dist%)
+    # baseline
     dist_targets = w_watch["dist_pct"].dropna().tolist()
-    baseline = baseline_sample(dist_targets, pd.to_datetime(window_end), HORIZON, k=len(w_watch))
+    baseline = baseline_sample(dist_targets, window_end_ts, HORIZON, k=len(w_watch))
     m_base = aggregate_metrics(baseline)
 
     edge_pp = None
     if m_base["cov"] and m_all["cov"] and m_base["succ"] is not None and m_all["succ"] is not None:
         edge_pp = (m_all["succ"] - m_base["succ"]) * 100.0
 
-    # rolling-4 (se houver histórico válido)
+    # rolling-4
     hist = read_weekly_summary()
     rolling_txt = "📈 ROLLING-4: sem histórico (weekly_summary.csv vazio)."
     if hist is not None and (not hist.empty):
-        # últimas 4 linhas
         h4 = hist.tail(4).copy()
-        # usar colunas existentes
         try:
-            cov = pd.to_numeric(h4["watch_cov"], errors="coerce").fillna(0).sum()
+            cov_total = int(pd.to_numeric(h4["watch_cov"], errors="coerce").fillna(0).sum())
             succ = pd.to_numeric(h4["watch_success"], errors="coerce")
             mae = pd.to_numeric(h4["watch_mae_mean"], errors="coerce")
             mfe = pd.to_numeric(h4["watch_mfe_med"], errors="coerce")
-            # métricas agregadas (média de semanas, não ponderada)
+
             succ_m = float(np.nanmean(succ.values)) if len(succ.dropna()) else None
             mae_m = float(np.nanmean(mae.values)) if len(mae.dropna()) else None
             mfe_m = float(np.nanmean(mfe.values)) if len(mfe.dropna()) else None
+
             rolling_txt = (
                 f"📈 ROLLING-4 (últimas {len(h4)} semanas): "
-                f"WATCH success {pct(succ_m)} | MFE_med {fmt(mfe_m*100 if mfe_m is not None else None,1)} | "
-                f"MAE {fmt(mae_m*100 if mae_m is not None else None,1)} | cov_total={int(cov)}"
+                f"WATCH success {pct(succ_m)} | "
+                f"MFE_med {fmt_pct_from_ret(mfe_m,1)} | "
+                f"MAE {fmt_pct_from_ret(mae_m,1)} | cov_total={cov_total}"
             )
         except Exception:
             rolling_txt = "📈 ROLLING-4: histórico existe mas parsing falhou (ver CSV)."
@@ -414,7 +450,7 @@ def main():
     if w_watch.empty and w_exec.empty:
         sanity = "WARN (sem sinais WATCH/EXEC na janela)"
 
-    # escrever summary row (schema fixo)
+    # escrever summary row
     append_weekly_summary({
         "week_end": week_end,
         "window_start": window_start,
@@ -451,39 +487,41 @@ def main():
         "regime_mode": regime_mode
     })
 
-    # construir mensagem
+    # mensagem
     lines = []
     lines.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v6)")
     lines.append(f"Janela (últimos 5 dias úteis): {window_start} → {window_end}")
     lines.append(f"Horizonte métricas: {HORIZON} sessões")
     lines.append("")
-    lines.append(f"Sinais na janela: {len(w_exec)+len(w_watch)}")
+    lines.append(f"Sinais na janela: {len(w_exec) + len(w_watch)}")
     lines.append(f"• EXEC: {len(w_exec)} | WATCH: {len(w_watch)} (LIMPO: {len(w_watch_clean)} | TETO: {len(w_watch_over)})")
     lines.append("")
+
     lines.append(
         f"EXEC:  cov={m_exec['cov']}/{len(w_exec)}  "
         f"S={pct(m_exec['succ'])} H1={pct(m_exec['h1'])} FF={pct(m_exec['ff'])}  "
-        f"MFE_med={fmt((m_exec['mfe_med']*100) if m_exec['mfe_med'] is not None else None,1)}  "
-        f"MAE={fmt((m_exec['mae_mean']*100) if m_exec['mae_mean'] is not None else None,1)}"
+        f"MFE_med={fmt_pct_from_ret(m_exec['mfe_med'],1)}  "
+        f"MAE={fmt_pct_from_ret(m_exec['mae_mean'],1)}"
     )
     lines.append(
         f"WATCH: cov={m_all['cov']}/{len(w_watch)}  "
         f"S={pct(m_all['succ'])} H1={pct(m_all['h1'])} FF={pct(m_all['ff'])}  "
-        f"MFE_med={fmt((m_all['mfe_med']*100) if m_all['mfe_med'] is not None else None,1)}  "
-        f"MAE={fmt((m_all['mae_mean']*100) if m_all['mae_mean'] is not None else None,1)}"
+        f"MFE_med={fmt_pct_from_ret(m_all['mfe_med'],1)}  "
+        f"MAE={fmt_pct_from_ret(m_all['mae_mean'],1)}"
     )
     lines.append(
         f"  LIMPO(≤{CLEAN_MAX_OH}): cov={m_clean['cov']}/{len(w_watch_clean)}  "
         f"S={pct(m_clean['succ'])}  "
-        f"MFE_med={fmt((m_clean['mfe_med']*100) if m_clean['mfe_med'] is not None else None,1)}  "
-        f"MAE={fmt((m_clean['mae_mean']*100) if m_clean['mae_mean'] is not None else None,1)}"
+        f"MFE_med={fmt_pct_from_ret(m_clean['mfe_med'],1)}  "
+        f"MAE={fmt_pct_from_ret(m_clean['mae_mean'],1)}"
     )
     lines.append(
         f"  TETO(>{CLEAN_MAX_OH}):  cov={m_over['cov']}/{len(w_watch_over)}  "
         f"S={pct(m_over['succ'])}  "
-        f"MFE_med={fmt((m_over['mfe_med']*100) if m_over['mfe_med'] is not None else None,1)}  "
-        f"MAE={fmt((m_over['mae_mean']*100) if m_over['mae_mean'] is not None else None,1)}"
+        f"MFE_med={fmt_pct_from_ret(m_over['mfe_med'],1)}  "
+        f"MAE={fmt_pct_from_ret(m_over['mae_mean'],1)}"
     )
+
     lines.append("")
     lines.append("🧪 BASELINE (random matched DIST% — aproximado):")
     if m_base["cov"] == 0:
@@ -493,8 +531,8 @@ def main():
         lines.append(
             f"BASE:  cov={m_base['cov']}/{len(w_watch)}  "
             f"S={pct(m_base['succ'])}  "
-            f"MFE_med={fmt((m_base['mfe_med']*100) if m_base['mfe_med'] is not None else None,1)}  "
-            f"MAE={fmt((m_base['mae_mean']*100) if m_base['mae_mean'] is not None else None,1)}"
+            f"MFE_med={fmt_pct_from_ret(m_base['mfe_med'],1)}  "
+            f"MAE={fmt_pct_from_ret(m_base['mae_mean'],1)}"
         )
         lines.append(f"EDGE:  {edge_pp:+.0f}pp" if edge_pp is not None else "EDGE: —")
 
