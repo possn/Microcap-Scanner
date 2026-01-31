@@ -1,10 +1,15 @@
-# weekly_eval.py  (QUANT v5 - rolling 4 semanas)
-# - Mantém v4: sanity, alinhamento T/T-1/T+1, buckets, persistência weekly_summary.csv
-# - NOVO: calcula ROLLING-4 (média móvel 4 semanas) e imprime bloco para decisão estrutural
+# weekly_eval.py  (QUANT v6 - baseline random + regime segmentation + rolling-4)
+# - Baseline aleatório (controle): amostra tickers do cache/ohlcv com filtros básicos
+#   e simula "trig" usando a distribuição real de DIST% dos WATCH da semana.
+# - Segmenta métricas WATCH por regime (RISK_ON / TRANSITION / RISK_OFF).
+# - Rolling-4: inclui edge vs baseline e por-regime.
+#
+# Nota: Não mexe no scanner.py. Só avaliação.
 
 import os
 import io
 import csv
+import random
 import requests
 import pandas as pd
 import numpy as np
@@ -12,6 +17,9 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
+# -------------------------
+# ENV
+# -------------------------
 TG_TOKEN = os.getenv("TG_BOT_TOKEN", "")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID", "")
 OHLCV_FMT = os.getenv("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d")
@@ -23,14 +31,21 @@ SUMMARY_CSV = Path("cache/weekly_summary.csv")
 HORIZON_SESS = int(os.getenv("WEEKLY_HORIZON_SESS", "5"))
 WATCH_OVERHEAD_CLEAN_MAX = int(os.getenv("WATCH_OVERHEAD_CLEAN_MAX", "5"))
 
-# sanity thresholds
-SANITY_MIN_COVERAGE_PCT = float(os.getenv("SANITY_MIN_COVERAGE_PCT", "0.65"))  # 65%
-SANITY_MAX_WEEKLY_JUMP_PP = float(os.getenv("SANITY_MAX_WEEKLY_JUMP_PP", "20")) # 20pp jump as "suspect"
+# Baseline sample sizing
+BASELINE_MULT = float(os.getenv("BASELINE_MULT", "2.0"))  # tenta amostrar 2x para compensar falhas
+BASELINE_SEED = os.getenv("BASELINE_SEED", "")           # opcional (string)
 
-# rolling decision thresholds (apenas informativos)
+# Filtros básicos baseline (para ser "justo" vs universo alvo)
+BASE_MIN_PX = float(os.getenv("BASE_MIN_PX", "1.0"))
+BASE_MAX_PX = float(os.getenv("BASE_MAX_PX", "25.0"))
+BASE_MIN_DV20 = float(os.getenv("BASE_MIN_DV20", "3000000"))
+BASE_MAX_DV20 = float(os.getenv("BASE_MAX_DV20", "80000000"))
+
+# sanity thresholds
+SANITY_MIN_COVERAGE_PCT = float(os.getenv("SANITY_MIN_COVERAGE_PCT", "0.65"))
+SANITY_MAX_WEEKLY_JUMP_PP = float(os.getenv("SANITY_MAX_WEEKLY_JUMP_PP", "20"))
+
 ROLL_MIN_WEEKS_STRUCTURAL = int(os.getenv("ROLL_MIN_WEEKS_STRUCTURAL", "4"))
-ROLL_SUCCESS_UP_PP = float(os.getenv("ROLL_SUCCESS_UP_PP", "10"))  # +10pp vs baseline
-ROLL_MAE_WORSEN_PP = float(os.getenv("ROLL_MAE_WORSEN_PP", "1"))    # não piorar mais que 1pp
 
 # -------------------------
 # Telegram
@@ -62,15 +77,6 @@ def last_n_business_days(end_dt: datetime, n: int = 5) -> list[datetime.date]:
 # -------------------------
 # OHLCV cache-first
 # -------------------------
-def _build_symbol_for_stooq(ticker: str) -> str:
-    return ticker.lower().replace("-", ".")
-
-def _candidate_urls(ticker: str) -> list[str]:
-    sym = _build_symbol_for_stooq(ticker)
-    if ".us" in OHLCV_FMT.lower():
-        return [OHLCV_FMT.format(symbol=sym), OHLCV_FMT.format(symbol=f"{sym}.us")]
-    return [OHLCV_FMT.format(symbol=sym), OHLCV_FMT.format(symbol=f"{sym}.us")]
-
 def _load_cached_ohlcv(ticker: str) -> pd.DataFrame | None:
     p = CACHE_OHLCV_DIR / f"{ticker.upper()}.csv"
     if not p.exists():
@@ -85,18 +91,28 @@ def _load_cached_ohlcv(ticker: str) -> pd.DataFrame | None:
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         for c in ["open","high","low","close","volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["high","low","close"]).reset_index(drop=True)
+        df = df.dropna(subset=["high","low","close","volume"]).reset_index(drop=True)
         if len(df) >= 30:
             return df
     except Exception:
         return None
     return None
 
+def _build_symbol_for_stooq(ticker: str) -> str:
+    return ticker.lower().replace("-", ".")
+
+def _candidate_urls(ticker: str) -> list[str]:
+    sym = _build_symbol_for_stooq(ticker)
+    if ".us" in OHLCV_FMT.lower():
+        return [OHLCV_FMT.format(symbol=sym), OHLCV_FMT.format(symbol=f"{sym}.us")]
+    return [OHLCV_FMT.format(symbol=sym), OHLCV_FMT.format(symbol=f"{sym}.us")]
+
 def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame | None:
     cached = _load_cached_ohlcv(ticker)
     if cached is not None and not cached.empty:
         return cached
 
+    # best-effort web fetch (raramente usado no weekly; preferimos cache)
     for url in _candidate_urls(ticker):
         try:
             text = requests.get(url, timeout=60, headers={"User-Agent": "Mozilla/5.0"}).text.strip()
@@ -115,11 +131,9 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame | None:
             df = df[need].copy()
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-            for c in ["open", "high", "low", "close", "volume"]:
+            for c in ["open","high","low","close","volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df.dropna(subset=["high", "low", "close"]).reset_index(drop=True)
-
+            df = df.dropna(subset=["high","low","close","volume"]).reset_index(drop=True)
             if len(df) >= 30:
                 return df
         except Exception:
@@ -132,18 +146,15 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame | None:
 def _align_index_T_Tm1_Tp1(o: pd.DataFrame, target_date: datetime.date) -> int | None:
     o_dates = o["date"].dt.date.values
 
-    # T
     idxs = np.where(o_dates == target_date)[0]
     if len(idxs) > 0:
         return int(idxs[0])
 
-    # T-1
     t_minus = target_date - timedelta(days=1)
     idxs = np.where(o_dates == t_minus)[0]
     if len(idxs) > 0:
         return int(idxs[0])
 
-    # T+1
     after = np.where(o_dates > target_date)[0]
     if len(after) > 0:
         return int(after[0])
@@ -164,9 +175,15 @@ def retfmt(x: float | None) -> str:
     return f"{x*100:.1f}%"
 
 # -------------------------
-# Metric computation
+# Metrics core
 # -------------------------
-def compute_metrics(df_sig: pd.DataFrame, horizon: int) -> dict:
+def compute_metrics_with_trig(df_sig: pd.DataFrame, horizon: int) -> dict:
+    """
+    Espera colunas: ticker, date, close(entry), trig.
+    Mede sucesso = any(close > trig) em <= horizon sessões.
+    Mede H1/FF usando closes após primeiro breakout.
+    MFE/MAE usando high/low no horizonte.
+    """
     res = {
         "n": int(len(df_sig)),
         "coverage": 0,
@@ -248,12 +265,95 @@ def compute_metrics(df_sig: pd.DataFrame, horizon: int) -> dict:
     return res
 
 # -------------------------
+# Baseline: random matched by DIST%
+# -------------------------
+def _cached_tickers_list() -> list[str]:
+    if not CACHE_OHLCV_DIR.exists():
+        return []
+    out = []
+    for p in CACHE_OHLCV_DIR.glob("*.csv"):
+        out.append(p.stem.upper())
+    return list(set(out))
+
+def _passes_baseline_filters(o: pd.DataFrame) -> bool:
+    if o is None or len(o) < 60:
+        return False
+    close_now = float(o["close"].iloc[-1])
+    if close_now < BASE_MIN_PX or close_now > BASE_MAX_PX:
+        return False
+    dv20 = float((o["close"].iloc[-20:] * o["volume"].iloc[-20:]).mean())
+    if dv20 < BASE_MIN_DV20 or dv20 > BASE_MAX_DV20:
+        return False
+    return True
+
+def build_baseline_df(watch_df: pd.DataFrame, horizon: int, window_end: datetime.date) -> pd.DataFrame:
+    """
+    Cria baseline com n == len(watch_df), usando tickers do cache.
+    Matching: dist% é amostrado da distribuição da semana; trig = entry*(1+dist/100).
+    Date: usa o mesmo window_end (alinhamento T/T-1/T+1 trata).
+    """
+    n_target = int(len(watch_df))
+    if n_target <= 0:
+        return pd.DataFrame()
+
+    # dist distribution (só valores finitos)
+    dist_vals = pd.to_numeric(watch_df.get("dist_pct", np.nan), errors="coerce").dropna().tolist()
+    if not dist_vals:
+        # fallback: assume 4%
+        dist_vals = [4.0] * n_target
+
+    # seed deterministic opcional
+    if BASELINE_SEED:
+        random.seed(BASELINE_SEED)
+    else:
+        random.seed(str(window_end))
+
+    candidates = _cached_tickers_list()
+    random.shuffle(candidates)
+
+    # tenta amostrar >n para compensar falhas
+    attempt = int(max(n_target, n_target * BASELINE_MULT))
+    picks = candidates[:attempt] if len(candidates) >= attempt else candidates[:]
+
+    rows = []
+    dt = datetime.combine(window_end, datetime.min.time()).replace(tzinfo=ZoneInfo("Europe/Lisbon"))
+
+    for t in picks:
+        o = _load_cached_ohlcv(t)
+        if o is None:
+            continue
+        if not _passes_baseline_filters(o):
+            continue
+
+        # entry = close em T (ou T-1/T+1 via alinhamento)
+        i0 = _align_index_T_Tm1_Tp1(o, dt.date())
+        if i0 is None:
+            continue
+
+        entry = float(o["close"].iloc[i0])
+        if not np.isfinite(entry) or entry <= 0:
+            continue
+
+        dist = float(random.choice(dist_vals))
+        # se dist negativa (overshoot), permitimos; trig pode ficar abaixo do entry
+        trig = entry * (1.0 + dist / 100.0)
+        if not np.isfinite(trig) or trig <= 0:
+            continue
+
+        rows.append({"date": dt.date().isoformat(), "ticker": t, "close": entry, "trig": trig})
+
+        if len(rows) >= n_target:
+            break
+
+    return pd.DataFrame(rows)
+
+# -------------------------
 # Buckets (compact)
 # -------------------------
 def bucket_series(x: pd.Series, edges: list[float], labels: list[str]) -> pd.Series:
     return pd.cut(x, bins=edges, labels=labels, include_lowest=True)
 
-def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
+def bucket_report_watch(df: pd.DataFrame, horizon: int) -> list[str]:
     out = []
     if df.empty:
         return out
@@ -263,10 +363,11 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     def line(g: pd.DataFrame, name: str) -> str:
-        m = compute_metrics(g, horizon)
+        # usa trig real já existente no df
+        m = compute_metrics_with_trig(g, horizon)
         return f"- {name}: n={m['n']} cov={m['coverage']} S={pct(m['success_rate'])} MFE_med={retfmt(m['mfe_median'])} MAE={retfmt(m['mae_mean'])}"
 
-    out.append(title)
+    out.append("Buckets WATCH (monitorizar):")
 
     if "overhead_touches" in df.columns:
         oh = df["overhead_touches"].fillna(-1)
@@ -274,7 +375,7 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
         for name, g in df.groupby(b, dropna=False):
             if name is None:
                 continue
-            m = compute_metrics(g, horizon)
+            m = compute_metrics_with_trig(g, horizon)
             if m["coverage"] >= 5:
                 out.append(line(g, f"OH {name}"))
 
@@ -284,7 +385,7 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
         for name, g in df.groupby(b, dropna=False):
             if name is None:
                 continue
-            m = compute_metrics(g, horizon)
+            m = compute_metrics_with_trig(g, horizon)
             if m["coverage"] >= 5:
                 out.append(line(g, f"DIST {name}%"))
 
@@ -294,7 +395,7 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
         for name, g in df.groupby(b, dropna=False):
             if name is None:
                 continue
-            m = compute_metrics(g, horizon)
+            m = compute_metrics_with_trig(g, horizon)
             if m["coverage"] >= 5:
                 out.append(line(g, f"BBZ {name}"))
 
@@ -304,7 +405,7 @@ def bucket_report(df: pd.DataFrame, horizon: int, title: str) -> list[str]:
         for name, g in df.groupby(b, dropna=False):
             if name is None:
                 continue
-            m = compute_metrics(g, horizon)
+            m = compute_metrics_with_trig(g, horizon)
             if m["coverage"] >= 5:
                 out.append(line(g, f"ATRp {name}"))
 
@@ -331,6 +432,16 @@ def summary_init_if_needed() -> None:
             "watch_over_success",
             "watch_mae",
             "watch_mfe_med",
+            # baseline + edge
+            "baseline_cov_pct",
+            "baseline_success",
+            "baseline_mfe_med",
+            "baseline_mae",
+            "edge_pp",
+            # regime segmented
+            "watch_success_risk_on",
+            "watch_success_transition",
+            "watch_success_risk_off",
         ])
 
 def append_week_summary(row: dict) -> None:
@@ -347,6 +458,14 @@ def append_week_summary(row: dict) -> None:
         "watch_over_success",
         "watch_mae",
         "watch_mfe_med",
+        "baseline_cov_pct",
+        "baseline_success",
+        "baseline_mfe_med",
+        "baseline_mae",
+        "edge_pp",
+        "watch_success_risk_on",
+        "watch_success_transition",
+        "watch_success_risk_off",
     ]
     with SUMMARY_CSV.open("a", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=cols)
@@ -357,14 +476,12 @@ def load_summary_df() -> pd.DataFrame:
         return pd.DataFrame()
     try:
         s = pd.read_csv(SUMMARY_CSV)
-        if s.empty:
-            return pd.DataFrame()
-        return s
+        return s if not s.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 # -------------------------
-# SANITY + ROLLING
+# SANITY
 # -------------------------
 def sanity_checks(total: int, watch_m: dict, prev_week: dict | None) -> list[str]:
     fails = []
@@ -374,7 +491,7 @@ def sanity_checks(total: int, watch_m: dict, prev_week: dict | None) -> list[str
     if watch_m["n"] > 0:
         cov_pct = (watch_m["coverage"] / max(1, watch_m["n"]))
         if cov_pct < SANITY_MIN_COVERAGE_PCT:
-            fails.append(f"Coverage baixo em WATCH ({cov_pct*100:.0f}%) — provável cache/OHLCV/alinhamento")
+            fails.append(f"Coverage baixo em WATCH ({cov_pct*100:.0f}%) — provável cache/alinhamento")
 
     if prev_week is not None:
         try:
@@ -383,73 +500,68 @@ def sanity_checks(total: int, watch_m: dict, prev_week: dict | None) -> list[str
             if np.isfinite(prev) and np.isfinite(cur):
                 diff_pp = abs((cur - prev) * 100.0)
                 if diff_pp >= SANITY_MAX_WEEKLY_JUMP_PP:
-                    fails.append(f"Salto anómalo na success WATCH vs semana anterior ({diff_pp:.0f}pp) — verificar alinhamento e cache")
+                    fails.append(f"Salto anómalo na success WATCH vs semana anterior ({diff_pp:.0f}pp) — verificar")
         except Exception:
             pass
 
     return fails
 
-def _to_float(x):
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else np.nan
-    except Exception:
+# -------------------------
+# Rolling-4 blocks
+# -------------------------
+def _mean_tail(sdf: pd.DataFrame, col: str, k: int = 4) -> float:
+    if sdf.empty or col not in sdf.columns:
         return np.nan
+    v = pd.to_numeric(sdf[col], errors="coerce").dropna()
+    if v.empty:
+        return np.nan
+    return float(v.tail(min(k, len(v))).mean())
 
 def rolling4_block(sdf: pd.DataFrame) -> list[str]:
-    """
-    Mostra rolling-4 (média) das métricas chave.
-    Se <4 semanas, mostra "em construção".
-    """
     out = []
     if sdf.empty:
         out.append("📈 ROLLING-4: sem histórico (weekly_summary.csv vazio).")
         return out
 
-    # sort by week_end
-    try:
+    # sort
+    if "week_end" in sdf.columns:
         sdf["week_end_dt"] = pd.to_datetime(sdf["week_end"], errors="coerce")
         sdf = sdf.dropna(subset=["week_end_dt"]).sort_values("week_end_dt")
-    except Exception:
-        pass
 
     n_weeks = len(sdf)
-    tail = sdf.tail(min(ROLL_MIN_WEEKS_STRUCTURAL, n_weeks)).copy()
-
-    # numeric columns
-    for c in ["watch_success","watch_clean_success","watch_over_success","watch_mae","watch_mfe_med","watch_cov_pct"]:
-        if c in tail.columns:
-            tail[c] = pd.to_numeric(tail[c], errors="coerce")
-
     if n_weeks < ROLL_MIN_WEEKS_STRUCTURAL:
         out.append(f"📈 ROLLING-4: em construção ({n_weeks}/{ROLL_MIN_WEEKS_STRUCTURAL} semanas).")
     else:
         out.append("📈 ROLLING-4 (últimas 4 semanas):")
 
-    def mean_col(c):
-        if c not in tail.columns:
-            return np.nan
-        v = tail[c].dropna()
-        return float(v.mean()) if len(v) else np.nan
+    r_cov = _mean_tail(sdf, "watch_cov_pct", 4)
+    r_all = _mean_tail(sdf, "watch_success", 4)
+    r_clean = _mean_tail(sdf, "watch_clean_success", 4)
+    r_over = _mean_tail(sdf, "watch_over_success", 4)
+    r_mae = _mean_tail(sdf, "watch_mae", 4)
+    r_mfe = _mean_tail(sdf, "watch_mfe_med", 4)
 
-    r_cov = mean_col("watch_cov_pct")
-    r_all = mean_col("watch_success")
-    r_clean = mean_col("watch_clean_success")
-    r_over = mean_col("watch_over_success")
-    r_mae = mean_col("watch_mae")
-    r_mfe = mean_col("watch_mfe_med")
+    rb_all = _mean_tail(sdf, "baseline_success", 4)
+    rb_mae = _mean_tail(sdf, "baseline_mae", 4)
+    rb_mfe = _mean_tail(sdf, "baseline_mfe_med", 4)
+    redge = _mean_tail(sdf, "edge_pp", 4)
+
+    r_on = _mean_tail(sdf, "watch_success_risk_on", 4)
+    r_tr = _mean_tail(sdf, "watch_success_transition", 4)
+    r_off = _mean_tail(sdf, "watch_success_risk_off", 4)
 
     out.append(f"- WATCH cov%: {pct(r_cov)}")
     out.append(f"- WATCH success: {pct(r_all)} | LIMPO: {pct(r_clean)} | TETO: {pct(r_over)}")
     out.append(f"- WATCH MFE_med: {retfmt(r_mfe)} | MAE: {retfmt(r_mae)}")
 
-    # Optional: eligibility hint (não altera modelo, apenas “semáforo”)
-    if n_weeks >= ROLL_MIN_WEEKS_STRUCTURAL and np.isfinite(r_all):
-        # comparar LIMPO vs TETO se ambos existem
-        if np.isfinite(r_clean) and np.isfinite(r_over):
-            diff_pp = (r_over - r_clean) * 100.0
-            out.append(f"- Δ(TETO-LIMPO) success: {diff_pp:+.0f}pp (rolling-4)")
-        out.append("Critério p/ mudar estruturalmente (guia): efeito ≥ +10pp e MAE não piorar >1pp, consistente.")
+    out.append(f"- BASELINE success: {pct(rb_all)} | MFE_med: {retfmt(rb_mfe)} | MAE: {retfmt(rb_mae)}")
+    if np.isfinite(redge):
+        out.append(f"- EDGE (Modelo - Baseline): {redge:+.0f}pp (rolling-4)")
+    else:
+        out.append("- EDGE (Modelo - Baseline): —")
+
+    out.append(f"- Regime success (rolling-4): RISK_ON {pct(r_on)} | TRANSITION {pct(r_tr)} | RISK_OFF {pct(r_off)}")
+    out.append("Critério p/ mudar estruturalmente (guia): EDGE ≥ +8pp (rolling-4) e MAE não piorar >~1pp, consistente.")
 
     return out
 
@@ -463,12 +575,12 @@ def main() -> None:
     end = days[-1]
 
     if not SIGNALS_CSV.exists():
-        tg_send("❌ WEEKLY: falta cache/signals.csv (BUG: daily não commitou ou cache não restaurada).")
+        tg_send("❌ WEEKLY: falta cache/signals.csv (daily não commitou ou cache não restaurada).")
         return
 
     df = pd.read_csv(SIGNALS_CSV)
     if df.empty:
-        tg_send("⚠ WEEKLY: signals.csv vazio (BUG: daily não está a escrever sinais).")
+        tg_send("⚠ WEEKLY: signals.csv vazio (daily não está a escrever sinais).")
         return
 
     df["date"] = pd.to_datetime(df.get("date", None), errors="coerce")
@@ -483,19 +595,54 @@ def main() -> None:
     exec_df = wdf[wdf["signal"].astype(str).isin(["EXEC_A", "EXEC_B"])].copy()
     watch_df = wdf[wdf["signal"].astype(str) == "WATCH"].copy()
 
+    # ensure trig exists for metrics
+    for col in ["close", "trig"]:
+        if col in watch_df.columns:
+            watch_df[col] = pd.to_numeric(watch_df[col], errors="coerce")
+    watch_df = watch_df.dropna(subset=["close","trig"]).copy()
+
+    # clean vs overhead
     watch_df["overhead_touches"] = pd.to_numeric(watch_df.get("overhead_touches", np.nan), errors="coerce")
     watch_clean = watch_df[watch_df["overhead_touches"] <= WATCH_OVERHEAD_CLEAN_MAX].copy()
     watch_over = watch_df[watch_df["overhead_touches"] > WATCH_OVERHEAD_CLEAN_MAX].copy()
 
-    # Metrics
-    m_exec = compute_metrics(exec_df, HORIZON_SESS)
-    m_watch_all = compute_metrics(watch_df, HORIZON_SESS)
-    m_watch_clean = compute_metrics(watch_clean, HORIZON_SESS)
-    m_watch_over = compute_metrics(watch_over, HORIZON_SESS)
+    # metrics
+    m_exec = compute_metrics_with_trig(exec_df, HORIZON_SESS) if not exec_df.empty else {
+        "n": 0, "coverage": 0, "success_rate": np.nan, "hold1_rate": np.nan, "fail_fast_rate": np.nan,
+        "mfe_mean": np.nan, "mfe_median": np.nan, "mae_mean": np.nan
+    }
+    m_watch_all = compute_metrics_with_trig(watch_df, HORIZON_SESS)
+    m_watch_clean = compute_metrics_with_trig(watch_clean, HORIZON_SESS)
+    m_watch_over = compute_metrics_with_trig(watch_over, HORIZON_SESS)
 
-    # Persist summary
-    cov_pct = (m_watch_all["coverage"] / max(1, m_watch_all["n"])) if m_watch_all["n"] > 0 else np.nan
+    watch_cov_pct = (m_watch_all["coverage"] / max(1, m_watch_all["n"])) if m_watch_all["n"] > 0 else np.nan
 
+    # regime segmentation (WATCH)
+    if "regime" in watch_df.columns:
+        w_on = watch_df[watch_df["regime"].astype(str) == "RISK_ON"].copy()
+        w_tr = watch_df[watch_df["regime"].astype(str) == "TRANSITION"].copy()
+        w_off = watch_df[watch_df["regime"].astype(str) == "RISK_OFF"].copy()
+        m_on = compute_metrics_with_trig(w_on, HORIZON_SESS) if not w_on.empty else {"success_rate": np.nan}
+        m_tr = compute_metrics_with_trig(w_tr, HORIZON_SESS) if not w_tr.empty else {"success_rate": np.nan}
+        m_off = compute_metrics_with_trig(w_off, HORIZON_SESS) if not w_off.empty else {"success_rate": np.nan}
+    else:
+        m_on = {"success_rate": np.nan}
+        m_tr = {"success_rate": np.nan}
+        m_off = {"success_rate": np.nan}
+
+    # baseline build + metrics
+    baseline_df = build_baseline_df(watch_df, HORIZON_SESS, end)
+    m_base = compute_metrics_with_trig(baseline_df, HORIZON_SESS) if not baseline_df.empty else {
+        "n": 0, "coverage": 0, "success_rate": np.nan, "hold1_rate": np.nan, "fail_fast_rate": np.nan,
+        "mfe_mean": np.nan, "mfe_median": np.nan, "mae_mean": np.nan
+    }
+    base_cov_pct = (m_base["coverage"] / max(1, m_base["n"])) if m_base["n"] > 0 else np.nan
+
+    edge_pp = np.nan
+    if np.isfinite(m_watch_all["success_rate"]) and np.isfinite(m_base["success_rate"]):
+        edge_pp = (m_watch_all["success_rate"] - m_base["success_rate"]) * 100.0
+
+    # persist summary
     append_week_summary({
         "week_end": str(end),
         "window_start": str(start),
@@ -504,12 +651,20 @@ def main() -> None:
         "signals_total": total,
         "exec_total": int(len(exec_df)),
         "watch_total": int(len(watch_df)),
-        "watch_cov_pct": round(float(cov_pct), 4) if np.isfinite(cov_pct) else "",
+        "watch_cov_pct": round(float(watch_cov_pct), 6) if np.isfinite(watch_cov_pct) else "",
         "watch_success": round(float(m_watch_all["success_rate"]), 6) if np.isfinite(m_watch_all["success_rate"]) else "",
         "watch_clean_success": round(float(m_watch_clean["success_rate"]), 6) if np.isfinite(m_watch_clean["success_rate"]) else "",
         "watch_over_success": round(float(m_watch_over["success_rate"]), 6) if np.isfinite(m_watch_over["success_rate"]) else "",
         "watch_mae": round(float(m_watch_all["mae_mean"]), 6) if np.isfinite(m_watch_all["mae_mean"]) else "",
         "watch_mfe_med": round(float(m_watch_all["mfe_median"]), 6) if np.isfinite(m_watch_all["mfe_median"]) else "",
+        "baseline_cov_pct": round(float(base_cov_pct), 6) if np.isfinite(base_cov_pct) else "",
+        "baseline_success": round(float(m_base["success_rate"]), 6) if np.isfinite(m_base["success_rate"]) else "",
+        "baseline_mfe_med": round(float(m_base["mfe_median"]), 6) if np.isfinite(m_base["mfe_median"]) else "",
+        "baseline_mae": round(float(m_base["mae_mean"]), 6) if np.isfinite(m_base["mae_mean"]) else "",
+        "edge_pp": round(float(edge_pp), 3) if np.isfinite(edge_pp) else "",
+        "watch_success_risk_on": round(float(m_on["success_rate"]), 6) if np.isfinite(m_on["success_rate"]) else "",
+        "watch_success_transition": round(float(m_tr["success_rate"]), 6) if np.isfinite(m_tr["success_rate"]) else "",
+        "watch_success_risk_off": round(float(m_off["success_rate"]), 6) if np.isfinite(m_off["success_rate"]) else "",
     })
 
     sdf = load_summary_df()
@@ -520,13 +675,12 @@ def main() -> None:
     # SANITY
     sanity_fails = sanity_checks(total, m_watch_all, prev_week)
 
-    # Build message
+    # Message
     msg = []
-    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v5)")
+    msg.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v6)")
     msg.append(f"Janela (últimos 5 dias úteis): {start} → {end}")
     msg.append(f"Horizonte métricas: {HORIZON_SESS} sessões")
     msg.append("")
-
     msg.append(f"Sinais na janela: {total}")
     msg.append(f"• EXEC: {len(exec_df)} | WATCH: {len(watch_df)} (LIMPO: {len(watch_clean)} | TETO: {len(watch_over)})")
     msg.append("")
@@ -537,29 +691,41 @@ def main() -> None:
     msg.append(f"  TETO(>{WATCH_OVERHEAD_CLEAN_MAX}):  cov={m_watch_over['coverage']}/{m_watch_over['n']}  S={pct(m_watch_over['success_rate'])}  MFE_med={retfmt(m_watch_over['mfe_median'])}  MAE={retfmt(m_watch_over['mae_mean'])}")
     msg.append("")
 
+    # Baseline block
+    msg.append("🧪 BASELINE (random matched DIST%):")
+    msg.append(f"BASE:  cov={m_base['coverage']}/{m_base['n']}  S={pct(m_base['success_rate'])}  MFE_med={retfmt(m_base['mfe_median'])}  MAE={retfmt(m_base['mae_mean'])}")
+    if np.isfinite(edge_pp):
+        msg.append(f"EDGE:  Modelo - Baseline = {edge_pp:+.0f}pp")
+    else:
+        msg.append("EDGE:  —")
+    msg.append("")
+
+    # Regime block
+    msg.append("🧭 REGIME (WATCH success):")
+    msg.append(f"RISK_ON: {pct(m_on.get('success_rate', np.nan))} | TRANSITION: {pct(m_tr.get('success_rate', np.nan))} | RISK_OFF: {pct(m_off.get('success_rate', np.nan))}")
+    msg.append("")
+
+    # SANITY
     if sanity_fails:
         msg.append("🧯 SANITY: FAIL (corrigir já)")
         for f in sanity_fails:
             msg.append(f"- {f}")
-        msg.append("Ação típica: verificar cache restore, rate-limit Stooq, e alinhamento de datas.")
     else:
         msg.append("✅ SANITY: OK (sem bugs críticos detectados)")
-
     msg.append("")
+
+    # Rolling-4
     msg.extend(rolling4_block(sdf))
     msg.append("")
 
     # Buckets
     if len(watch_df) > 0:
-        msg.extend(bucket_report(watch_df, HORIZON_SESS, "Buckets WATCH (monitorizar):"))
-        msg.append("")
-    if len(exec_df) > 0:
-        msg.extend(bucket_report(exec_df, HORIZON_SESS, "Buckets EXEC (monitorizar):"))
+        msg.extend(bucket_report_watch(watch_df, HORIZON_SESS))
         msg.append("")
 
     msg.append("Ações:")
     msg.append("• Bugs: corrigir imediatamente se SANITY=FAIL.")
-    msg.append(f"• Modelo: sem alterações estruturais até acumular ≥{ROLL_MIN_WEEKS_STRUCTURAL} semanas (usar ROLLING-4).")
+    msg.append(f"• Modelo: alterações estruturais só com evidência em ROLLING-4 (≥{ROLL_MIN_WEEKS_STRUCTURAL} semanas).")
     msg.append("• Histórico: weekly_summary.csv actualizado (base para decisões).")
 
     tg_send("\n".join(msg))
