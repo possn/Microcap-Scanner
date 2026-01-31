@@ -3,7 +3,7 @@ name: microcap-scanner-daily
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 1 * * 1-5"  # 01:30 UTC, dias úteis (EOD US + atraso Stooq)
+    - cron: "0 12 * * *" # 12:00 UTC (Lisboa no inverno = 12:00)
 
 permissions:
   contents: write
@@ -15,7 +15,6 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -26,12 +25,20 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      # Cache rolling partilhada (restaura último estado e grava novo no fim do job)
+      - name: Restore cache (shared, rolling)
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: microcap-cache-shared-${{ github.run_id }}
+          restore-keys: |
+            microcap-cache-shared-
 
       - name: Run scanner
         env:
@@ -84,17 +91,20 @@ jobs:
 
           SLEEP_EVERY: "25"
           SLEEP_SECONDS: "3.0"
-
         run: |
           python scanner.py
 
+      # Commit/push apenas no main (evita ruído em branches)
       - name: Commit cache outputs (signals + ohlcv)
+        if: github.ref == 'refs/heads/main'
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
 
+          # Rebase primeiro (reduz conflitos)
           git pull --rebase || true
 
           git add cache/signals.csv cache/ohlcv || true
           git commit -m "Update cache (signals + ohlcv)" || exit 0
+
           git push
