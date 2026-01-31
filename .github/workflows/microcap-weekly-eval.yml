@@ -1,9 +1,10 @@
+# .github/workflows/microcap-weekly-eval.yml
 name: microcap-weekly-eval
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "30 12 * * 6"   # Sábado 12:30 UTC (depois do daily das 12:00)
+    - cron: "15 2 * * 1-5"   # Seg–Sex 02:15 UTC (depois do daily ter tido tempo de commitar)
 
 permissions:
   contents: write
@@ -33,14 +34,19 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Sync latest repo state (ensure latest cache)
-        run: |
-          git pull --rebase || true
+      - name: Restore cache folder (shared)
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: microcap-cache-shared-v1
+          restore-keys: |
+            microcap-cache-shared-
 
-      - name: Run weekly evaluation
+      - name: Run weekly evaluation (strict coverage)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
         run: |
@@ -51,10 +57,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add cache/weekly_summary.csv || true
-          git status --porcelain
-
-          git commit -m "Update weekly_summary.csv" || exit 0
-
           git pull --rebase || true
+
+          git add cache/weekly_summary.csv || true
+          git commit -m "Update weekly_summary.csv" || exit 0
           git push
