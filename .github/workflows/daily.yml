@@ -1,9 +1,10 @@
+# .github/workflows/microcap-scanner-daily.yml
 name: microcap-scanner-daily
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 12 * * *"   # 12:00 UTC
+    - cron: "0 12 * * 1-5"   # Seg–Sex 12:00 UTC (EOD disponível; evita fim-de-semana)
 
 permissions:
   contents: write
@@ -33,10 +34,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # Opcional mas seguro: garante que estás em cima do último commit do cache
-      - name: Sync latest repo state
-        run: |
-          git pull --rebase || true
+      - name: Restore cache folder (persistente)
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: microcap-cache-shared-v1
+          restore-keys: |
+            microcap-cache-shared-
 
       - name: Run scanner
         env:
@@ -89,6 +93,7 @@ jobs:
 
           SLEEP_EVERY: "25"
           SLEEP_SECONDS: "3.0"
+
         run: |
           python scanner.py
 
@@ -97,10 +102,8 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git add cache/signals.csv cache/ohlcv || true
-          git status --porcelain
-
-          git commit -m "Update cache (signals + ohlcv)" || exit 0
-
           git pull --rebase || true
+
+          git add cache/signals.csv cache/ohlcv || true
+          git commit -m "Update cache (signals + ohlcv)" || exit 0
           git push
