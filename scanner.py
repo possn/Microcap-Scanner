@@ -1,19 +1,18 @@
-# scanner.py  (V7_1_PREOPEN_FULL_TOP7_IDEAL — FIXED)
+# scanner.py  (V7_1_PREOPEN_FULL_TOP7_CLEAN)
 # EOD-only, public/free, cache-first, ranked, pre-open actionable.
-# FIXES (críticos):
-# 1) signals.csv "date" passa a ser DATA DE MERCADO (última data do OHLCV do ticker),
-#    não a data do relógio do workflow → weekly_eval deixa de ter cov=0 por mismatch.
-# 2) Removido duplicado de load_cached_ohlcv_local dentro do main (havia duas definições).
-# 3) Header mostra "ASOF" de mercado (preferência QQQ; fallback UTC date).
+# FIXES:
+#  - No duplicate rows in cache/signals.csv for same (date,ticker,signal)
+#  - Single cache loader (removed duplicate nested function)
+#  - Robust CACHE_ONLY + auto-switch on Stooq HITS_LIMIT
+#  - ASOF reflects last market date actually observed in used OHLCV
+#  - Safer parsing + consistent diagnostics
 
 import os, io, time, csv
-from datetime import datetime, timezone
-from pathlib import Path
-
 import requests
 import pandas as pd
 import numpy as np
-
+from datetime import datetime, timezone
+from pathlib import Path
 
 # =========================
 # ENV / CONFIG
@@ -32,53 +31,42 @@ OHLCV_FMT = os.environ.get("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}
 MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "600"))
 CANDIDATE_POOL = int(os.environ.get("CANDIDATE_POOL", "2600"))
 
-# micro/small proxy (verifiable)
 MIN_PX = float(os.environ.get("MIN_PX", "1.0"))
 MAX_PX = float(os.environ.get("MAX_PX", "25"))
 MIN_DV20 = float(os.environ.get("MIN_DV20", "3000000"))
 MAX_DV20 = float(os.environ.get("MAX_DV20", "80000000"))
 MIN_SV20 = float(os.environ.get("MIN_SV20", "600000"))
 
-# compression gates
-BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.7"))
-ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.45"))
+BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.80"))
+ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.35"))
 
-# base/dry
 BASE_DD_MAX = float(os.environ.get("BASE_DD_MAX", "0.55"))
 CONTRACTION_MAX = float(os.environ.get("CONTRACTION_MAX", "0.85"))
 DRYUP_MAX = float(os.environ.get("DRYUP_MAX", "0.95"))
 
-# execution rules
 VOL_CONFIRM_MULT_BASE = float(os.environ.get("VOL_CONFIRM_MULT", "1.15"))
 MAX_GAP_UP = float(os.environ.get("MAX_GAP_UP", "1.12"))
 DIST_MAX_PCT = float(os.environ.get("DIST_MAX_PCT", "10.0"))
 EXEC_MAX_OVERSHOOT_PCT = float(os.environ.get("EXEC_MAX_OVERSHOOT_PCT", "6.0"))
 
-# quality gates for EXECUTAR
-EXEC_BBZ_MAX = float(os.environ.get("EXEC_BBZ_MAX", "-1.1"))
+EXEC_BBZ_MAX = float(os.environ.get("EXEC_BBZ_MAX", "-1.10"))
 EXEC_ATRPCTL_MAX = float(os.environ.get("EXEC_ATRPCTL_MAX", "0.30"))
 
-# payoff filter
 MIN_R_PCT = float(os.environ.get("MIN_R_PCT", "8.0"))
 
-# overhead supply proxy
 OVERHEAD_WINDOW = int(os.environ.get("OVERHEAD_WINDOW", "200"))
 OVERHEAD_BAND_PCT = float(os.environ.get("OVERHEAD_BAND_PCT", "8.0"))
 OVERHEAD_MAX_TOUCHES = int(os.environ.get("OVERHEAD_MAX_TOUCHES", "10"))
 
-# watch maturation/stale
 WATCH_BOOST_MIN_DAYS = int(os.environ.get("WATCH_BOOST_MIN_DAYS", "3"))
 WATCH_STALE_DAYS = int(os.environ.get("WATCH_STALE_DAYS", "10"))
 
-# empirical learning
 HORIZON = int(os.environ.get("HORIZON_SESS", "40"))
 RET_WINDOWS = [5, 10, 20, 40]
 
-# regime symbols (EOD)
 REG_QQQ = os.environ.get("REG_QQQ", "QQQ")
 REG_VIX = os.environ.get("REG_VIX", "VIX")  # may fail; fallback used
 
-# sleep
 SLEEP_EVERY = int(os.environ.get("SLEEP_EVERY", "60"))
 SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "1.0"))
 
@@ -86,7 +74,6 @@ SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "1.0"))
 CACHE_DIR = Path("cache")
 OHLCV_DIR = CACHE_DIR / "ohlcv"
 SIGNALS_CSV = CACHE_DIR / "signals.csv"
-
 
 # =========================
 # Telegram
@@ -101,7 +88,6 @@ def tg_send(text: str) -> None:
         r.raise_for_status()
     except Exception:
         pass
-
 
 # =========================
 # Utils / Indicators
@@ -132,7 +118,6 @@ def fetch_text(url: str) -> str:
     r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
-
 
 # =========================
 # Holdings parsing
@@ -179,45 +164,18 @@ def get_universe_from_holdings(url: str) -> list[str]:
     else:
         raise RuntimeError("Holdings sem Ticker/Symbol.")
     raw = df[col].astype(str).str.strip().tolist()
-    out: list[str] = []
+    out = []
     for t in raw:
         t = t.replace(".", "-").upper()
         if is_valid_ticker(t):
             out.append(t)
     return out
 
-
 # =========================
 # OHLCV / cache
 # =========================
 def cache_path(t: str) -> Path:
     return OHLCV_DIR / f"{t}.csv"
-
-def load_cached_ohlcv_local(ticker: str) -> pd.DataFrame | None:
-    path = cache_path(ticker)
-    if not path.exists():
-        return None
-    try:
-        df = pd.read_csv(path)
-        df.columns = [c.strip().lower() for c in df.columns]
-        need = ["date", "open", "high", "low", "close", "volume"]
-        if not all(c in df.columns for c in need):
-            return None
-
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-        df = df.dropna(subset=["open", "high", "low", "close", "volume"])
-
-        if len(df) < 260:
-            return None
-
-        return df.reset_index(drop=True)
-    except Exception:
-        return None
 
 def build_ohlcv_url_equity(ticker: str) -> str:
     sym = ticker.lower().replace("-", ".")
@@ -231,22 +189,35 @@ def build_ohlcv_url_symbol(symbol: str) -> tuple[str, str]:
     url2 = OHLCV_FMT.format(symbol=f"{sym}.us")
     return url1, url2
 
-def read_cached_dv20(ticker: str) -> float | None:
-    path = cache_path(ticker)
-    if not path.exists():
+def load_cached_ohlcv_local(ticker: str, min_rows: int = 120) -> pd.DataFrame | None:
+    p = cache_path(ticker)
+    if not p.exists():
         return None
     try:
-        df = pd.read_csv(path)
+        df = pd.read_csv(p)
         df.columns = [c.strip().lower() for c in df.columns]
-        if not set(["close", "volume"]).issubset(df.columns):
+        need = ["date", "open", "high", "low", "close", "volume"]
+        if not all(c in df.columns for c in need):
             return None
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        df = df.dropna(subset=["close", "volume"])
-        if len(df) < 30:
+        df = df[need].copy()
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        for c in ["open","high","low","close","volume"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
+        if len(df) < min_rows:
             return None
+        return df
+    except Exception:
+        return None
+
+def read_cached_dv20(ticker: str) -> float | None:
+    df = load_cached_ohlcv_local(ticker, min_rows=30)
+    if df is None:
+        return None
+    try:
         dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
-        if not np.isfinite(dv20):
+        if not np.isfinite(dv20) or dv20 <= 0:
             return None
         return dv20
     except Exception:
@@ -256,13 +227,12 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
     """
     Fetch EOD OHLCV for ticker, with disk cache.
     - Tenta ir ao Stooq e atualizar o CSV local.
-    - Se Stooq der HITS_LIMIT / falhar / BAD_FORMAT, usa o cache existente (se houver).
+    - Se Stooq der HITS_LIMIT / falhar / BAD_FORMAT, usa cache existente (se houver).
     - Se não houver cache e falhar, levanta erro.
     """
     ensure_dirs()
     path = cache_path(ticker)
 
-    # 1) Lê cache (se existir)
     cached = None
     if path.exists():
         try:
@@ -274,7 +244,6 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
         except Exception:
             cached = None
 
-    # 2) Tenta buscar dados frescos
     try:
         url = build_ohlcv_url_equity(ticker)
         text = fetch_text(url).strip()
@@ -299,12 +268,10 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
 
-        # merge com cache
-        if cached is not None and len(cached) > 0:
-            if all(c in cached.columns for c in need):
-                merged = pd.concat([cached[need], df[need]], ignore_index=True)
-                merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
-                df = merged
+        if cached is not None and len(cached) > 0 and all(c in cached.columns for c in need):
+            merged = pd.concat([cached[need], df[need]], ignore_index=True)
+            merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+            df = merged
 
         df.to_csv(path, index=False)
         return df.reset_index(drop=True)
@@ -312,12 +279,16 @@ def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
     except Exception:
         # fallback cache
         if cached is not None and len(cached) >= 120:
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in cached.columns:
+            need = ["date", "open", "high", "low", "close", "volume"]
+            if all(c in cached.columns for c in need):
+                cached = cached[need].copy()
+                cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
+                cached = cached.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+                for c in ["open","high","low","close","volume"]:
                     cached[c] = pd.to_numeric(cached[c], errors="coerce")
-            cached = cached.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
-            return cached.reset_index(drop=True)
-
+                cached = cached.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
+                if len(cached) >= 120:
+                    return cached
         raise
 
 def fetch_ohlcv_symbol_best_effort(symbol: str) -> pd.DataFrame | None:
@@ -338,15 +309,14 @@ def fetch_ohlcv_symbol_best_effort(symbol: str) -> pd.DataFrame | None:
             df = df[need].copy()
             df["date"] = pd.to_datetime(df["date"], errors="coerce")
             df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-            for c in ["open", "high", "low", "close", "volume"]:
+            for c in ["open","high","low","close","volume"]:
                 df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df.dropna(subset=["close"]).reset_index(drop=True)
+            df = df.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
             if len(df) >= 120:
                 return df
         except Exception:
             continue
     return None
-
 
 # =========================
 # Model components
@@ -422,7 +392,7 @@ def score_candidate(
     if np.isfinite(dist_to_trig_pct):
         s += max(0.0, (DIST_MAX_PCT - dist_to_trig_pct)) * 0.10
 
-    # Overhead supply penalty (strong tiers)
+    # Overhead penalty tiers
     if overhead_touches >= 60:
         s -= 1.5
     elif overhead_touches >= 30:
@@ -434,29 +404,14 @@ def score_candidate(
     s -= stale_penalty
     return float(s)
 
-
 # =========================
 # Regime logic (EOD)
 # =========================
 def regime_snapshot() -> dict:
-    out = {
-        "mode": "TRANSITION",
-        "vol_mult_adj": 0.0,
-        "dist_adj": 0.0,
-        "qqq_trend": None,
-        "vix_trend": None,
-        "asof_date": None,  # data de mercado (QQQ), usada no header
-    }
-
+    out = {"mode": "TRANSITION", "vol_mult_adj": 0.0, "dist_adj": 0.0, "qqq_trend": None, "vix_trend": None}
     qqq = fetch_ohlcv_symbol_best_effort(REG_QQQ)
-    if qqq is None or len(qqq) < 120:
+    if qqq is None or len(qqq) < 200:
         return out
-
-    try:
-        d = pd.to_datetime(qqq["date"].iloc[-1], errors="coerce")
-        out["asof_date"] = None if pd.isna(d) else d.date()
-    except Exception:
-        out["asof_date"] = None
 
     qqq["ma50"] = qqq["close"].rolling(50).mean()
     qqq["ma200"] = qqq["close"].rolling(200).mean()
@@ -473,7 +428,7 @@ def regime_snapshot() -> dict:
     out["qqq_trend"] = qqq_trend
 
     vix = fetch_ohlcv_symbol_best_effort(REG_VIX)
-    if vix is not None and len(vix) >= 60:
+    if vix is not None and len(vix) >= 30:
         vix["ma20"] = vix["close"].rolling(20).mean()
         if np.isfinite(vix["ma20"].iloc[-1]):
             v_close = float(vix["close"].iloc[-1])
@@ -487,7 +442,7 @@ def regime_snapshot() -> dict:
         out["mode"] = "RISK_ON"
         out["vol_mult_adj"] = -0.03
         out["dist_adj"] = +2.0
-    elif qqq_trend == "DOWN" and (out["vix_trend"] in ["UP"]):
+    elif qqq_trend == "DOWN" and (out["vix_trend"] == "UP"):
         out["mode"] = "RISK_OFF"
         out["vol_mult_adj"] = +0.10
         out["dist_adj"] = -4.0
@@ -498,45 +453,73 @@ def regime_snapshot() -> dict:
 
     return out
 
+# =========================
+# signals.csv helpers (NO DUPES)
+# =========================
+SIGNALS_COLS = [
+    "date","ticker","signal","score","close","trig","stop","dist_pct","dv20",
+    "bbz","atrpctl","dd","contr","dry","overhead_touches","vol_mult","overshoot_pct",
+    "R_pct","regime",
+    "ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
+]
 
-# =========================
-# signals.csv helpers
-# =========================
 def signals_csv_init_if_needed() -> None:
     if SIGNALS_CSV.exists():
         return
     ensure_dirs()
     with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow([
-            "date","ticker","signal","score","close","trig","stop","dist_pct","dv20",
-            "bbz","atrpctl","dd","contr","dry","overhead_touches","vol_mult","overshoot_pct",
-            "R_pct","regime",
-            "ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
-        ])
+        w.writerow(SIGNALS_COLS)
 
-def append_signal_row(row: dict) -> None:
+def load_existing_keys_for_date(date_str: str) -> set[tuple[str,str,str]]:
+    """
+    Carrega keys (date,ticker,signal) já existentes para o dia corrente.
+    Evita duplicados mesmo com múltiplos runs.
+    """
+    keys: set[tuple[str,str,str]] = set()
+    if not SIGNALS_CSV.exists():
+        return keys
+    try:
+        df = pd.read_csv(SIGNALS_CSV, usecols=["date","ticker","signal"])
+        df = df.dropna()
+        df["date"] = df["date"].astype(str)
+        df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+        df["signal"] = df["signal"].astype(str).str.upper().str.strip()
+        df = df[df["date"] == date_str]
+        for _, r in df.iterrows():
+            keys.add((r["date"], r["ticker"], r["signal"]))
+    except Exception:
+        pass
+    return keys
+
+def append_signal_row(row: dict, keyset: set[tuple[str,str,str]]) -> None:
     signals_csv_init_if_needed()
-    cols = [
-        "date","ticker","signal","score","close","trig","stop","dist_pct","dv20",
-        "bbz","atrpctl","dd","contr","dry","overhead_touches","vol_mult","overshoot_pct",
-        "R_pct","regime",
-        "ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
-    ]
+
+    d = str(row.get("date", "")).strip()
+    t = str(row.get("ticker", "")).strip().upper()
+    s = str(row.get("signal", "")).strip().upper()
+    k = (d, t, s)
+    if d and t and s and (k in keyset):
+        return
+
     with SIGNALS_CSV.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=cols)
-        w.writerow({c: row.get(c, "") for c in cols})
+        w = csv.DictWriter(f, fieldnames=SIGNALS_COLS)
+        w.writerow({c: row.get(c, "") for c in SIGNALS_COLS})
+
+    if d and t and s:
+        keyset.add(k)
 
 def recent_watch_stats(ticker: str, lookback_days: int = 15) -> dict:
     if not SIGNALS_CSV.exists():
         return {"days": 0, "dists": []}
     try:
-        df = pd.read_csv(SIGNALS_CSV)
+        df = pd.read_csv(SIGNALS_CSV, usecols=["date","ticker","dist_pct"])
     except Exception:
         return {"days": 0, "dists": []}
-    if df.empty or "ticker" not in df.columns:
+    if df.empty:
         return {"days": 0, "dists": []}
 
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
     df = df[df["ticker"] == ticker].copy()
     if df.empty:
         return {"days": 0, "dists": []}
@@ -574,7 +557,6 @@ def watch_boost_and_stale_penalty(dist_series: list[float]) -> tuple[float, floa
 
     return (boost, penalty)
 
-
 # =========================
 # outcomes update (EOD-only, from cache)
 # =========================
@@ -596,22 +578,14 @@ def update_outcomes_using_cache() -> dict:
     updated = 0
     for idx in unresolved_idx[:800]:
         try:
-            ticker = str(df.at[idx, "ticker"])
+            ticker = str(df.at[idx, "ticker"]).strip().upper()
             sig_date = pd.to_datetime(df.at[idx, "date"], errors="coerce")
             if pd.isna(sig_date):
                 continue
 
-            p = cache_path(ticker)
-            if not p.exists():
+            o = load_cached_ohlcv_local(ticker, min_rows=260)
+            if o is None:
                 continue
-
-            o = pd.read_csv(p)
-            o.columns = [c.strip().lower() for c in o.columns]
-            if "date" not in o.columns or "close" not in o.columns:
-                continue
-
-            o["date"] = pd.to_datetime(o["date"], errors="coerce")
-            o = o.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
 
             o_dates = o["date"].dt.date
             target = sig_date.date()
@@ -663,7 +637,9 @@ def empirical_prob_by_score_bin(regime: str) -> str:
     if df.empty:
         return "EMP: sem histórico"
 
-    df = df[df.get("resolved", "0").astype(str) == "1"].copy()
+    if "resolved" not in df.columns:
+        return "EMP: sem histórico"
+    df = df[df["resolved"].astype(str) == "1"].copy()
     if df.empty or "score" not in df.columns:
         return "EMP: sem histórico"
 
@@ -686,57 +662,50 @@ def empirical_prob_by_score_bin(regime: str) -> str:
     out = []
     for b, g in df.groupby("bin"):
         n = len(g)
-        p30 = float(pd.to_numeric(g["hit_30"], errors="coerce").fillna(0).mean())
-        p50 = float(pd.to_numeric(g["hit_50"], errors="coerce").fillna(0).mean())
+        p30 = float(pd.to_numeric(g.get("hit_30", 0), errors="coerce").fillna(0).mean())
+        p50 = float(pd.to_numeric(g.get("hit_50", 0), errors="coerce").fillna(0).mean())
         out.append((str(b), n, p30, p50))
 
     parts = [f"{i+1}:{n}|{p30*100:.0f}/{p50*100:.0f}" for i, (_, n, p30, p50) in enumerate(out)]
     return "EMP bins(n|P30/P50%): " + " ".join(parts)
 
-
 # =========================
 # MAIN
 # =========================
 def main() -> None:
-    now_ts = datetime.now(timezone.utc)
-    now = now_ts.strftime("%Y-%m-%d %H:%M UTC")
+    now_dt = datetime.now(timezone.utc)
+    now = now_dt.strftime("%Y-%m-%d %H:%M UTC")
+    today = now_dt.strftime("%Y-%m-%d")
+
     ensure_dirs()
 
-    # --- learning update (EOD-only outcomes from cache) ---
+    # prevent duplicate writes for same day
+    keyset = load_existing_keys_for_date(today)
+
+    # learning update
     upd = update_outcomes_using_cache()
 
-    # --- regime ---
+    # regime
     reg = regime_snapshot()
     mode = reg["mode"]
     VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
     DIST_LIMIT = max(6.0, DIST_MAX_PCT + reg["dist_adj"])
 
-    # --- build universe (NO alphabetical bias) ---
+    # universe
     all_tickers = (
         get_universe_from_holdings(IWC_URL)
         + get_universe_from_holdings(IWM_URL)
         + get_universe_from_holdings(IJR_URL)
     )
+    universe = list(set([t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()]))
 
-    # remove junk/dupes but DO NOT sort
-    universe = list(
-        set(
-            [
-                t.strip().upper()
-                for t in all_tickers
-                if isinstance(t, str) and t.strip()
-            ]
-        )
-    )
-
-    # Rank scan order by cached dv20 (best effort) to use limited fetch budget well
+    # rank scan order by cached dv20 (best effort)
     scored: list[tuple[str, float]] = []
     unscored: list[str] = []
-
     pool = universe[: min(CANDIDATE_POOL, len(universe))]
     for t in pool:
         dv = read_cached_dv20(t)
-        if dv is None or (not np.isfinite(dv)) or dv <= 0:
+        if dv is None:
             unscored.append(t)
         else:
             scored.append((t, float(dv)))
@@ -745,32 +714,26 @@ def main() -> None:
     ordered = [t for t, _ in scored] + unscored
     tickers = ordered[:MAX_TICKERS]
 
-    # --- containers ---
     execA: list[tuple] = []
     execB: list[tuple] = []
     watch_clean: list[tuple] = []
     watch_over: list[tuple] = []
     near: list[tuple] = []
 
-    # --- diagnostics ---
     hits_limited = False
     no_data = 0
     hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
     cache_used = 0
     cache_miss = 0
 
-    # optional global CACHE_ONLY
-    cache_only = bool(globals().get("CACHE_ONLY", False))
+    # ASOF = max market date observed in used OHLCV
+    asof_date = None
 
-    # Track market as-of (for header): prefer QQQ asof_date
-    header_asof = reg.get("asof_date") or now_ts.date()
-
-    # --- scan loop ---
     for i, t in enumerate(tickers):
         try:
-            # If rate-limited: switch to cache-only for remaining tickers
-            if hits_limited or cache_only:
-                df = load_cached_ohlcv_local(t)
+            # decide data source
+            if CACHE_ONLY or hits_limited:
+                df = load_cached_ohlcv_local(t, min_rows=260)
                 if df is None:
                     cache_miss += 1
                     continue
@@ -778,35 +741,27 @@ def main() -> None:
             else:
                 df = fetch_ohlcv_equity(t)
 
-            # normalize columns + numeric safety
-            df.columns = [c.strip().lower() for c in df.columns]
-            need = ["date", "open", "high", "low", "close", "volume"]
-            if not all(c in df.columns for c in need):
+            if df is None or df.empty:
                 continue
 
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-
-            for c in ["open", "high", "low", "close", "volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
+            # update ASOF
+            try:
+                dmax = pd.to_datetime(df["date"], errors="coerce").dropna().max()
+                if pd.notna(dmax):
+                    dmax = dmax.normalize()
+                    if asof_date is None or dmax > asof_date:
+                        asof_date = dmax
+            except Exception:
+                pass
 
             if len(df) < 260:
                 continue
             hist_ok += 1
 
-            # *** DATA DE MERCADO (CRÍTICO) ***
-            # Esta é a data que vai para signals.csv e tem de existir no OHLCV do ticker.
-            market_date = pd.to_datetime(df["date"].iloc[-1], errors="coerce")
-            if pd.isna(market_date):
-                continue
-            signal_date_str = str(market_date.date())
-
             close_now = float(df["close"].iloc[-1])
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
             sv20 = float(df["volume"].iloc[-20:].mean())
 
-            # liquidity / proxy caps
             if close_now < MIN_PX or close_now > MAX_PX:
                 continue
             if dv20 < MIN_DV20 or dv20 > MAX_DV20:
@@ -852,18 +807,15 @@ def main() -> None:
                 near.append((t, close_now, dv20, bbz_last, f"LOW_R({R_pct:.1f}%)"))
                 continue
 
-            # distances
+            # dist / overshoot
             dist_pct = ((trig - close_now) / close_now * 100.0) if close_now > 0 else np.nan
             overshoot_pct = ((close_now - trig) / trig * 100.0) if trig > 0 else 0.0
 
-            # overhead supply proxy
             overhead = overhead_supply_touches(df, trig)
 
-            # watch maturation/stale
             stats = recent_watch_stats(t)
             boost, stale_pen = watch_boost_and_stale_penalty(stats["dists"])
 
-            # score
             sc = score_candidate(
                 bbz_last, atr_pctl, dd, contr, dry, dv20,
                 dist_pct if np.isfinite(dist_pct) else (DIST_LIMIT + 999.0),
@@ -894,8 +846,7 @@ def main() -> None:
                 (execB if sig == "EXEC_B" else execA).append(item)
 
                 append_signal_row({
-                    "date": signal_date_str,  # <-- FIX CRÍTICO
-                    "ticker": t, "signal": sig,
+                    "date": today, "ticker": t, "signal": sig,
                     "score": round(sc, 6), "close": round(close_now, 6),
                     "trig": round(trig, 6), "stop": round(stop, 6),
                     "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
@@ -907,10 +858,10 @@ def main() -> None:
                     "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
                     "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
                     "regime": mode, "resolved": "0"
-                })
+                }, keyset)
 
             else:
-                # Pre-breakout watchlist (extra filtro: atr_pctl <= 0.30)
+                # WATCH
                 if (
                     np.isfinite(dist_pct)
                     and dist_pct <= DIST_LIMIT
@@ -928,8 +879,7 @@ def main() -> None:
                         watch_over.append(item)
 
                     append_signal_row({
-                        "date": signal_date_str,  # <-- FIX CRÍTICO
-                        "ticker": t, "signal": "WATCH",
+                        "date": today, "ticker": t, "signal": "WATCH",
                         "score": round(sc, 6), "close": round(close_now, 6),
                         "trig": round(trig, 6), "stop": round(stop, 6),
                         "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
@@ -941,20 +891,20 @@ def main() -> None:
                         "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
                         "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
                         "regime": mode, "resolved": "0"
-                    })
+                    }, keyset)
 
         except Exception as e:
-            s = str(e)
+            s = str(e).upper()
             if "NO_DATA" in s:
                 no_data += 1
             elif "HITS_LIMIT" in s:
-                hits_limited = True  # switch to cache-only; DO NOT break
+                hits_limited = True
+            # swallow other errors
             pass
 
         if (i + 1) % SLEEP_EVERY == 0:
             time.sleep(SLEEP_SECONDS)
 
-    # --- sorting / tops ---
     execA.sort(key=lambda x: x[0], reverse=True)
     execB.sort(key=lambda x: x[0], reverse=True)
     watch_clean.sort(key=lambda x: x[0], reverse=True)
@@ -968,9 +918,10 @@ def main() -> None:
 
     emp = empirical_prob_by_score_bin(mode)
 
-    # --- message header ---
+    asof_str = asof_date.strftime("%Y-%m-%d") if asof_date is not None else "—"
+
     msg = [f"[{now}] ### V7_1_PREOPEN_FULL_TOP7 ### Microcap scanner (RANKED)"]
-    msg.append(f"ASOF={header_asof} (data de mercado)")
+    msg.append(f"ASOF={asof_str} (data de mercado)")
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
         f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH_CLEAN={len(watch_clean)} WATCH_OVER={len(watch_over)} | nodata={no_data} | "
@@ -978,74 +929,54 @@ def main() -> None:
     )
     msg.append(emp)
     msg.append(f"LEARNING: outcomes_updated={upd['updated']} | resolved_total={upd['resolved_total']}")
-    if hits_limited or cache_only:
-        msg.append(f"NOTA: Stooq rate-limit; modo CACHE_ONLY ativado (cache_used={cache_used} cache_miss={cache_miss}).")
+    if hits_limited or CACHE_ONLY:
+        msg.append(f"NOTA: Stooq rate-limit ou CACHE_ONLY; cache_used={cache_used} cache_miss={cache_miss}.")
     msg.append("")
-
-    # --- EXEC sections ---
-    if execB:
-        msg.append("EXECUTAR_B (2-day confirmação; maior probabilidade):")
-        for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execB:
-            msg.append(
-                f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
-                f"R%={Rp:.1f} | over={over:.1f}% | volx={vm:.2f} | overhead={oh} | base={win}d"
-            )
-        msg.append("")
-
-    if execA:
-        msg.append("EXECUTAR_A (1-day; mais sinais, menos robusto):")
-        for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execA:
-            msg.append(
-                f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
-                f"R%={Rp:.1f} | over={over:.1f}% | volx={vm:.2f} | overhead={oh} | base={win}d"
-            )
-        msg.append("")
 
     if not execA and not execB:
         msg.append("EXECUTAR: (vazio)")
         msg.append("")
+    else:
+        if execB:
+            msg.append("EXECUTAR_B (2-day confirmação; maior probabilidade):")
+            for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execB:
+                msg.append(
+                    f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
+                    f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
+                    f"R%={Rp:.1f} | over={over:.1f}% | volx={vm:.2f} | overhead={oh} | base={win}d"
+                )
+            msg.append("")
+        if execA:
+            msg.append("EXECUTAR_A (1-day; mais sinais, menos robusto):")
+            for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execA:
+                msg.append(
+                    f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
+                    f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
+                    f"R%={Rp:.1f} | over={over:.1f}% | volx={vm:.2f} | overhead={oh} | base={win}d"
+                )
+            msg.append("")
 
-    # --- WATCH_CLEAN with PRIORIDADE + emoji ---
     if watch_clean:
-
         def _prio_key(x):
             sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
             prioridade = 0
-            if dist <= 4:
-                prioridade += 1
-            if oh <= 3:
-                prioridade += 1
-            if atrp <= 0.20:
-                prioridade += 1
-            if Rp >= 12:
-                prioridade += 1
+            if dist <= 4: prioridade += 1
+            if oh <= 3: prioridade += 1
+            if atrp <= 0.20: prioridade += 1
+            if Rp >= 12: prioridade += 1
             return (prioridade, sc)
 
         watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
 
         msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
-
             prioridade = 0
-            if dist <= 4:
-                prioridade += 1
-            if oh <= 3:
-                prioridade += 1
-            if atrp <= 0.20:
-                prioridade += 1
-            if Rp >= 12:
-                prioridade += 1
+            if dist <= 4: prioridade += 1
+            if oh <= 3: prioridade += 1
+            if atrp <= 0.20: prioridade += 1
+            if Rp >= 12: prioridade += 1
 
-            if prioridade == 4:
-                emoji = "🔥"
-            elif prioridade == 3:
-                emoji = "✅"
-            elif prioridade == 2:
-                emoji = "⚠️"
-            else:
-                emoji = "❌"
+            emoji = "🔥" if prioridade == 4 else "✅" if prioridade == 3 else "⚠️" if prioridade == 2 else "❌"
 
             msg.append(
                 f"- {emoji} {t} | PRIORIDADE={prioridade}/4 | score={sc:.2f} | close={c:.2f} | "
@@ -1057,7 +988,6 @@ def main() -> None:
         msg.append("AGUARDAR_LIMPO: (vazio)")
         msg.append("")
 
-    # --- WATCH_OVER ---
     if watch_over:
         msg.append("AGUARDAR_COM_TETO (overhead>5; probabilidade menor):")
         for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_over:
@@ -1070,7 +1000,6 @@ def main() -> None:
         msg.append("AGUARDAR_COM_TETO: (vazio)")
         msg.append("")
 
-    # --- NEAR / debug ---
     if near:
         msg.append("QUASE (debug):")
         for t, c, dv, bbz, reason in near:
