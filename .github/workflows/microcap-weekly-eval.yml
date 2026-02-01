@@ -1,10 +1,9 @@
-# .github/workflows/microcap-weekly-eval.yml
 name: microcap-weekly-eval
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 2 * * 1-5"   # Seg–Sex 02:15 UTC (depois do daily ter tido tempo de commitar)
+    - cron: "15 2 * * 6"   # Sábado 02:15 UTC (depois da semana fechar)
 
 permissions:
   contents: write
@@ -42,7 +41,7 @@ jobs:
           restore-keys: |
             microcap-cache-shared-
 
-      - name: Run weekly evaluation (strict coverage)
+      - name: Run weekly evaluation
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
