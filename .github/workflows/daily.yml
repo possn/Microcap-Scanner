@@ -1,10 +1,9 @@
-# .github/workflows/microcap-scanner-daily.yml
 name: microcap-scanner-daily
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 12 * * 1-5"   # Seg–Sex 12:00 UTC (EOD disponível; evita fim-de-semana)
+    - cron: "0 12 * * *"   # TODOS os dias 12:00 UTC (pré-abertura US; usa EOD disponível)
 
 permissions:
   contents: write
@@ -34,7 +33,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore cache folder (persistente)
+      - name: Restore cache folder (shared)
         uses: actions/cache@v4
         with:
           path: cache
@@ -102,6 +101,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # evita rejeições por branch avançado
           git pull --rebase || true
 
           git add cache/signals.csv cache/ohlcv || true
