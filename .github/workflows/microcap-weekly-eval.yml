@@ -3,7 +3,8 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "15 2 * * 6"   # Sábado 02:15 UTC (depois da semana fechar)
+    # Sábado 02:00 UTC (sem dependência do daily nesse dia)
+    - cron: "0 2 * * 6"
 
 permissions:
   contents: write
@@ -15,6 +16,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
 
     steps:
       - name: Checkout repository
@@ -33,19 +35,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore cache folder (shared)
-        uses: actions/cache@v4
-        with:
-          path: cache
-          key: microcap-cache-shared-v1
-          restore-keys: |
-            microcap-cache-shared-
-
       - name: Run weekly evaluation
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
         run: |
