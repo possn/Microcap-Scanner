@@ -3,7 +3,10 @@ name: microcap-scanner-daily
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 12 * * *"   # TODOS os dias 12:00 UTC (pré-abertura US; usa EOD disponível)
+    # Dias úteis, 13:20 UTC (Portugal no inverno = UTC).
+    # Dá tempo para o EOD do dia anterior já estar disponível no Stooq
+    # e ainda fica antes da abertura US (14:30 UTC no inverno).
+    - cron: "20 13 * * 1-5"
 
 permissions:
   contents: write
@@ -15,6 +18,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout repository
@@ -33,15 +37,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Restore cache folder (shared)
-        uses: actions/cache@v4
-        with:
-          path: cache
-          key: microcap-cache-shared-v1
-          restore-keys: |
-            microcap-cache-shared-
-
-      - name: Run scanner
+      - name: Run scanner (pre-open, EOD prior day)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
@@ -50,49 +46,57 @@ jobs:
           IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
           IJR_HOLDINGS_CSV_URL: ${{ secrets.IJR_HOLDINGS_CSV_URL }}
 
-          OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
+          # IMPORTANTE: não forces OHLCV_URL_FMT via secret se ele puder estar vazio.
+          # Se quiseres mesmo, garante que o secret está preenchido.
+          # OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
 
+          # Preferência: puxar dados novos (fallback para cache se houver rate-limit)
+          CACHE_ONLY: "0"
+
+          # Universe / velocidade
           MAX_TICKERS: "450"
           CANDIDATE_POOL: "2000"
+          SLEEP_EVERY: "25"
+          SLEEP_SECONDS: "2.0"
 
+          # Filtros relaxados (para saírem ideias diariamente)
           MIN_PX: "1.0"
-          MAX_PX: "25"
-          MIN_DV20: "3000000"
-          MAX_DV20: "80000000"
-          MIN_SV20: "600000"
+          MAX_PX: "30"
 
-          BBZ_GATE: "-0.80"
-          ATRPCTL_GATE: "0.35"
+          MIN_DV20: "1500000"
+          MAX_DV20: "120000000"
+          MIN_SV20: "250000"
 
-          BASE_DD_MAX: "0.55"
-          CONTRACTION_MAX: "0.85"
-          DRYUP_MAX: "0.95"
+          # Compressão mais permissiva
+          BBZ_GATE: "-0.60"
+          ATRPCTL_GATE: "0.50"
 
-          VOL_CONFIRM_MULT: "1.18"
-          MAX_GAP_UP: "1.12"
-          DIST_MAX_PCT: "12.0"
-          EXEC_MAX_OVERSHOOT_PCT: "6.0"
+          # Base/dry permissivo
+          BASE_DD_MAX: "0.62"
+          CONTRACTION_MAX: "0.92"
+          DRYUP_MAX: "1.10"
 
-          EXEC_BBZ_MAX: "-1.10"
-          EXEC_ATRPCTL_MAX: "0.30"
+          # Exec / watch mais permissivo
+          VOL_CONFIRM_MULT: "1.12"
+          MAX_GAP_UP: "1.14"
+          DIST_MAX_PCT: "18.0"
+          EXEC_MAX_OVERSHOOT_PCT: "8.0"
 
-          MIN_R_PCT: "8.0"
+          EXEC_BBZ_MAX: "-0.90"
+          EXEC_ATRPCTL_MAX: "0.38"
+
+          MIN_R_PCT: "6.0"
 
           OVERHEAD_WINDOW: "200"
           OVERHEAD_BAND_PCT: "8.0"
-          OVERHEAD_MAX_TOUCHES: "10"
+          OVERHEAD_MAX_TOUCHES: "12"
 
           WATCH_BOOST_MIN_DAYS: "3"
           WATCH_STALE_DAYS: "10"
 
           HORIZON_SESS: "40"
-
           REG_QQQ: "QQQ"
           REG_VIX: "VIX"
-
-          SLEEP_EVERY: "25"
-          SLEEP_SECONDS: "3.0"
-
         run: |
           python scanner.py
 
@@ -101,7 +105,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # evita rejeições por branch avançado
           git pull --rebase || true
 
           git add cache/signals.csv cache/ohlcv || true
