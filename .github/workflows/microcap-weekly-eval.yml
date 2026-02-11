@@ -3,7 +3,6 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
-    # Sábado 02:00 UTC (sem dependência do daily nesse dia)
     - cron: "0 2 * * 6"
 
 permissions:
@@ -39,18 +38,27 @@ jobs:
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+
           WEEKLY_HORIZON_SESS: "5"
           WATCH_OVERHEAD_CLEAN_MAX: "5"
+
+          BREAKOUT_BUFFER_PCT: "0.5"
+
+          LEARN_MIN_COV: "30"
+          LEARN_BLEND: "0.25"
+          LEARN_STEP_DIST: "1.0"
+          LEARN_STEP_ATR: "0.02"
+          LEARN_STEP_BBZ: "0.05"
         run: |
           python weekly_eval.py
 
-      - name: Commit weekly summary (weekly_summary.csv)
+      - name: Commit weekly outputs (weekly_summary + learned_params)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git pull --rebase || true
 
-          git add cache/weekly_summary.csv || true
-          git commit -m "Update weekly_summary.csv" || exit 0
+          git add cache/weekly_summary.csv cache/learned_params.json || true
+          git commit -m "Update weekly outputs (weekly_summary + learned_params)" || exit 0
           git push
