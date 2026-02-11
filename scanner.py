@@ -1,18 +1,20 @@
-# scanner.py  (V7_2_PREOPEN_RELAX_DAILY) — RELAXED (MORE IDEAS DAILY + ASOF + DETERMINISM)
+# scanner.py  (V7_3_PREOPEN_RELAX_DAILY) — DAILY breakout candidates + learned params (optional)
 # EOD-only, public/free, cache-first, ranked, pre-open actionable.
 #
-# OBJECTIVE:
-# - Output proposals DAILY (even when strict filter yields few).
-# - Keep determinism and ASOF schema for weekly eval.
-# - Maintain EXEC logic but slightly more permissive to avoid "empty" runs.
+# DATA SOURCES (real / free / public):
+# - Stooq EOD CSV: https://stooq.com/q/d/l/?s={symbol}.us&i=d
+# - Universe: holdings CSV URLs (IWC/IWM/IJR) via secrets
 #
-# KEY CHANGES vs your V7_1:
-#  1) Liquidity + compression gates are relaxed (still bounded).
-#  2) WATCH rule is widened (atr_pctl, dist, overhead tolerance).
-#  3) If total proposals are too low, produce WATCH_RELAX list from "near" candidates.
-#  4) Keeps ASOF+schema migration + de-dup by (ASOF,ticker,signal).
+# KEY POINTS:
+# - Deterministic universe order.
+# - Cache-first; if Stooq rate-limits, falls back to local cache.
+# - Writes cache/signals.csv (ASOF schema).
+# - Reads cache/learned_params.json if present to gently adjust a few gates.
+#
+# NOTE:
+# - This is NOT "autonomous trading". It outputs ranked candidates only.
 
-import os, io, time, csv
+import os, io, time, csv, json
 import requests
 import pandas as pd
 import numpy as np
@@ -43,6 +45,7 @@ MIN_DV20 = float(os.environ.get("MIN_DV20", "1500000"))
 MAX_DV20 = float(os.environ.get("MAX_DV20", "120000000"))
 MIN_SV20 = float(os.environ.get("MIN_SV20", "250000"))
 
+# Core gates (can be adjusted slightly by learned_params.json)
 BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.60"))
 ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.50"))
 
@@ -68,7 +71,7 @@ WATCH_BOOST_MIN_DAYS = int(os.environ.get("WATCH_BOOST_MIN_DAYS", "3"))
 WATCH_STALE_DAYS = int(os.environ.get("WATCH_STALE_DAYS", "10"))
 
 # "Guarantee ideas"
-MIN_DAILY_PROPOSALS = int(os.environ.get("MIN_DAILY_PROPOSALS", "6"))  # total WATCH+EXEC desired
+MIN_DAILY_PROPOSALS = int(os.environ.get("MIN_DAILY_PROPOSALS", "6"))
 WATCH_RELAX_TOP = int(os.environ.get("WATCH_RELAX_TOP", "8"))
 
 HORIZON = int(os.environ.get("HORIZON_SESS", "40"))
@@ -84,6 +87,8 @@ SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "2.0"))
 CACHE_DIR = Path("cache")
 OHLCV_DIR = CACHE_DIR / "ohlcv"
 SIGNALS_CSV = CACHE_DIR / "signals.csv"
+LEARNED_JSON = CACHE_DIR / "learned_params.json"
+LAST_RUN_JSON = CACHE_DIR / "last_run.json"
 
 # =========================
 # Telegram
@@ -129,6 +134,67 @@ def fetch_text(url: str) -> str:
     r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
     r.raise_for_status()
     return r.text
+
+def safe_float(x, default=np.nan):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+# =========================
+# Learned params
+# =========================
+def load_learned_params() -> dict:
+    """
+    Reads cache/learned_params.json if exists.
+    Expected schema:
+    {
+      "version": 1,
+      "asof": "YYYY-MM-DD",
+      "blend": 0.25,
+      "params": { "DIST_MAX_PCT": 19.0, "ATRPCTL_GATE": 0.48, "BBZ_GATE": -0.65 }
+    }
+    """
+    if not LEARNED_JSON.exists():
+        return {}
+    try:
+        d = json.loads(LEARNED_JSON.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return {}
+        return d
+    except Exception:
+        return {}
+
+def apply_learned_params():
+    """
+    Blend a few gates conservatively.
+    Only adjusts: DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE
+    """
+    global DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE
+    learned = load_learned_params()
+    if not learned:
+        return
+    blend = safe_float(learned.get("blend", 0.25), 0.25)
+    blend = max(0.0, min(0.50, blend))
+
+    params = learned.get("params", {})
+    if not isinstance(params, dict):
+        return
+
+    def _blend(cur, new):
+        if not np.isfinite(new):
+            return cur
+        return (1.0 - blend) * cur + blend * new
+
+    if "DIST_MAX_PCT" in params:
+        DIST_MAX_PCT = float(_blend(DIST_MAX_PCT, safe_float(params.get("DIST_MAX_PCT"))))
+    if "ATRPCTL_GATE" in params:
+        ATRPCTL_GATE = float(_blend(ATRPCTL_GATE, safe_float(params.get("ATRPCTL_GATE"))))
+    if "BBZ_GATE" in params:
+        BBZ_GATE = float(_blend(BBZ_GATE, safe_float(params.get("BBZ_GATE"))))
+    if "VOL_CONFIRM_MULT" in params:
+        VOL_CONFIRM_MULT_BASE = float(_blend(VOL_CONFIRM_MULT_BASE, safe_float(params.get("VOL_CONFIRM_MULT"))))
 
 # =========================
 # Holdings parsing
@@ -235,11 +301,6 @@ def read_cached_dv20(ticker: str) -> float | None:
         return None
 
 def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
-    """
-    Fetch EOD OHLCV for ticker, with disk cache.
-    - Tenta Stooq e atualiza CSV local.
-    - Se falhar / rate-limit, usa cache existente (se houver).
-    """
     ensure_dirs()
     path = cache_path(ticker)
 
@@ -462,7 +523,7 @@ def regime_snapshot() -> dict:
     return out
 
 # =========================
-# signals.csv helpers (ASOF + NO DUPES + SCHEMA MIGRATION)
+# signals.csv helpers (ASOF + NO DUPES + SCHEMA)
 # =========================
 SIGNALS_COLS = [
     "date",
@@ -473,43 +534,12 @@ SIGNALS_COLS = [
     "ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
 ]
 
-def _read_signals_header() -> list[str] | None:
-    if not SIGNALS_CSV.exists():
-        return None
-    try:
-        with SIGNALALS_CSV.open("r", encoding="utf-8") as f:  # noqa: F821
-            first = f.readline().strip()
-        if not first:
-            return None
-        return [c.strip() for c in first.split(",")]
-    except Exception:
-        # fallback safe
-        try:
-            with SIGNALS_CSV.open("r", encoding="utf-8") as f:
-                first = f.readline().strip()
-            if not first:
-                return None
-            return [c.strip() for c in first.split(",")]
-        except Exception:
-            return None
-
 def signals_csv_ensure_schema() -> None:
     ensure_dirs()
-
     if not SIGNALS_CSV.exists():
         with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(SIGNALS_COLS)
-        return
-
-    hdr = _read_signals_header()
-    if not hdr:
-        with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(SIGNALS_COLS)
-        return
-
-    if "asof" in [h.lower() for h in hdr]:
         return
 
     try:
@@ -520,12 +550,14 @@ def signals_csv_ensure_schema() -> None:
             w.writerow(SIGNALS_COLS)
         return
 
+    # Ensure columns exist and order is stable
     if "asof" not in df.columns:
         df.insert(1, "asof", "")
 
     for c in SIGNALS_COLS:
         if c not in df.columns:
             df[c] = ""
+
     df = df[SIGNALS_COLS].copy()
     df.to_csv(SIGNALS_CSV, index=False)
 
@@ -541,23 +573,13 @@ def load_existing_keys_for_asof(asof_str: str) -> set[tuple[str,str,str]]:
         return keys
 
     try:
-        cols = pd.read_csv(SIGNALS_CSV, nrows=1).columns
-        usecols = ["asof","ticker","signal"] if "asof" in cols else ["date","ticker","signal"]
-        df = pd.read_csv(SIGNALS_CSV, usecols=usecols).dropna()
-        if "asof" in df.columns:
-            df["asof"] = df["asof"].astype(str)
-            df = df[df["asof"] == asof_str]
-            dcol = "asof"
-        else:
-            df["date"] = df["date"].astype(str)
-            df = df[df["date"] == asof_str]
-            dcol = "date"
-
+        df = pd.read_csv(SIGNALS_CSV, usecols=["asof","ticker","signal"]).dropna()
+        df["asof"] = df["asof"].astype(str)
+        df = df[df["asof"] == asof_str]
         df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
         df["signal"] = df["signal"].astype(str).str.upper().str.strip()
-
         for _, r in df.iterrows():
-            keys.add((str(r[dcol]), r["ticker"], r["signal"]))
+            keys.add((str(r["asof"]), r["ticker"], r["signal"]))
     except Exception:
         pass
 
@@ -566,7 +588,6 @@ def load_existing_keys_for_asof(asof_str: str) -> set[tuple[str,str,str]]:
 
 def append_signal_row(row: dict) -> None:
     signals_csv_ensure_schema()
-
     asof = str(row.get("asof", "")).strip()
     t = str(row.get("ticker", "")).strip().upper()
     s = str(row.get("signal", "")).strip().upper()
@@ -759,6 +780,9 @@ def empirical_prob_by_score_bin(regime: str) -> str:
 # MAIN
 # =========================
 def main() -> None:
+    # apply learned params before running
+    apply_learned_params()
+
     now_dt = datetime.now(timezone.utc)
     now = now_dt.strftime("%Y-%m-%d %H:%M UTC")
     run_day = now_dt.strftime("%Y-%m-%d")
@@ -801,8 +825,8 @@ def main() -> None:
     execB: list[tuple] = []
     watch_clean: list[tuple] = []
     watch_over: list[tuple] = []
-    near: list[tuple] = []        # strict near (debug)
-    near_relax: list[tuple] = []  # candidates for WATCH_RELAX
+    near: list[tuple] = []
+    near_relax: list[tuple] = []
 
     hits_limited = False
     no_data = 0
@@ -864,7 +888,6 @@ def main() -> None:
             atr_pctl = float((atr_win <= atr_last).mean())
 
             if not (bbz_last < BBZ_GATE and atr_pctl < ATRPCTL_GATE):
-                # store relax-candidate if close to passing compression
                 if (bbz_last < (BBZ_GATE + 0.10)) or (atr_pctl < (ATRPCTL_GATE + 0.08)):
                     near_relax.append(("COMP", t, close_now, dv20, bbz_last, atr_pctl))
                 continue
@@ -881,7 +904,6 @@ def main() -> None:
             dry = dryup_ratio(df)
             if (not np.isfinite(dry)) or (dry >= DRYUP_MAX):
                 near.append((t, close_now, dv20, bbz_last, "DRY"))
-                # still consider as relax candidate if only slightly above
                 if np.isfinite(dry) and dry < (DRYUP_MAX + 0.12):
                     near_relax.append(("DRY", t, close_now, dv20, bbz_last, atr_pctl))
                 continue
@@ -957,9 +979,6 @@ def main() -> None:
                 })
             else:
                 # WATCH (wider net)
-                # - allow atr_pctl a bit higher than before
-                # - allow some overhead but separate CLEAN vs OVER
-                # - allow slight overshoot within limit
                 if (
                     np.isfinite(dist_pct)
                     and dist_pct <= DIST_LIMIT
@@ -999,7 +1018,6 @@ def main() -> None:
                         "resolved": "0"
                     })
                 else:
-                    # store as relax candidate if it's close on dist/atr
                     if np.isfinite(dist_pct) and dist_pct <= (DIST_LIMIT + 6.0) and atr_pctl <= 0.50:
                         near_relax.append(("WATCH", t, close_now, dv20, bbz_last, atr_pctl))
 
@@ -1033,7 +1051,6 @@ def main() -> None:
     total_props = len(execA) + len(execB) + len(watch_clean) + len(watch_over)
     watch_relax_lines = []
     if total_props < MIN_DAILY_PROPOSALS and near_relax:
-        # deterministic: sort by (reason, dv20 desc, ticker asc)
         near_relax_sorted = sorted(
             near_relax,
             key=lambda x: (str(x[0]), -float(x[3]) if np.isfinite(x[3]) else 0.0, str(x[1]))
@@ -1045,7 +1062,8 @@ def main() -> None:
                 f"- {t} | reason={reason} | close={c:.2f} | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}"
             )
 
-    msg = [f"[{now}] ### V7_2_PREOPEN_RELAX_DAILY ### Microcap scanner (RANKED)"]
+    # Compose message
+    msg = [f"[{now}] ### V7_3_PREOPEN_RELAX_DAILY ### Microcap scanner (RANKED)"]
     msg.append(f"ASOF={asof_str_global} (data de mercado)")
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
@@ -1058,6 +1076,7 @@ def main() -> None:
         msg.append(f"NOTA: Stooq rate-limit ou CACHE_ONLY; cache_used={cache_used} cache_miss={cache_miss}.")
     msg.append("")
 
+    # EXEC blocks
     if not execA and not execB:
         msg.append("EXECUTAR: (vazio)")
         msg.append("")
@@ -1081,6 +1100,7 @@ def main() -> None:
                 )
             msg.append("")
 
+    # WATCH blocks
     if watch_clean:
         def _prio_key(x):
             sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
@@ -1135,6 +1155,32 @@ def main() -> None:
         msg.append("QUASE: (vazio)")
 
     tg_send("\n".join(msg))
+
+    # write last_run metadata (useful for debugging)
+    try:
+        LAST_RUN_JSON.write_text(json.dumps({
+            "run_utc": now,
+            "asof": asof_str_global,
+            "mode": mode,
+            "eval": len(tickers),
+            "counts": {
+                "exec_b": len(execB),
+                "exec_a": len(execA),
+                "watch_clean": len(watch_clean),
+                "watch_over": len(watch_over),
+                "nodata": no_data,
+                "cache_used": cache_used,
+                "cache_miss": cache_miss
+            },
+            "gates": {
+                "BBZ_GATE": BBZ_GATE,
+                "ATRPCTL_GATE": ATRPCTL_GATE,
+                "DIST_MAX_PCT": DIST_MAX_PCT,
+                "VOL_CONFIRM_MULT": VOL_CONFIRM_MULT
+            }
+        }, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     main()
