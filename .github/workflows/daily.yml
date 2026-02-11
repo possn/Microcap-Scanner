@@ -3,9 +3,6 @@ name: microcap-scanner-daily
 on:
   workflow_dispatch: {}
   schedule:
-    # Dias úteis, 13:20 UTC (Portugal no inverno = UTC).
-    # Dá tempo para o EOD do dia anterior já estar disponível no Stooq
-    # e ainda fica antes da abertura US (14:30 UTC no inverno).
     - cron: "20 13 * * 1-5"
 
 permissions:
@@ -46,20 +43,13 @@ jobs:
           IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
           IJR_HOLDINGS_CSV_URL: ${{ secrets.IJR_HOLDINGS_CSV_URL }}
 
-          # IMPORTANTE: não forces OHLCV_URL_FMT via secret se ele puder estar vazio.
-          # Se quiseres mesmo, garante que o secret está preenchido.
-          # OHLCV_URL_FMT: ${{ secrets.OHLCV_URL_FMT }}
-
-          # Preferência: puxar dados novos (fallback para cache se houver rate-limit)
           CACHE_ONLY: "0"
 
-          # Universe / velocidade
           MAX_TICKERS: "450"
           CANDIDATE_POOL: "2000"
           SLEEP_EVERY: "25"
           SLEEP_SECONDS: "2.0"
 
-          # Filtros relaxados (para saírem ideias diariamente)
           MIN_PX: "1.0"
           MAX_PX: "30"
 
@@ -67,16 +57,13 @@ jobs:
           MAX_DV20: "120000000"
           MIN_SV20: "250000"
 
-          # Compressão mais permissiva
           BBZ_GATE: "-0.60"
           ATRPCTL_GATE: "0.50"
 
-          # Base/dry permissivo
           BASE_DD_MAX: "0.62"
           CONTRACTION_MAX: "0.92"
           DRYUP_MAX: "1.10"
 
-          # Exec / watch mais permissivo
           VOL_CONFIRM_MULT: "1.12"
           MAX_GAP_UP: "1.14"
           DIST_MAX_PCT: "18.0"
@@ -100,13 +87,13 @@ jobs:
         run: |
           python scanner.py
 
-      - name: Commit cache outputs (signals + ohlcv)
+      - name: Commit cache outputs (signals + ohlcv + learned + last_run)
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git pull --rebase || true
 
-          git add cache/signals.csv cache/ohlcv || true
-          git commit -m "Update cache (signals + ohlcv)" || exit 0
+          git add cache/signals.csv cache/ohlcv cache/learned_params.json cache/last_run.json || true
+          git commit -m "Update cache (signals + ohlcv + learned + last_run)" || exit 0
           git push
