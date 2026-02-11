@@ -1,10 +1,16 @@
-# weekly_eval.py — QUANT v6 (schema FIXO + rolling-4) [LAGGED WINDOW + ROBUST COVERAGE]
-# Lê cache/signals.csv + cache/ohlcv/*.csv
-# Calcula métricas semanais em janela "lagged" para evitar cov=0 por falta de futuro
-# Escreve cache/weekly_summary.csv com colunas fixas (sem corrupção)
-# Envia resumo para Telegram
+# weekly_eval.py — QUANT v7 (breakout-correct: HIGH/LOW + regime segmentation + learned_params.json)
+# Reads cache/signals.csv + cache/ohlcv/*.csv
+# Weekly window is LAGGED (end=max(eval_day)-HORIZON BDays) to avoid cov=0
+# Computes:
+# - WATCH/EXEC success using HIGH (intraday breakout) with buffer
+# - MFE/MAE using HIGH/LOW (not close)
+# - Regime segmentation (RISK_ON/TRANSITION/RISK_OFF)
+# Writes:
+# - cache/weekly_summary.csv (schema fixed)
+# - cache/learned_params.json (conservative parameter nudges, only if enough coverage)
+# Sends Telegram summary
 
-import os, csv, random
+import os, csv, json, random
 from pathlib import Path
 import pandas as pd
 import numpy as np
@@ -20,12 +26,21 @@ TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
 OHLCV_DIR = Path("cache") / "ohlcv"
 SIGNALS_CSV = Path("cache") / "signals.csv"
 SUMMARY_CSV = Path("cache") / "weekly_summary.csv"
+LEARNED_JSON = Path("cache") / "learned_params.json"
 
-HORIZON = int(os.environ.get("WEEKLY_HORIZON_SESS", "5"))  # horizonte de métricas (sessões úteis)
+HORIZON = int(os.environ.get("WEEKLY_HORIZON_SESS", "5"))  # sessions forward for weekly metrics
 CLEAN_MAX_OH = int(os.environ.get("WATCH_OVERHEAD_CLEAN_MAX", "5"))
-
-# janela de sinais (sempre 5 dias úteis)
 WINDOW_DAYS = 5
+
+# breakout definition (intraday)
+BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.5"))  # 0.5% default
+
+# learning controls
+LEARN_MIN_COV = int(os.environ.get("LEARN_MIN_COV", "30"))   # minimum covered signals to consider nudges
+LEARN_BLEND = float(os.environ.get("LEARN_BLEND", "0.25"))   # how strongly daily blends learned params
+LEARN_STEP_DIST = float(os.environ.get("LEARN_STEP_DIST", "1.0"))    # +/-
+LEARN_STEP_ATR = float(os.environ.get("LEARN_STEP_ATR", "0.02"))     # +/-
+LEARN_STEP_BBZ = float(os.environ.get("LEARN_STEP_BBZ", "0.05"))     # +/-
 
 # =========================
 # TELEGRAM
@@ -59,7 +74,7 @@ def load_ohlcv(ticker: str) -> pd.DataFrame | None:
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         for c in ["open", "high", "low", "close", "volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["close"]).reset_index(drop=True)
+        df = df.dropna(subset=["close", "high", "low"]).reset_index(drop=True)
         return df
     except Exception:
         return None
@@ -79,7 +94,9 @@ SUMMARY_HEADER = [
     "clean_success","clean_mfe_med","clean_mae_mean",
     "over_success","over_mfe_med","over_mae_mean",
     "baseline_cov","baseline_success","baseline_mfe_med","baseline_mae_mean","edge_pp",
-    "regime_mode"
+    "regime_mode",
+    "risk_on_succ","transition_succ","risk_off_succ",
+    "learn_action","learn_notes"
 ]
 
 def append_weekly_summary(row: dict) -> None:
@@ -122,7 +139,6 @@ def fmt_pct_from_ret(x: float | None, nd=1) -> str:
 # Date helpers
 # =========================
 def pick_target_date_from_row(row: pd.Series) -> pd.Timestamp | None:
-    # prioridade: asof -> date
     if "asof" in row.index:
         d = pd.to_datetime(row.get("asof", None), errors="coerce")
         if pd.notna(d):
@@ -133,7 +149,6 @@ def pick_target_date_from_row(row: pd.Series) -> pd.Timestamp | None:
     return d0.normalize()
 
 def find_pos_best_effort(df: pd.DataFrame, target: pd.Timestamp) -> int | None:
-    # 1) match exacto
     dates = df["date"].dt.normalize().values
     t64 = target.to_datetime64()
 
@@ -141,7 +156,6 @@ def find_pos_best_effort(df: pd.DataFrame, target: pd.Timestamp) -> int | None:
     if len(idx) > 0:
         return int(idx[0])
 
-    # 2) fallback: último <= target
     idx2 = np.where(dates <= t64)[0]
     if len(idx2) > 0:
         return int(idx2[-1])
@@ -149,29 +163,29 @@ def find_pos_best_effort(df: pd.DataFrame, target: pd.Timestamp) -> int | None:
     return None
 
 # =========================
-# MFE/MAE
+# MFE/MAE using HIGH/LOW
 # =========================
 def mfe_mae_from_entry(df: pd.DataFrame, pos: int, horizon: int, entry: float) -> tuple[float | None, float | None]:
     if entry <= 0:
         return (None, None)
     end = min(len(df) - 1, pos + horizon)
-    sl = df.iloc[pos:end+1]["close"]
-    if sl.empty:
+    sl_hi = df.iloc[pos:end+1]["high"]
+    sl_lo = df.iloc[pos:end+1]["low"]
+    if sl_hi.empty or sl_lo.empty:
         return (None, None)
-    rets = (sl / entry) - 1.0
-    mfe = float(np.nanmax(rets.values))
-    mae = float(np.nanmin(rets.values))
+    mfe = float((sl_hi.max() / entry) - 1.0)
+    mae = float((sl_lo.min() / entry) - 1.0)
     return (mfe, mae)
 
 # =========================
-# Evaluation
+# Evaluation (intraday breakout)
 # =========================
-def eval_watch_row(row: pd.Series, horizon: int) -> dict:
+def eval_signal_row(row: pd.Series, horizon: int) -> dict:
     """
-    covered=1 apenas se existir futuro suficiente (pos + horizon < len(df))
-    Sucesso: algum close > trig no horizonte
-    H1: close_{+1} > trig
-    Fail-fast: close < stop em <=2 sessões
+    covered=1 only if full horizon exists
+    success: any HIGH >= trig*(1+buffer)
+    h1: next-day HIGH >= trig*(1+buffer)
+    fail-fast: LOW < stop within next 2 sessions
     """
     out = {"covered": 0, "success": 0, "h1": 0, "ff": 0, "mfe": None, "mae": None}
 
@@ -181,7 +195,7 @@ def eval_watch_row(row: pd.Series, horizon: int) -> dict:
     entry_close = float(pd.to_numeric(row.get("close", np.nan), errors="coerce"))
     target = pick_target_date_from_row(row)
 
-    if (not t) or pd.isna(target) or (not np.isfinite(trig)) or (not np.isfinite(entry_close)):
+    if (not t) or pd.isna(target) or (not np.isfinite(trig)) or (not np.isfinite(entry_close)) or entry_close <= 0:
         return out
 
     df = load_ohlcv(t)
@@ -192,22 +206,23 @@ def eval_watch_row(row: pd.Series, horizon: int) -> dict:
     if pos is None:
         return out
 
-    # cobertura exige horizonte completo
     if pos + horizon >= len(df):
         return out
 
     out["covered"] = 1
-
     end = pos + horizon
-    future = df.iloc[pos:end+1]["close"].values
-    out["success"] = 1 if np.any(future > trig) else 0
 
-    out["h1"] = 1 if float(df["close"].iloc[pos+1]) > trig else 0
+    trig_hit = trig * (1.0 + BREAKOUT_BUFFER_PCT / 100.0)
+
+    future_high = df.iloc[pos:end+1]["high"].values
+    out["success"] = 1 if np.any(future_high >= trig_hit) else 0
+
+    out["h1"] = 1 if float(df["high"].iloc[pos+1]) >= trig_hit else 0
 
     ff = 0
     if np.isfinite(stop):
         for j in [pos+1, pos+2]:
-            if j < len(df) and float(df["close"].iloc[j]) < stop:
+            if j < len(df) and float(df["low"].iloc[j]) < stop:
                 ff = 1
                 break
     out["ff"] = ff
@@ -238,17 +253,16 @@ def aggregate_metrics(rows_eval: list[dict]) -> dict:
     return {"cov": cov, "succ": suc, "h1": h1, "ff": ff, "mfe_med": mfe_med, "mae_mean": mae_mean}
 
 # =========================
-# BASELINE (robusto)
+# BASELINE (aligned with breakout)
 # =========================
 def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon: int, k: int) -> list[dict]:
     """
-    Baseline aproximado (cache-only):
-    - escolhe tickers aleatórios do cache/ohlcv
-    - trig_baseline = max(close últimos 20 dias antes do window_end)
-    - dist% = (trig - close)/close
-    - se houver dist_targets suficiente (>=6): matching por buckets (quartis)
-      senão: baseline sem matching (para não cair em cov=0/0)
-    - covered=1 apenas se existir futuro suficiente (pos + horizon < len(df))
+    Baseline cache-only:
+    - pick random tickers from cache/ohlcv
+    - trig = max(HIGH last 20 sessions before window_end)
+    - success = any future HIGH >= trig*(1+buffer)
+    - dist% computed similarly
+    - optional matching by dist quartiles when enough targets exist
     """
     if k <= 0:
         return []
@@ -263,9 +277,8 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
     tt = [x for x in dist_targets if np.isfinite(x)]
     use_matching = len(tt) >= 6
 
-    # matching por buckets
-    want = None
     bucket = None
+    want = None
     got = None
     if use_matching:
         qs = np.quantile(tt, [0.25, 0.50, 0.75])
@@ -284,6 +297,8 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         want = {b: target_buckets.count(b) for b in [0, 1, 2, 3]}
         got = {0: 0, 1: 0, 2: 0, 3: 0}
 
+    trig_hit_mult = (1.0 + BREAKOUT_BUFFER_PCT / 100.0)
+
     picked: list[dict] = []
     tries = 0
 
@@ -291,7 +306,7 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         if len(picked) >= k:
             break
         tries += 1
-        if tries > 2000:
+        if tries > 2500:
             break
 
         t = p.stem.upper()
@@ -302,8 +317,6 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         pos = find_pos_best_effort(df, window_end.normalize())
         if pos is None or pos < 25:
             continue
-
-        # cobertura exige horizonte completo
         if pos + horizon >= len(df):
             continue
 
@@ -311,7 +324,7 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         if close0 <= 0:
             continue
 
-        trig = float(df["close"].iloc[pos-20:pos].max())
+        trig = float(df["high"].iloc[pos-20:pos].max())
         if trig <= 0:
             continue
 
@@ -325,8 +338,8 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
                 continue
 
         end = pos + horizon
-        future = df["close"].iloc[pos:end+1].values
-        success = 1 if np.any(future > trig) else 0
+        future_hi = df["high"].iloc[pos:end+1].values
+        success = 1 if np.any(future_hi >= trig * trig_hit_mult) else 0
         mfe, mae = mfe_mae_from_entry(df, pos, horizon, close0)
 
         picked.append({"covered": 1, "success": success, "mfe": mfe, "mae": mae})
@@ -335,6 +348,84 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
             got[b] += 1  # type: ignore[index]
 
     return picked
+
+# =========================
+# Learning (conservative nudges)
+# =========================
+def propose_learned_params(m_watch: dict, m_base: dict, cov: int, current: dict) -> tuple[str, str, dict]:
+    """
+    Produce a small adjustment suggestion.
+    Goal: increase success edge vs baseline while keeping quality.
+    Rule-based, conservative:
+      - If success is low and worse than baseline: tighten a bit (reduce dist, tighten ATR gate, require more compression)
+      - If success is decent but cov is too low: relax slightly (increase dist, relax ATR, allow slightly less negative BBZ)
+      - Else: keep
+    Returns: (learn_action, learn_notes, params_dict)
+    """
+    # current gates expected in "current"
+    dist = float(current.get("DIST_MAX_PCT", 18.0))
+    atr = float(current.get("ATRPCTL_GATE", 0.50))
+    bbz = float(current.get("BBZ_GATE", -0.60))
+
+    succ = m_watch.get("succ", None)
+    base_succ = m_base.get("succ", None)
+
+    if succ is None or base_succ is None or cov < LEARN_MIN_COV:
+        return ("HOLD", f"cov<{LEARN_MIN_COV} ou métricas insuficientes", {})
+
+    edge = succ - base_succ
+
+    # Heuristic targets
+    # - want positive edge
+    # - want not-too-low coverage; if cov small, allow a bit more ideas
+    if edge < -0.02:
+        # underperforming baseline -> tighten
+        new = {
+            "DIST_MAX_PCT": max(10.0, dist - LEARN_STEP_DIST),
+            "ATRPCTL_GATE": max(0.30, atr - LEARN_STEP_ATR),
+            "BBZ_GATE": min(-0.40, bbz - LEARN_STEP_BBZ),  # more negative => stricter compression
+        }
+        return ("TIGHTEN", f"edge={edge*100:.1f}pp vs baseline; tighten gates", new)
+
+    if edge > 0.01 and cov < (LEARN_MIN_COV + 15):
+        # doing ok but cov still low -> relax a hair to get more samples
+        new = {
+            "DIST_MAX_PCT": min(25.0, dist + LEARN_STEP_DIST),
+            "ATRPCTL_GATE": min(0.65, atr + LEARN_STEP_ATR),
+            "BBZ_GATE": max(-1.20, bbz + LEARN_STEP_BBZ),  # less negative => slightly more permissive
+        }
+        return ("RELAX", f"edge={edge*100:.1f}pp, mas cov baixo; relax ligeiro", new)
+
+    return ("HOLD", f"edge={edge*100:.1f}pp; sem ajuste", {})
+
+def write_learned_params(asof: str, params: dict, action: str, notes: str) -> None:
+    ensure_parent(LEARNED_JSON)
+    if not params:
+        # still write a marker so you know weekly ran (optional)
+        try:
+            LEARNED_JSON.write_text(json.dumps({
+                "version": 1,
+                "asof": asof,
+                "blend": float(max(0.0, min(0.50, LEARN_BLEND))),
+                "params": {},
+                "action": action,
+                "notes": notes
+            }, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+        return
+
+    try:
+        LEARNED_JSON.write_text(json.dumps({
+            "version": 1,
+            "asof": asof,
+            "blend": float(max(0.0, min(0.50, LEARN_BLEND))),
+            "params": params,
+            "action": action,
+            "notes": notes
+        }, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 # =========================
 # MAIN
@@ -371,12 +462,6 @@ def main():
     else:
         sig["eval_day"] = sig["date"]
 
-    # -------------------------
-    # Janela "lagged":
-    # end_eval_day = max(eval_day) - HORIZON BDays
-    # window = [end_eval_day - (WINDOW_DAYS-1) BDays, end_eval_day]
-    # Se isto ficar vazio (ex: pouco histórico), cai para "últimos 5 dias únicos" do eval_day
-    # -------------------------
     max_day = pd.to_datetime(sig["eval_day"], errors="coerce").dropna().max()
     if pd.isna(max_day):
         tg_send("WEEKLY REVIEW: FAIL — sem datas válidas.")
@@ -389,7 +474,6 @@ def main():
     w = sig[(sig["eval_day"] >= lag_start) & (sig["eval_day"] <= lag_end)].copy()
 
     if w.empty:
-        # fallback (antigo comportamento)
         u = pd.to_datetime(sig["eval_day"], errors="coerce").dropna().dt.normalize().unique()
         u = sorted(u)
         if not u:
@@ -418,24 +502,37 @@ def main():
         if len(vc) > 0:
             regime_mode = str(vc.index[0])
 
-    eval_all = [eval_watch_row(r, HORIZON) for _, r in w_watch.iterrows()]
-    eval_clean = [eval_watch_row(r, HORIZON) for _, r in w_watch_clean.iterrows()]
-    eval_over = [eval_watch_row(r, HORIZON) for _, r in w_watch_over.iterrows()]
-    eval_exec = [eval_watch_row(r, HORIZON) for _, r in w_exec.iterrows()]
+    eval_watch = [eval_signal_row(r, HORIZON) for _, r in w_watch.iterrows()]
+    eval_clean = [eval_signal_row(r, HORIZON) for _, r in w_watch_clean.iterrows()]
+    eval_over = [eval_signal_row(r, HORIZON) for _, r in w_watch_over.iterrows()]
+    eval_exec = [eval_signal_row(r, HORIZON) for _, r in w_exec.iterrows()]
 
-    m_all = aggregate_metrics(eval_all)
+    m_watch = aggregate_metrics(eval_watch)
     m_clean = aggregate_metrics(eval_clean)
     m_over = aggregate_metrics(eval_over)
     m_exec = aggregate_metrics(eval_exec)
 
-    # baseline
+    # baseline aligned
     dist_targets = w_watch["dist_pct"].dropna().tolist()
     baseline = baseline_sample(dist_targets, lag_end, HORIZON, k=len(w_watch))
     m_base = aggregate_metrics(baseline)
 
     edge_pp = None
-    if m_base["cov"] and m_all["cov"] and (m_base["succ"] is not None) and (m_all["succ"] is not None):
-        edge_pp = (m_all["succ"] - m_base["succ"]) * 100.0
+    if m_base["cov"] and m_watch["cov"] and (m_base["succ"] is not None) and (m_watch["succ"] is not None):
+        edge_pp = (m_watch["succ"] - m_base["succ"]) * 100.0
+
+    # regime segmentation
+    def succ_by_regime(tag: str) -> float | None:
+        ww = w_watch[w_watch["regime"].astype(str) == tag].copy()
+        if ww.empty:
+            return None
+        ev = [eval_signal_row(r, HORIZON) for _, r in ww.iterrows()]
+        mm = aggregate_metrics(ev)
+        return mm["succ"]
+
+    risk_on_s = succ_by_regime("RISK_ON")
+    trans_s = succ_by_regime("TRANSITION")
+    risk_off_s = succ_by_regime("RISK_OFF")
 
     # rolling-4
     hist = read_weekly_summary()
@@ -461,12 +558,29 @@ def main():
         except Exception:
             rolling_txt = "📈 ROLLING-4: histórico existe mas parsing falhou (ver CSV)."
 
-    # SANITY
     sanity = "OK"
     if w_watch.empty and w_exec.empty:
         sanity = "WARN (sem sinais WATCH/EXEC na janela)"
 
-    # escrever summary row (schema fixo)
+    # learning: derive current from latest daily run gates (best effort)
+    # We cannot read the scanner env here, so we infer "current" from last learned, else defaults.
+    current = {"DIST_MAX_PCT": 18.0, "ATRPCTL_GATE": 0.50, "BBZ_GATE": -0.60}
+    if LEARNED_JSON.exists():
+        try:
+            prev = json.loads(LEARNED_JSON.read_text(encoding="utf-8"))
+            if isinstance(prev, dict) and isinstance(prev.get("params", {}), dict):
+                # last suggested params are *targets*; treat them as current estimate
+                pp = prev.get("params", {})
+                for k in ["DIST_MAX_PCT", "ATRPCTL_GATE", "BBZ_GATE"]:
+                    if k in pp and np.isfinite(float(pp[k])):
+                        current[k] = float(pp[k])
+        except Exception:
+            pass
+
+    learn_action, learn_notes, learn_params = propose_learned_params(m_watch, m_base, int(m_watch["cov"]), current)
+    write_learned_params(week_end, learn_params, learn_action, learn_notes)
+
+    # write weekly summary row
     append_weekly_summary({
         "week_end": week_end,
         "window_start": window_start,
@@ -479,12 +593,12 @@ def main():
         "watch_clean": int(len(w_watch_clean)),
         "watch_over": int(len(w_watch_over)),
 
-        "watch_cov": int(m_all["cov"]),
-        "watch_success": (m_all["succ"] if m_all["succ"] is not None else ""),
-        "watch_h1": (m_all["h1"] if m_all["h1"] is not None else ""),
-        "watch_ff": (m_all["ff"] if m_all["ff"] is not None else ""),
-        "watch_mfe_med": (m_all["mfe_med"] if m_all["mfe_med"] is not None else ""),
-        "watch_mae_mean": (m_all["mae_mean"] if m_all["mae_mean"] is not None else ""),
+        "watch_cov": int(m_watch["cov"]),
+        "watch_success": (m_watch["succ"] if m_watch["succ"] is not None else ""),
+        "watch_h1": (m_watch["h1"] if m_watch["h1"] is not None else ""),
+        "watch_ff": (m_watch["ff"] if m_watch["ff"] is not None else ""),
+        "watch_mfe_med": (m_watch["mfe_med"] if m_watch["mfe_med"] is not None else ""),
+        "watch_mae_mean": (m_watch["mae_mean"] if m_watch["mae_mean"] is not None else ""),
 
         "clean_success": (m_clean["succ"] if m_clean["succ"] is not None else ""),
         "clean_mfe_med": (m_clean["mfe_med"] if m_clean["mfe_med"] is not None else ""),
@@ -500,18 +614,23 @@ def main():
         "baseline_mae_mean": (m_base["mae_mean"] if m_base["mae_mean"] is not None else ""),
         "edge_pp": (edge_pp if edge_pp is not None else ""),
 
-        "regime_mode": regime_mode
+        "regime_mode": regime_mode,
+        "risk_on_succ": (risk_on_s if risk_on_s is not None else ""),
+        "transition_succ": (trans_s if trans_s is not None else ""),
+        "risk_off_succ": (risk_off_s if risk_off_s is not None else ""),
+
+        "learn_action": learn_action,
+        "learn_notes": learn_notes
     })
 
-    # PENDING (sem futuro suficiente)
     pending_exec = max(0, len(w_exec) - m_exec["cov"])
-    pending_watch = max(0, len(w_watch) - m_all["cov"])
+    pending_watch = max(0, len(w_watch) - m_watch["cov"])
 
-    # mensagem
+    # Telegram message
     lines = []
-    lines.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v6)")
+    lines.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v7)")
     lines.append(f"Janela (lagged): {window_start} → {window_end}  (end=max(eval_day)-{HORIZON}d úteis)")
-    lines.append(f"Horizonte métricas: {HORIZON} sessões")
+    lines.append(f"Horizonte métricas: {HORIZON} sessões | Breakout=HIGH ≥ trig*(1+{BREAKOUT_BUFFER_PCT:.1f}%)")
     lines.append("")
     lines.append(f"Sinais na janela: {len(w_exec) + len(w_watch)}")
     lines.append(f"• EXEC: {len(w_exec)} | WATCH: {len(w_watch)} (LIMPO: {len(w_watch_clean)} | TETO: {len(w_watch_over)})")
@@ -526,10 +645,10 @@ def main():
         f"MAE={fmt_pct_from_ret(m_exec['mae_mean'],1)}"
     )
     lines.append(
-        f"WATCH: cov={m_all['cov']}/{len(w_watch)}  "
-        f"S={pct(m_all['succ'])} H1={pct(m_all['h1'])} FF={pct(m_all['ff'])}  "
-        f"MFE_med={fmt_pct_from_ret(m_all['mfe_med'],1)}  "
-        f"MAE={fmt_pct_from_ret(m_all['mae_mean'],1)}"
+        f"WATCH: cov={m_watch['cov']}/{len(w_watch)}  "
+        f"S={pct(m_watch['succ'])} H1={pct(m_watch['h1'])} FF={pct(m_watch['ff'])}  "
+        f"MFE_med={fmt_pct_from_ret(m_watch['mfe_med'],1)}  "
+        f"MAE={fmt_pct_from_ret(m_watch['mae_mean'],1)}"
     )
     lines.append(
         f"  LIMPO(≤{CLEAN_MAX_OH}): cov={m_clean['cov']}/{len(w_watch_clean)}  "
@@ -563,16 +682,18 @@ def main():
 
     lines.append("")
     lines.append("🧭 REGIME (WATCH success):")
-    lines.append(f"{regime_mode}: {pct(m_all['succ'])} | TRANSITION: — | RISK_OFF: —")
+    lines.append(f"RISK_ON: {pct(risk_on_s)} | TRANSITION: {pct(trans_s)} | RISK_OFF: {pct(risk_off_s)}")
     lines.append("")
     lines.append(f"✅ SANITY: {sanity}")
     lines.append("")
     lines.append(rolling_txt)
     lines.append("")
-    lines.append("Ações:")
-    lines.append("• Modelo: alterações estruturais só com evidência em ROLLING-4 (≥4 semanas).")
-    lines.append("• Se PENDING elevado: é normal quando a janela está demasiado recente (agora está lagged, deve baixar).")
-    lines.append("• Histórico: weekly_summary.csv actualizado (base para decisões).")
+    lines.append("🧠 LEARNING:")
+    lines.append(f"• action={learn_action} | {learn_notes}")
+    if learn_params:
+        lines.append(f"• learned_params.json: {learn_params}")
+    else:
+        lines.append("• learned_params.json: (sem alterações)")
 
     tg_send("\n".join(lines))
 
