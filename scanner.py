@@ -1,4 +1,4 @@
-# scanner.py  (V7_3_PREOPEN_RELAX_DAILY) — DAILY breakout candidates + learned params (optional)
+# scanner.py (V7_4_PREOPEN_RELAX_DAILY) — DAILY breakout candidates + learned params (AUTO)
 # EOD-only, public/free, cache-first, ranked, pre-open actionable.
 #
 # DATA SOURCES (real / free / public):
@@ -9,7 +9,8 @@
 # - Deterministic universe order.
 # - Cache-first; if Stooq rate-limits, falls back to local cache.
 # - Writes cache/signals.csv (ASOF schema).
-# - Reads cache/learned_params.json if present to gently adjust a few gates.
+# - Reads cache/learned_params.json (from weekly_eval v7) and blends gates conservatively.
+# - Writes cache/last_run.json for audit/debug.
 #
 # NOTE:
 # - This is NOT "autonomous trading". It outputs ranked candidates only.
@@ -45,7 +46,7 @@ MIN_DV20 = float(os.environ.get("MIN_DV20", "1500000"))
 MAX_DV20 = float(os.environ.get("MAX_DV20", "120000000"))
 MIN_SV20 = float(os.environ.get("MIN_SV20", "250000"))
 
-# Core gates (can be adjusted slightly by learned_params.json)
+# Core gates (may be adjusted slightly by learned_params.json)
 BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.60"))
 ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.50"))
 
@@ -82,6 +83,13 @@ REG_VIX = os.environ.get("REG_VIX", "VIX")
 
 SLEEP_EVERY = int(os.environ.get("SLEEP_EVERY", "25"))
 SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "2.0"))
+
+# Optional: require a small buffer above trig to call an EOD breakout "real"
+BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.0"))  # e.g. 0.5 => close > trig*1.005
+
+# Learning blend (how much daily trusts learned gates)
+# - if weekly wrote a "blend" field, we use it; else we use this env
+LEARN_BLEND_ENV = float(os.environ.get("LEARN_BLEND", "0.25"))  # 0..0.50
 
 # paths
 CACHE_DIR = Path("cache")
@@ -142,59 +150,75 @@ def safe_float(x, default=np.nan):
     except Exception:
         return default
 
+def clamp(x: float, lo: float, hi: float) -> float:
+    return float(min(hi, max(lo, x)))
+
 # =========================
-# Learned params
+# Learned params (weekly_eval v7 compatible)
 # =========================
 def load_learned_params() -> dict:
     """
-    Reads cache/learned_params.json if exists.
-    Expected schema:
-    {
-      "version": 1,
-      "asof": "YYYY-MM-DD",
-      "blend": 0.25,
-      "params": { "DIST_MAX_PCT": 19.0, "ATRPCTL_GATE": 0.48, "BBZ_GATE": -0.65 }
-    }
+    Supports:
+    - weekly_eval v7 schema:
+      { "params": {...}, "history": [...], "meta": {...} }
+    - legacy schema (if ever):
+      { "version": 1, "asof": "...", "blend": 0.25, "params": {...} }
     """
     if not LEARNED_JSON.exists():
         return {}
     try:
         d = json.loads(LEARNED_JSON.read_text(encoding="utf-8"))
-        if not isinstance(d, dict):
-            return {}
-        return d
+        return d if isinstance(d, dict) else {}
     except Exception:
         return {}
 
-def apply_learned_params():
+def apply_learned_params() -> dict:
     """
     Blend a few gates conservatively.
-    Only adjusts: DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE
+    Adjusts: DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE (optional).
+    Returns a dict with applied values for logging.
     """
     global DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE
+
     learned = load_learned_params()
     if not learned:
-        return
-    blend = safe_float(learned.get("blend", 0.25), 0.25)
-    blend = max(0.0, min(0.50, blend))
+        return {"used": False}
 
     params = learned.get("params", {})
-    if not isinstance(params, dict):
-        return
+    if not isinstance(params, dict) or not params:
+        return {"used": False}
 
-    def _blend(cur, new):
+    blend = safe_float(learned.get("blend", LEARN_BLEND_ENV), LEARN_BLEND_ENV)
+    blend = clamp(blend, 0.0, 0.50)
+
+    def _blend(cur, new, lo=None, hi=None):
         if not np.isfinite(new):
             return cur
-        return (1.0 - blend) * cur + blend * new
+        v = (1.0 - blend) * cur + blend * new
+        if lo is not None and hi is not None:
+            v = clamp(float(v), float(lo), float(hi))
+        return float(v)
 
-    if "DIST_MAX_PCT" in params:
-        DIST_MAX_PCT = float(_blend(DIST_MAX_PCT, safe_float(params.get("DIST_MAX_PCT"))))
-    if "ATRPCTL_GATE" in params:
-        ATRPCTL_GATE = float(_blend(ATRPCTL_GATE, safe_float(params.get("ATRPCTL_GATE"))))
-    if "BBZ_GATE" in params:
-        BBZ_GATE = float(_blend(BBZ_GATE, safe_float(params.get("BBZ_GATE"))))
+    # clamps (same spirit as weekly)
+    DIST_MAX_PCT = _blend(DIST_MAX_PCT, safe_float(params.get("DIST_MAX_PCT", np.nan)), 10.0, 26.0)
+    ATRPCTL_GATE = _blend(ATRPCTL_GATE, safe_float(params.get("ATRPCTL_GATE", np.nan)), 0.30, 0.75)
+    BBZ_GATE = _blend(BBZ_GATE, safe_float(params.get("BBZ_GATE", np.nan)), -1.40, -0.20)
+
     if "VOL_CONFIRM_MULT" in params:
-        VOL_CONFIRM_MULT_BASE = float(_blend(VOL_CONFIRM_MULT_BASE, safe_float(params.get("VOL_CONFIRM_MULT"))))
+        VOL_CONFIRM_MULT_BASE = _blend(VOL_CONFIRM_MULT_BASE, safe_float(params.get("VOL_CONFIRM_MULT", np.nan)), 1.05, 1.35)
+
+    meta = learned.get("meta", {}) if isinstance(learned.get("meta", {}), dict) else {}
+    used_ts = meta.get("last_update_utc") or meta.get("created_utc") or ""
+
+    return {
+        "used": True,
+        "blend": blend,
+        "DIST_MAX_PCT": DIST_MAX_PCT,
+        "ATRPCTL_GATE": ATRPCTL_GATE,
+        "BBZ_GATE": BBZ_GATE,
+        "VOL_CONFIRM_MULT_BASE": VOL_CONFIRM_MULT_BASE,
+        "learned_ts": used_ts
+    }
 
 # =========================
 # Holdings parsing
@@ -550,7 +574,6 @@ def signals_csv_ensure_schema() -> None:
             w.writerow(SIGNALS_COLS)
         return
 
-    # Ensure columns exist and order is stable
     if "asof" not in df.columns:
         df.insert(1, "asof", "")
 
@@ -780,8 +803,7 @@ def empirical_prob_by_score_bin(regime: str) -> str:
 # MAIN
 # =========================
 def main() -> None:
-    # apply learned params before running
-    apply_learned_params()
+    learned_applied = apply_learned_params()
 
     now_dt = datetime.now(timezone.utc)
     now = now_dt.strftime("%Y-%m-%d %H:%M UTC")
@@ -794,8 +816,10 @@ def main() -> None:
 
     reg = regime_snapshot()
     mode = reg["mode"]
+
     VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
     DIST_LIMIT = max(8.0, DIST_MAX_PCT + reg["dist_adj"])
+    breakout_mult = 1.0 + (BREAKOUT_BUFFER_PCT / 100.0)
 
     # universe (DETERMINISTIC)
     all_tickers = (
@@ -938,13 +962,14 @@ def main() -> None:
             vol20 = float(df["volume"].iloc[-20:].mean())
             vol_mult = (vol_now / vol20) if vol20 > 0 else np.nan
 
-            breakout_now = close_now > trig
+            trig_eff = trig * breakout_mult
+            breakout_now = close_now > trig_eff
             vol_confirm = (vol20 > 0) and (vol_now >= VOL_CONFIRM_MULT * vol20)
             no_big_gap = (close_prev > 0) and (open_now <= close_prev * MAX_GAP_UP)
 
             quality_ok = (bbz_last <= EXEC_BBZ_MAX) or (atr_pctl <= EXEC_ATRPCTL_MAX)
             not_too_extended = overshoot_pct <= EXEC_MAX_OVERSHOOT_PCT
-            prev_above = float(df["close"].iloc[-2]) > trig
+            prev_above = float(df["close"].iloc[-2]) > trig_eff
 
             if breakout_now and vol_confirm and no_big_gap and quality_ok and not_too_extended:
                 sig = "EXEC_B" if prev_above else "EXEC_A"
@@ -1063,8 +1088,21 @@ def main() -> None:
             )
 
     # Compose message
-    msg = [f"[{now}] ### V7_3_PREOPEN_RELAX_DAILY ### Microcap scanner (RANKED)"]
-    msg.append(f"ASOF={asof_str_global} (data de mercado)")
+    msg = [f"[{now}] ### V7_4_PREOPEN_RELAX_DAILY ### Microcap scanner (RANKED)"]
+    msg.append(f"ASOF={asof_str_global} (data de mercado) | breakout_buffer={BREAKOUT_BUFFER_PCT:.2f}%")
+
+    # learning line (what was actually applied)
+    if learned_applied.get("used"):
+        msg.append(
+            f"LEARNED_APPLIED: yes | blend={learned_applied.get('blend',0):.2f} | "
+            f"DIST_MAX_PCT={learned_applied.get('DIST_MAX_PCT',DIST_MAX_PCT):.2f} | "
+            f"ATRPCTL_GATE={learned_applied.get('ATRPCTL_GATE',ATRPCTL_GATE):.3f} | "
+            f"BBZ_GATE={learned_applied.get('BBZ_GATE',BBZ_GATE):.3f} | "
+            f"ts={learned_applied.get('learned_ts','') or '—'}"
+        )
+    else:
+        msg.append("LEARNED_APPLIED: no (learned_params.json ausente/invalid)")
+
     msg.append(
         f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
         f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH_CLEAN={len(watch_clean)} WATCH_OVER={len(watch_over)} | nodata={no_data} | "
@@ -1176,8 +1214,11 @@ def main() -> None:
                 "BBZ_GATE": BBZ_GATE,
                 "ATRPCTL_GATE": ATRPCTL_GATE,
                 "DIST_MAX_PCT": DIST_MAX_PCT,
-                "VOL_CONFIRM_MULT": VOL_CONFIRM_MULT
-            }
+                "VOL_CONFIRM_MULT_BASE": VOL_CONFIRM_MULT_BASE,
+                "VOL_CONFIRM_MULT": VOL_CONFIRM_MULT,
+                "BREAKOUT_BUFFER_PCT": BREAKOUT_BUFFER_PCT
+            },
+            "learned_applied": learned_applied
         }, indent=2), encoding="utf-8")
     except Exception:
         pass
