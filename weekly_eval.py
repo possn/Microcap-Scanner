@@ -1,23 +1,16 @@
-# weekly_eval.py — QUANT v7 (schema FIXO + rolling-4 + AUTO-LEARNING)
+# weekly_eval.py — QUANT v7 (schema FIXO + lagged window + baseline + AUTO-LEARNING)
 # Lê cache/signals.csv + cache/ohlcv/*.csv
-# Calcula métricas semanais em janela "lagged" para evitar cov=0 por falta de futuro
-# Escreve cache/weekly_summary.csv com colunas fixas (sem corrupção)
-# Actualiza cache/learned_params.json (auto-learning, auditável)
+# Calcula métricas semanais em janela "lagged" (evita cov=0 por falta de futuro)
+# Escreve cache/weekly_summary.csv (colunas fixas)
+# Atualiza cache/learned_params.json (aprendizagem automática conservadora)
 # Envia resumo para Telegram
-#
-# Fixes:
-# - Robustez total: elimina KeyError (ex: 'h1') com rows incompletos
-# - Baseline não precisa de h1/ff
-#
-# Learning:
-# - só ajusta parâmetros se cov >= LEARN_MIN_COV
-# - usa EDGE (watch_success - baseline_success) como sinal
-# - updates pequenos, com blend, e clamps
-# - grava histórico em learned_params.json
 
-import os, csv, json, random
+import os
+import csv
+import json
+import random
 from pathlib import Path
-from datetime import datetime, timezone
+
 import pandas as pd
 import numpy as np
 import requests
@@ -34,32 +27,24 @@ SIGNALS_CSV = Path("cache") / "signals.csv"
 SUMMARY_CSV = Path("cache") / "weekly_summary.csv"
 LEARNED_JSON = Path("cache") / "learned_params.json"
 
-HORIZON = int(os.environ.get("WEEKLY_HORIZON_SESS", "5"))  # sessões úteis
+HORIZON = int(os.environ.get("WEEKLY_HORIZON_SESS", "5"))  # sessões úteis para métricas
 CLEAN_MAX_OH = int(os.environ.get("WATCH_OVERHEAD_CLEAN_MAX", "5"))
-WINDOW_DAYS = 5
+WINDOW_DAYS = 5  # sempre 5 dias úteis
 
-# Breakout buffer (ex: 0.5 => sucesso só se close > trig*1.005)
-BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.0"))
+# learning knobs
+BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.5"))  # buffer p/ trig (evita falsos)
+LEARN_MIN_COV = int(os.environ.get("LEARN_MIN_COV", "30"))                 # cobertura mínima para aprender
+LEARN_BLEND = float(os.environ.get("LEARN_BLEND", "0.25"))                 # 0..0.5 (conservador)
+LEARN_STEP_DIST = float(os.environ.get("LEARN_STEP_DIST", "1.0"))          # pontos percentuais
+LEARN_STEP_ATR = float(os.environ.get("LEARN_STEP_ATR", "0.02"))           # 0.xx
+LEARN_STEP_BBZ = float(os.environ.get("LEARN_STEP_BBZ", "0.05"))           # z-score units
 
-# Learning knobs (seguros)
-LEARN_MIN_COV = int(os.environ.get("LEARN_MIN_COV", "30"))
-LEARN_BLEND = float(os.environ.get("LEARN_BLEND", "0.25"))  # 0..1 (quanto “mexe” por semana)
-LEARN_STEP_DIST = float(os.environ.get("LEARN_STEP_DIST", "1.0"))   # pontos percentuais
-LEARN_STEP_ATR = float(os.environ.get("LEARN_STEP_ATR", "0.02"))     # unidades (0..1)
-LEARN_STEP_BBZ = float(os.environ.get("LEARN_STEP_BBZ", "0.05"))     # unidades (BBZ gate)
-
-# Defaults (se learned_params ainda não existir)
-DEFAULTS = {
-    "DIST_MAX_PCT": float(os.environ.get("DIST_MAX_PCT", "18.0")),
-    "ATRPCTL_GATE": float(os.environ.get("ATRPCTL_GATE", "0.50")),
-    "BBZ_GATE": float(os.environ.get("BBZ_GATE", "-0.60")),
-}
-
-# clamps (para não descontrolar)
-CLAMPS = {
-    "DIST_MAX_PCT": (10.0, 26.0),
-    "ATRPCTL_GATE": (0.30, 0.75),
-    "BBZ_GATE": (-1.40, -0.20),  # mais negativo = mais exigente em compressão
+# defaults (devem bater com o daily)
+DEFAULT_PARAMS = {
+    "DIST_MAX_PCT": 18.0,
+    "ATRPCTL_GATE": 0.50,
+    "BBZ_GATE": -0.60,
+    "VOL_CONFIRM_MULT": 1.12,
 }
 
 # =========================
@@ -115,9 +100,7 @@ SUMMARY_HEADER = [
     "over_success","over_mfe_med","over_mae_mean",
     "baseline_cov","baseline_success","baseline_mfe_med","baseline_mae_mean","edge_pp",
     "regime_mode",
-    "breakout_buffer_pct",
-    "learn_cov_ok","learn_edge_pp","learn_action",
-    "learn_dist_max_pct","learn_atrpctl_gate","learn_bbz_gate"
+    "learn_action","learn_edge_pp","learn_cov_used"
 ]
 
 def append_weekly_summary(row: dict) -> None:
@@ -144,7 +127,7 @@ def read_weekly_summary() -> pd.DataFrame:
         return pd.DataFrame()
 
 # =========================
-# Formatting helpers
+# Formatting
 # =========================
 def pct(x: float | None) -> str:
     if x is None or (not np.isfinite(x)):
@@ -160,6 +143,7 @@ def fmt_pct_from_ret(x: float | None, nd=1) -> str:
 # Date helpers
 # =========================
 def pick_target_date_from_row(row: pd.Series) -> pd.Timestamp | None:
+    # prioridade: asof -> date
     if "asof" in row.index:
         d = pd.to_datetime(row.get("asof", None), errors="coerce")
         if pd.notna(d):
@@ -199,19 +183,16 @@ def mfe_mae_from_entry(df: pd.DataFrame, pos: int, horizon: int, entry: float) -
     return (mfe, mae)
 
 # =========================
-# Evaluation
+# Evaluation row
 # =========================
-def _empty_eval() -> dict:
-    return {"covered": 0, "success": 0, "h1": 0, "ff": 0, "mfe": None, "mae": None}
-
 def eval_watch_row(row: pd.Series, horizon: int, breakout_buffer_pct: float) -> dict:
     """
     covered=1 apenas se existir futuro suficiente (pos + horizon < len(df))
-    Sucesso: algum close > trig*(1+buffer)
+    Sucesso: algum close > trig*(1+buffer) no horizonte
     H1: close_{+1} > trig*(1+buffer)
     Fail-fast: close < stop em <=2 sessões
     """
-    out = _empty_eval()
+    out = {"covered": 0, "success": 0, "h1": 0, "ff": 0, "mfe": None, "mae": None}
 
     t = str(row.get("ticker", "")).strip().upper()
     trig = float(pd.to_numeric(row.get("trig", np.nan), errors="coerce"))
@@ -235,15 +216,12 @@ def eval_watch_row(row: pd.Series, horizon: int, breakout_buffer_pct: float) -> 
 
     out["covered"] = 1
 
-    buf = 1.0 + (breakout_buffer_pct / 100.0)
-    trig_eff = trig * buf
+    trig_eff = trig * (1.0 + breakout_buffer_pct / 100.0)
 
     end = pos + horizon
-    future = pd.to_numeric(df.iloc[pos:end+1]["close"], errors="coerce").dropna().values
-    if len(future) == 0:
-        return out
-
+    future = df.iloc[pos:end+1]["close"].values
     out["success"] = 1 if np.any(future > trig_eff) else 0
+
     out["h1"] = 1 if float(df["close"].iloc[pos+1]) > trig_eff else 0
 
     ff = 0
@@ -260,21 +238,23 @@ def eval_watch_row(row: pd.Series, horizon: int, breakout_buffer_pct: float) -> 
     return out
 
 def aggregate_metrics(rows_eval: list[dict]) -> dict:
+    """
+    Robust: aceita dicionários incompletos (usa defaults).
+    """
     if not rows_eval:
         return {"cov": 0, "succ": None, "h1": None, "ff": None, "mfe_med": None, "mae_mean": None}
 
-    cov_rows = [r for r in rows_eval if int(r.get("covered", 0)) == 1]
-    cov = len(cov_rows)
+    cov = sum(1 for r in rows_eval if int(r.get("covered", 0)) == 1)
     if cov == 0:
         return {"cov": 0, "succ": None, "h1": None, "ff": None, "mfe_med": None, "mae_mean": None}
 
-    succ = float(np.mean([int(r.get("success", 0)) for r in cov_rows]))
-    h1 = float(np.mean([int(r.get("h1", 0)) for r in cov_rows]))
-    ff = float(np.mean([int(r.get("ff", 0)) for r in cov_rows]))
+    succ = float(np.mean([float(r.get("success", 0)) for r in rows_eval if int(r.get("covered", 0)) == 1]))
+    h1 = float(np.mean([float(r.get("h1", 0)) for r in rows_eval if int(r.get("covered", 0)) == 1]))
+    ff = float(np.mean([float(r.get("ff", 0)) for r in rows_eval if int(r.get("covered", 0)) == 1]))
 
-    mfes = [r.get("mfe") for r in cov_rows]
+    mfes = [r.get("mfe") for r in rows_eval if int(r.get("covered", 0)) == 1]
+    maes = [r.get("mae") for r in rows_eval if int(r.get("covered", 0)) == 1]
     mfes = [float(x) for x in mfes if x is not None and np.isfinite(x)]
-    maes = [r.get("mae") for r in cov_rows]
     maes = [float(x) for x in maes if x is not None and np.isfinite(x)]
 
     mfe_med = float(np.median(mfes)) if mfes else None
@@ -283,7 +263,7 @@ def aggregate_metrics(rows_eval: list[dict]) -> dict:
     return {"cov": cov, "succ": succ, "h1": h1, "ff": ff, "mfe_med": mfe_med, "mae_mean": mae_mean}
 
 # =========================
-# BASELINE (cache-only; robusto)
+# BASELINE (cache-only; matching por dist% se possível)
 # =========================
 def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon: int, k: int, breakout_buffer_pct: float) -> list[dict]:
     """
@@ -291,18 +271,15 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
     - escolhe tickers aleatórios do cache/ohlcv
     - trig_baseline = max(close últimos 20 dias antes do window_end)
     - dist% = (trig - close)/close
-    - matching por buckets se dist_targets >= 6
-    - devolve dicts com: covered, success, mfe, mae (sem h1/ff -> aggregate é robusto)
+    - matching por buckets se dist_targets>=6
+    - métricas iguais a WATCH (success/h1/ff/mfe/mae)
     """
-    if k <= 0:
-        return []
-    if not OHLCV_DIR.exists():
+    if k <= 0 or (not OHLCV_DIR.exists()):
         return []
 
     files = [p for p in OHLCV_DIR.iterdir() if p.is_file() and p.name.endswith(".csv")]
     if not files:
         return []
-
     random.shuffle(files)
 
     tt = [x for x in dist_targets if np.isfinite(x)]
@@ -330,7 +307,6 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
 
     picked: list[dict] = []
     tries = 0
-    buf = 1.0 + (breakout_buffer_pct / 100.0)
 
     for p in files:
         if len(picked) >= k:
@@ -363,188 +339,113 @@ def baseline_sample(dist_targets: list[float], window_end: pd.Timestamp, horizon
         if not np.isfinite(dist):
             continue
 
-        if use_matching:
-            b = bucket(dist)  # type: ignore[misc]
-            if got[b] >= want.get(b, 0):  # type: ignore[union-attr]
+        if use_matching and bucket and want and got:
+            b = bucket(dist)
+            if got[b] >= want.get(b, 0):
                 continue
 
-        trig_eff = trig * buf
+        trig_eff = trig * (1.0 + breakout_buffer_pct / 100.0)
         end = pos + horizon
-        future = df["close"].iloc[pos:end+1].values
+        future = df.iloc[pos:end+1]["close"].values
+
         success = 1 if np.any(future > trig_eff) else 0
+        h1 = 1 if float(df["close"].iloc[pos+1]) > trig_eff else 0
+
+        ff = 0
+        stop = float(df["close"].iloc[pos-10:pos].min()) * 0.95  # stop baseline genérico
+        for j in [pos+1, pos+2]:
+            if j < len(df) and float(df["close"].iloc[j]) < stop:
+                ff = 1
+                break
+
         mfe, mae = mfe_mae_from_entry(df, pos, horizon, close0)
 
-        picked.append({"covered": 1, "success": success, "mfe": mfe, "mae": mae})
+        picked.append({"covered": 1, "success": success, "h1": h1, "ff": ff, "mfe": mfe, "mae": mae})
 
-        if use_matching:
-            got[b] += 1  # type: ignore[index]
+        if use_matching and got is not None:
+            got[b] += 1
 
     return picked
 
 # =========================
-# LEARNING (auditável)
+# Learning params helpers
 # =========================
-def _clamp(name: str, x: float) -> float:
-    lo, hi = CLAMPS[name]
-    return float(min(hi, max(lo, x)))
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 def load_learned_params() -> dict:
-    ensure_parent(LEARNED_JSON)
     if not LEARNED_JSON.exists():
-        return {
-            "params": dict(DEFAULTS),
-            "history": [],
-            "meta": {"created_utc": datetime.now(timezone.utc).isoformat()}
-        }
+        return {}
     try:
         d = json.loads(LEARNED_JSON.read_text(encoding="utf-8"))
-        if "params" not in d or not isinstance(d["params"], dict):
-            raise ValueError("bad learned schema")
-        for k in DEFAULTS:
-            if k not in d["params"] or not np.isfinite(float(d["params"][k])):
-                d["params"][k] = DEFAULTS[k]
-        if "history" not in d or not isinstance(d["history"], list):
-            d["history"] = []
-        if "meta" not in d or not isinstance(d["meta"], dict):
-            d["meta"] = {}
-        return d
+        return d if isinstance(d, dict) else {}
     except Exception:
-        return {
-            "params": dict(DEFAULTS),
-            "history": [{"ts_utc": datetime.now(timezone.utc).isoformat(), "note": "reset_invalid_json"}],
-            "meta": {"reset_utc": datetime.now(timezone.utc).isoformat()}
-        }
+        return {}
 
-def save_learned_params(obj: dict) -> None:
+def save_learned_params(version: int, asof: str, blend: float, params: dict, meta: dict) -> None:
     ensure_parent(LEARNED_JSON)
-    LEARNED_JSON.write_text(json.dumps(obj, indent=2, sort_keys=True), encoding="utf-8")
+    payload = {
+        "version": int(version),
+        "asof": str(asof),
+        "blend": float(blend),
+        "params": params,
+        "meta": meta,
+    }
+    LEARNED_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-def learning_update(week_end: str, regime_mode: str, m_watch: dict, m_base: dict) -> dict:
+def propose_learning_update(edge_pp: float | None, cov: int, current_params: dict) -> tuple[str, dict]:
     """
-    Decide e aplica update. Retorna: {did_update, action, params, edge_pp, cov_ok}
+    Política conservadora:
+    - Só aprende se cov >= LEARN_MIN_COV e edge_pp não é None.
+    - Se edge_pp < 0: tornar gates ligeiramente MAIS estritos (menos lixo).
+    - Se edge_pp > +5: relaxar ligeiramente (mais ideias mantendo edge).
+    - Caso contrário: KEEP.
     """
-    learned = load_learned_params()
-    params = learned["params"]
+    if edge_pp is None or (not np.isfinite(edge_pp)) or cov < LEARN_MIN_COV:
+        return ("NO_LEARN", current_params)
 
-    cov_watch = int(m_watch.get("cov", 0) or 0)
-    cov_base = int(m_base.get("cov", 0) or 0)
-    cov_ok = (cov_watch >= LEARN_MIN_COV) and (cov_base >= max(10, int(0.6 * LEARN_MIN_COV)))
+    dist = float(current_params.get("DIST_MAX_PCT", DEFAULT_PARAMS["DIST_MAX_PCT"]))
+    atrg = float(current_params.get("ATRPCTL_GATE", DEFAULT_PARAMS["ATRPCTL_GATE"]))
+    bbzg = float(current_params.get("BBZ_GATE", DEFAULT_PARAMS["BBZ_GATE"]))
+    volm = float(current_params.get("VOL_CONFIRM_MULT", DEFAULT_PARAMS["VOL_CONFIRM_MULT"]))
 
-    succ_w = m_watch.get("succ", None)
-    succ_b = m_base.get("succ", None)
-    edge_pp = None
-    if succ_w is not None and succ_b is not None and np.isfinite(succ_w) and np.isfinite(succ_b):
-        edge_pp = (float(succ_w) - float(succ_b)) * 100.0
+    if edge_pp < 0:
+        # tighten
+        dist = _clamp(dist - LEARN_STEP_DIST, 10.0, 30.0)
+        atrg = _clamp(atrg - LEARN_STEP_ATR, 0.25, 0.65)
+        bbzg = _clamp(bbzg - LEARN_STEP_BBZ, -2.50, -0.10)  # mais negativo = mais estrito
+        volm = _clamp(volm + 0.01, 1.05, 1.40)
+        return ("TIGHTEN", {"DIST_MAX_PCT": dist, "ATRPCTL_GATE": atrg, "BBZ_GATE": bbzg, "VOL_CONFIRM_MULT": volm})
 
-    action = "NOOP"
-    did = False
+    if edge_pp > 5:
+        # relax slightly
+        dist = _clamp(dist + LEARN_STEP_DIST, 10.0, 30.0)
+        atrg = _clamp(atrg + LEARN_STEP_ATR, 0.25, 0.65)
+        bbzg = _clamp(bbzg + LEARN_STEP_BBZ, -2.50, -0.10)  # menos negativo = mais permissivo
+        volm = _clamp(volm - 0.01, 1.05, 1.40)
+        return ("RELAX", {"DIST_MAX_PCT": dist, "ATRPCTL_GATE": atrg, "BBZ_GATE": bbzg, "VOL_CONFIRM_MULT": volm})
 
-    # sem cov suficiente ou sem edge -> não mexe
-    if (not cov_ok) or (edge_pp is None) or (not np.isfinite(edge_pp)):
-        learned["history"].append({
-            "ts_utc": datetime.now(timezone.utc).isoformat(),
-            "week_end": week_end,
-            "regime_mode": regime_mode,
-            "cov_watch": cov_watch,
-            "cov_base": cov_base,
-            "edge_pp": edge_pp,
-            "action": "NOOP_cov_or_edge"
-        })
-        save_learned_params(learned)
-        return {
-            "did_update": False,
-            "action": "NOOP_cov_or_edge",
-            "params": dict(params),
-            "edge_pp": edge_pp,
-            "cov_ok": cov_ok
-        }
+    return ("KEEP", current_params)
 
-    # regra direccional (simples e estável)
-    # edge positivo => relaxa ligeiramente; edge negativo => aperta ligeiramente
-    if edge_pp > 0.0:
-        direction = +1
-        action = "RELAX"
-    elif edge_pp < 0.0:
-        direction = -1
-        action = "TIGHTEN"
-    else:
-        direction = 0
-        action = "NOOP_edge_zero"
+def blend_params(old_params: dict, new_params: dict, blend: float) -> dict:
+    b = _clamp(float(blend), 0.0, 0.50)
 
-    if direction == 0:
-        learned["history"].append({
-            "ts_utc": datetime.now(timezone.utc).isoformat(),
-            "week_end": week_end,
-            "regime_mode": regime_mode,
-            "cov_watch": cov_watch,
-            "cov_base": cov_base,
-            "edge_pp": edge_pp,
-            "action": action
-        })
-        save_learned_params(learned)
-        return {
-            "did_update": False,
-            "action": action,
-            "params": dict(params),
-            "edge_pp": edge_pp,
-            "cov_ok": cov_ok
-        }
-
-    # current
-    dist = float(params.get("DIST_MAX_PCT", DEFAULTS["DIST_MAX_PCT"]))
-    atrg = float(params.get("ATRPCTL_GATE", DEFAULTS["ATRPCTL_GATE"]))
-    bbzg = float(params.get("BBZ_GATE", DEFAULTS["BBZ_GATE"]))
-
-    # targets (um passo)
-    # RELAX: dist ↑ ; atr_gate ↑ ; bbz_gate ↑ (menos negativo, mais permissivo)
-    # TIGHTEN: dist ↓ ; atr_gate ↓ ; bbz_gate ↓ (mais negativo, mais exigente)
-    dist_t = dist + direction * LEARN_STEP_DIST
-    atrg_t = atrg + direction * LEARN_STEP_ATR
-    bbzg_t = bbzg + direction * LEARN_STEP_BBZ
-
-    # blend + clamp
-    dist_n = _clamp("DIST_MAX_PCT", dist * (1 - LEARN_BLEND) + dist_t * LEARN_BLEND)
-    atrg_n = _clamp("ATRPCTL_GATE", atrg * (1 - LEARN_BLEND) + atrg_t * LEARN_BLEND)
-    bbzg_n = _clamp("BBZ_GATE", bbzg * (1 - LEARN_BLEND) + bbzg_t * LEARN_BLEND)
-
-    params["DIST_MAX_PCT"] = float(dist_n)
-    params["ATRPCTL_GATE"] = float(atrg_n)
-    params["BBZ_GATE"] = float(bbzg_n)
-
-    learned["params"] = params
-    learned["history"].append({
-        "ts_utc": datetime.now(timezone.utc).isoformat(),
-        "week_end": week_end,
-        "regime_mode": regime_mode,
-        "cov_watch": cov_watch,
-        "cov_base": cov_base,
-        "edge_pp": float(edge_pp),
-        "action": action,
-        "delta": {
-            "DIST_MAX_PCT": float(dist_n - dist),
-            "ATRPCTL_GATE": float(atrg_n - atrg),
-            "BBZ_GATE": float(bbzg_n - bbzg)
-        },
-        "new_params": dict(params)
-    })
-    learned["meta"]["last_update_utc"] = datetime.now(timezone.utc).isoformat()
-    learned["meta"]["last_week_end"] = week_end
-
-    save_learned_params(learned)
-    did = True
+    def _mix(k: str) -> float:
+        a = float(old_params.get(k, DEFAULT_PARAMS[k]))
+        n = float(new_params.get(k, a))
+        return (1.0 - b) * a + b * n
 
     return {
-        "did_update": did,
-        "action": action,
-        "params": dict(params),
-        "edge_pp": float(edge_pp),
-        "cov_ok": cov_ok
+        "DIST_MAX_PCT": _mix("DIST_MAX_PCT"),
+        "ATRPCTL_GATE": _mix("ATRPCTL_GATE"),
+        "BBZ_GATE": _mix("BBZ_GATE"),
+        "VOL_CONFIRM_MULT": _mix("VOL_CONFIRM_MULT"),
     }
 
 # =========================
 # MAIN
 # =========================
-def main():
+def main() -> None:
     if not SIGNALS_CSV.exists():
         tg_send("WEEKLY REVIEW: FAIL — cache/signals.csv não existe.")
         return
@@ -576,12 +477,6 @@ def main():
     else:
         sig["eval_day"] = sig["date"]
 
-    # -------------------------
-    # Janela "lagged":
-    # lag_end = max(eval_day) - HORIZON BDays
-    # window = [lag_end - (WINDOW_DAYS-1) BDays, lag_end]
-    # fallback: últimos 5 dias únicos
-    # -------------------------
     max_day = pd.to_datetime(sig["eval_day"], errors="coerce").dropna().max()
     if pd.isna(max_day):
         tg_send("WEEKLY REVIEW: FAIL — sem datas válidas.")
@@ -638,11 +533,8 @@ def main():
     m_base = aggregate_metrics(baseline)
 
     edge_pp = None
-    if m_base["cov"] and m_all["cov"] and (m_base["succ"] is not None) and (m_all["succ"] is not None):
+    if (m_base["cov"] and m_all["cov"] and (m_base["succ"] is not None) and (m_all["succ"] is not None)):
         edge_pp = (float(m_all["succ"]) - float(m_base["succ"])) * 100.0
-
-    # auto-learning (update learned_params.json)
-    learn = learning_update(week_end=week_end, regime_mode=regime_mode, m_watch=m_all, m_base=m_base)
 
     # rolling-4
     hist = read_weekly_summary()
@@ -650,10 +542,10 @@ def main():
     if hist is not None and (not hist.empty):
         h4 = hist.tail(4).copy()
         try:
-            cov_total = int(pd.to_numeric(h4["watch_cov"], errors="coerce").fillna(0).sum())
-            succ = pd.to_numeric(h4["watch_success"], errors="coerce")
-            mae = pd.to_numeric(h4["watch_mae_mean"], errors="coerce")
-            mfe = pd.to_numeric(h4["watch_mfe_med"], errors="coerce")
+            cov_total = int(pd.to_numeric(h4.get("watch_cov", 0), errors="coerce").fillna(0).sum())
+            succ = pd.to_numeric(h4.get("watch_success", np.nan), errors="coerce")
+            mae = pd.to_numeric(h4.get("watch_mae_mean", np.nan), errors="coerce")
+            mfe = pd.to_numeric(h4.get("watch_mfe_med", np.nan), errors="coerce")
 
             succ_m = float(np.nanmean(succ.values)) if len(succ.dropna()) else None
             mae_m = float(np.nanmean(mae.values)) if len(mae.dropna()) else None
@@ -673,8 +565,41 @@ def main():
     if w_watch.empty and w_exec.empty:
         sanity = "WARN (sem sinais WATCH/EXEC na janela)"
 
-    # escrever summary row (schema fixo)
-    lp = learn["params"]
+    # =========================
+    # AUTO-LEARNING
+    # =========================
+    learned = load_learned_params()
+    cur_params = DEFAULT_PARAMS.copy()
+    if isinstance(learned.get("params", None), dict):
+        for k in DEFAULT_PARAMS:
+            try:
+                cur_params[k] = float(learned["params"].get(k, cur_params[k]))
+            except Exception:
+                pass
+
+    action, proposed = propose_learning_update(edge_pp=edge_pp, cov=int(m_all["cov"]), current_params=cur_params)
+    blended = blend_params(cur_params, proposed, LEARN_BLEND) if action in ("TIGHTEN", "RELAX") else cur_params
+
+    # escreve learned_params.json sempre (mesmo KEEP/NO_LEARN) — dá rastreabilidade
+    edge_val = None if edge_pp is None or (not np.isfinite(edge_pp)) else float(edge_pp)
+    save_learned_params(
+        version=1,
+        asof=week_end,
+        blend=LEARN_BLEND,
+        params=blended,
+        meta={
+            "action": action,
+            "edge_pp": edge_val,
+            "cov_used": int(m_all["cov"]),
+            "baseline_cov": int(m_base["cov"]),
+            "breakout_buffer_pct": BREAKOUT_BUFFER_PCT,
+            "notes": "Conservative weekly learning; daily reads params and blends gates."
+        }
+    )
+
+    # =========================
+    # persist weekly summary
+    # =========================
     append_weekly_summary({
         "week_end": week_end,
         "window_start": window_start,
@@ -709,30 +634,29 @@ def main():
         "edge_pp": (edge_pp if edge_pp is not None else ""),
 
         "regime_mode": regime_mode,
-        "breakout_buffer_pct": BREAKOUT_BUFFER_PCT,
 
-        "learn_cov_ok": (1 if learn["cov_ok"] else 0),
-        "learn_edge_pp": (learn["edge_pp"] if learn["edge_pp"] is not None else ""),
-        "learn_action": learn["action"],
-        "learn_dist_max_pct": lp.get("DIST_MAX_PCT", ""),
-        "learn_atrpctl_gate": lp.get("ATRPCTL_GATE", ""),
-        "learn_bbz_gate": lp.get("BBZ_GATE", "")
+        "learn_action": action,
+        "learn_edge_pp": (edge_pp if edge_pp is not None else ""),
+        "learn_cov_used": int(m_all["cov"]),
     })
 
     # PENDING (sem futuro suficiente)
-    pending_exec = max(0, len(w_exec) - int(m_exec["cov"] or 0))
-    pending_watch = max(0, len(w_watch) - int(m_all["cov"] or 0))
+    pending_exec = max(0, len(w_exec) - int(m_exec["cov"]))
+    pending_watch = max(0, len(w_watch) - int(m_all["cov"]))
+
+    # edge string safe (sem f-string aninhado)
+    edge_txt = "—" if edge_pp is None or (not np.isfinite(edge_pp)) else f"{edge_pp:+.1f}"
 
     # mensagem
     lines = []
     lines.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v7)")
     lines.append(f"Janela (lagged): {window_start} → {window_end}  (end=max(eval_day)-{HORIZON}d úteis)")
-    lines.append(f"Horizonte métricas: {HORIZON} sessões | breakout_buffer={BREAKOUT_BUFFER_PCT:.2f}%")
+    lines.append(f"Horizonte métricas: {HORIZON} sessões | breakout_buffer={BREAKOUT_BUFFER_PCT:.1f}%")
     lines.append("")
     lines.append(f"Sinais na janela: {len(w_exec) + len(w_watch)}")
     lines.append(f"• EXEC: {len(w_exec)} | WATCH: {len(w_watch)} (LIMPO: {len(w_watch_clean)} | TETO: {len(w_watch_over)})")
     if (pending_exec + pending_watch) > 0:
-        lines.append(f"• PENDING (sem futuro suficiente no OHLCV p/ horizonte): EXEC={pending_exec} WATCH={pending_watch}")
+        lines.append(f"• PENDING (sem futuro suficiente p/ horizonte): EXEC={pending_exec} WATCH={pending_watch}")
     lines.append("")
 
     lines.append(
@@ -763,43 +687,37 @@ def main():
     lines.append("")
     lines.append("🧪 BASELINE (cache-only; matched se possível):")
     if len(w_watch) == 0:
-        lines.append("BASE:  cov=0/0  S=—  MFE_med=—  MAE=—")
-        lines.append("EDGE:  —")
-    elif m_base["cov"] == 0:
-        lines.append(f"BASE:  cov=0/{len(w_watch)}  S=—  MFE_med=—  MAE=—")
-        lines.append("EDGE:  —")
+        lines.append("BASE: cov=0/0  S=—  MFE_med=—  MAE=—")
+        lines.append("EDGE: —")
+    elif int(m_base["cov"]) == 0:
+        lines.append(f"BASE: cov=0/{len(w_watch)}  S=—  MFE_med=—  MAE=—")
+        lines.append("EDGE: —")
     else:
         lines.append(
-            f"BASE:  cov={m_base['cov']}/{len(w_watch)}  "
+            f"BASE: cov={m_base['cov']}/{len(w_watch)}  "
             f"S={pct(m_base['succ'])}  "
             f"MFE_med={fmt_pct_from_ret(m_base['mfe_med'],1)}  "
             f"MAE={fmt_pct_from_ret(m_base['mae_mean'],1)}"
         )
-        lines.append(f"EDGE:  {edge_pp:+.0f}pp" if edge_pp is not None else "EDGE: —")
+        lines.append(f"EDGE: {edge_txt} pp")
 
     lines.append("")
-    lines.append("🤖 LEARNING:")
+    lines.append("🧠 LEARNING:")
+    lines.append(f"Action={action} | cov_used={int(m_all['cov'])} | edge_pp={edge_txt}")
     lines.append(
-        f"cov_ok={1 if learn['cov_ok'] else 0} | edge_pp={('—' if learn['edge_pp'] is None else f'{learn['edge_pp']:+.1f}')} | action={learn['action']}"
-    )
-    lines.append(
-        f"params -> DIST_MAX_PCT={lp.get('DIST_MAX_PCT', DEFAULTS['DIST_MAX_PCT']):.2f} | "
-        f"ATRPCTL_GATE={lp.get('ATRPCTL_GATE', DEFAULTS['ATRPCTL_GATE']):.3f} | "
-        f"BBZ_GATE={lp.get('BBZ_GATE', DEFAULTS['BBZ_GATE']):.3f}"
+        f"learned_params.json → DIST_MAX_PCT={blended['DIST_MAX_PCT']:.1f} | "
+        f"ATRPCTL_GATE={blended['ATRPCTL_GATE']:.2f} | BBZ_GATE={blended['BBZ_GATE']:.2f} | "
+        f"VOL_CONFIRM_MULT={blended['VOL_CONFIRM_MULT']:.2f}"
     )
 
-    lines.append("")
-    lines.append("🧭 REGIME (WATCH success):")
-    lines.append(f"{regime_mode}: {pct(m_all['succ'])}")
     lines.append("")
     lines.append(f"✅ SANITY: {sanity}")
     lines.append("")
     lines.append(rolling_txt)
     lines.append("")
-    lines.append("Ações:")
-    lines.append("• weekly_summary.csv actualizado (base para decisões).")
-    lines.append("• learned_params.json actualizado (se cov_ok=1).")
-    lines.append("• Nota: o daily só melhora se o scanner.py ler learned_params.json (overrides).")
+    lines.append("Notas:")
+    lines.append("• Aprendizagem só mexe nos gates se houver cobertura suficiente (LEARN_MIN_COV).")
+    lines.append("• Ajustes são conservadores (LEARN_BLEND<=0.50) e o daily ainda faz blending adicional.")
 
     tg_send("\n".join(lines))
 
