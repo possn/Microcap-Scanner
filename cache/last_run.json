@@ -1,12 +1,12 @@
 {
-  "run_utc": "2026-02-19 14:16 UTC",
-  "asof": "2026-02-18",
+  "run_utc": "2026-02-20 14:06 UTC",
+  "asof": "2026-02-19",
   "mode": "TRANSITION",
   "eval": 450,
   "counts": {
     "exec_b": 0,
     "exec_a": 0,
-    "watch_clean": 3,
+    "watch_clean": 1,
     "watch_over": 7,
     "nodata": 0,
     "cache_used": 0,
