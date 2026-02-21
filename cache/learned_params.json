@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "asof": "2026-02-03",
+  "asof": "2026-02-12",
   "blend": 0.25,
   "params": {
     "DIST_MAX_PCT": 18.0,
@@ -10,9 +10,9 @@
   },
   "meta": {
     "action": "NO_LEARN",
-    "edge_pp": -6.2678062678062645,
-    "cov_used": 26,
-    "baseline_cov": 27,
+    "edge_pp": null,
+    "cov_used": 39,
+    "baseline_cov": 0,
     "breakout_buffer_pct": 0.5,
     "notes": "Conservative weekly learning; daily reads params and blends gates."
   }
