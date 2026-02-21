@@ -1,12 +1,9 @@
-# weekly_eval.py — QUANT v7.2 (SCHEMA FIXO + LAGGED WINDOW + BASELINE ROBUSTO + AUTO-LEARNING COM GUARDRAILS)
+# weekly_eval.py — QUANT v7.3 (SCHEMA FIXO + LAGGED WINDOW + BASELINE ROBUSTO (STALENESS-SAFE) + AUTO-LEARNING COM GUARDRAILS)
 # - Lê cache/signals.csv + cache/ohlcv/*.csv
-# - Calcula métricas semanais em janela "lagged" (evita cov=0 por falta de futuro)
-# - Escreve cache/weekly_summary.csv com colunas fixas (e valida header; LOUD FAIL se mismatch)
+# - Calcula métricas semanais em janela "lagged"
+# - Escreve cache/weekly_summary.csv (colunas fixas; LOUD FAIL se header mismatch)
 # - Atualiza cache/learned_params.json (aprendizagem conservadora, só se baseline válido)
 # - Envia resumo para Telegram
-#
-# Política: se weekly_summary.csv existir e tiver header diferente => FAIL (job vermelho).
-# Isto evita corrupção silenciosa do histórico.
 
 import os
 import csv
@@ -30,19 +27,17 @@ SIGNALS_CSV = Path("cache") / "signals.csv"
 SUMMARY_CSV = Path("cache") / "weekly_summary.csv"
 LEARNED_JSON = Path("cache") / "learned_params.json"
 
-HORIZON = int(os.environ.get("WEEKLY_HORIZON_SESS", "5"))  # sessões úteis para métricas
+HORIZON = int(os.environ.get("WEEKLY_HORIZON_SESS", "5"))
 CLEAN_MAX_OH = int(os.environ.get("WATCH_OVERHEAD_CLEAN_MAX", "5"))
-WINDOW_DAYS = 5  # sempre 5 dias úteis
+WINDOW_DAYS = 5
 
-# learning knobs
-BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.5"))  # buffer p/ trig (evita falsos)
-LEARN_MIN_COV = int(os.environ.get("LEARN_MIN_COV", "30"))                 # cobertura mínima para aprender
-LEARN_BLEND = float(os.environ.get("LEARN_BLEND", "0.25"))                 # 0..0.5 (conservador)
-LEARN_STEP_DIST = float(os.environ.get("LEARN_STEP_DIST", "1.0"))          # pontos percentuais
-LEARN_STEP_ATR = float(os.environ.get("LEARN_STEP_ATR", "0.02"))           # 0.xx
-LEARN_STEP_BBZ = float(os.environ.get("LEARN_STEP_BBZ", "0.05"))           # z-score units
+BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.5"))
+LEARN_MIN_COV = int(os.environ.get("LEARN_MIN_COV", "30"))
+LEARN_BLEND = float(os.environ.get("LEARN_BLEND", "0.25"))
+LEARN_STEP_DIST = float(os.environ.get("LEARN_STEP_DIST", "1.0"))
+LEARN_STEP_ATR = float(os.environ.get("LEARN_STEP_ATR", "0.02"))
+LEARN_STEP_BBZ = float(os.environ.get("LEARN_STEP_BBZ", "0.05"))
 
-# defaults (devem bater com o daily)
 DEFAULT_PARAMS = {
     "DIST_MAX_PCT": 18.0,
     "ATRPCTL_GATE": 0.50,
@@ -51,8 +46,8 @@ DEFAULT_PARAMS = {
 }
 
 # baseline guardrails
-BASELINE_MIN_COV_RATIO = 0.80  # baseline_cov tem de cobrir pelo menos 80% de WATCH count
-BASELINE_NOFALLBACK_REQUIRED = True  # se houve fallback, não aprende
+BASELINE_MIN_COV_RATIO = 0.80
+BASELINE_NOFALLBACK_REQUIRED = True  # se fallback==1, não aprende
 
 # =========================
 # TELEGRAM
@@ -95,7 +90,7 @@ def load_ohlcv(ticker: str) -> pd.DataFrame | None:
         return None
 
 # =========================
-# weekly_summary schema FIXO (v7.2)
+# weekly_summary schema FIXO
 # =========================
 SUMMARY_HEADER = [
     "week_end","window_start","window_end","horizon",
@@ -116,10 +111,6 @@ def _read_first_line(path: Path) -> str:
         return f.readline().strip("\n").strip("\r").strip()
 
 def weekly_summary_ensure_schema_loud_fail() -> None:
-    """
-    Se o CSV existir e o header não for EXACTAMENTE o esperado, falha o job.
-    Nunca reescreve em silêncio.
-    """
     ensure_parent(SUMMARY_CSV)
     if not SUMMARY_CSV.exists():
         with SUMMARY_CSV.open("w", newline="", encoding="utf-8") as f:
@@ -129,7 +120,6 @@ def weekly_summary_ensure_schema_loud_fail() -> None:
 
     first = _read_first_line(SUMMARY_CSV)
     expected = ",".join(SUMMARY_HEADER)
-
     if first != expected:
         tg_send(
             "WEEKLY REVIEW: FAIL — weekly_summary.csv header mismatch.\n"
@@ -218,12 +208,6 @@ def mfe_mae_from_entry(df: pd.DataFrame, pos: int, horizon: int, entry: float) -
 # Evaluation row
 # =========================
 def eval_watch_row(row: pd.Series, horizon: int, breakout_buffer_pct: float) -> dict:
-    """
-    covered=1 apenas se existir futuro suficiente (pos + horizon < len(df))
-    Sucesso: algum close > trig*(1+buffer) no horizonte
-    H1: close_{+1} > trig*(1+buffer)
-    Fail-fast: close < stop em <=2 sessões
-    """
     out = {"covered": 0, "success": 0, "h1": 0, "ff": 0, "mfe": None, "mae": None}
 
     t = str(row.get("ticker", "")).strip().upper()
@@ -249,9 +233,9 @@ def eval_watch_row(row: pd.Series, horizon: int, breakout_buffer_pct: float) -> 
     out["covered"] = 1
 
     trig_eff = trig * (1.0 + breakout_buffer_pct / 100.0)
-
     end = pos + horizon
     future = df.iloc[pos:end+1]["close"].values
+
     out["success"] = 1 if np.any(future > trig_eff) else 0
     out["h1"] = 1 if float(df["close"].iloc[pos+1]) > trig_eff else 0
 
@@ -291,7 +275,7 @@ def aggregate_metrics(rows_eval: list[dict]) -> dict:
     return {"cov": cov, "succ": succ, "h1": h1, "ff": ff, "mfe_med": mfe_med, "mae_mean": mae_mean}
 
 # =========================
-# BASELINE (cache-only; matching por dist% se possível; fallback robusto)
+# BASELINE (staleness-safe)
 # =========================
 def baseline_sample(
     dist_targets: list[float],
@@ -303,13 +287,10 @@ def baseline_sample(
     """
     Retorna (picked_rows, dbg):
       dbg = {files, picked, fallback}
-    Baseline aproximado (cache-only):
-      - escolhe tickers aleatórios do cache/ohlcv
-      - trig_baseline = max(close últimos 20 dias antes do window_end)
-      - dist% = (trig - close)/close
-      - matching por buckets se dist_targets>=6
-      - se matching falhar (poucos picked), faz fallback sem matching para completar k
-      - métricas iguais a WATCH (success/h1/ff/mfe/mae)
+
+    FIX v7.3:
+    - Escolhe sempre pos <= pos_cap=(len(df)-horizon-1) para garantir futuro.
+    - Se o cache estiver "stale" e não tiver data >= window_end, ainda assim consegue escolher um pos válido.
     """
     dbg = {"files": 0, "picked": 0, "fallback": 0}
 
@@ -320,6 +301,7 @@ def baseline_sample(
     dbg["files"] = len(files)
     if not files:
         return ([], dbg)
+
     random.shuffle(files)
 
     tt = [x for x in dist_targets if np.isfinite(x)]
@@ -345,79 +327,85 @@ def baseline_sample(
         want = {b: target_buckets.count(b) for b in [0, 1, 2, 3]}
         got = {0: 0, 1: 0, 2: 0, 3: 0}
 
-    def _try_pick(files_iter, enforce_matching: bool) -> list[dict]:
+    def _pick_one(df: pd.DataFrame, enforce_matching: bool) -> dict | None:
+        if df is None or len(df) < (horizon + 30):
+            return None
+
+        pos_cap = len(df) - horizon - 1
+        if pos_cap < 25:
+            return None
+
+        # pos candidato baseado em window_end (ou último <= window_end)
+        pos0 = find_pos_best_effort(df, window_end.normalize())
+        if pos0 is None:
+            return None
+
+        pos = int(min(pos0, pos_cap))
+        if pos < 25:
+            return None
+
+        close0 = float(df["close"].iloc[pos])
+        if close0 <= 0:
+            return None
+
+        trig = float(df["close"].iloc[pos-20:pos].max())
+        if trig <= 0:
+            return None
+
+        dist = (trig - close0) / close0 * 100.0
+        if not np.isfinite(dist):
+            return None
+
+        if enforce_matching and use_matching and bucket and want and got:
+            b = bucket(dist)
+            if got[b] >= want.get(b, 0):
+                return None
+        else:
+            b = None
+
+        trig_eff = trig * (1.0 + breakout_buffer_pct / 100.0)
+        end = pos + horizon
+        future = df.iloc[pos:end+1]["close"].values
+
+        success = 1 if np.any(future > trig_eff) else 0
+        h1 = 1 if float(df["close"].iloc[pos+1]) > trig_eff else 0
+
+        ff = 0
+        stop = float(df["close"].iloc[pos-10:pos].min()) * 0.95
+        for j in [pos+1, pos+2]:
+            if j < len(df) and float(df["close"].iloc[j]) < stop:
+                ff = 1
+                break
+
+        mfe, mae = mfe_mae_from_entry(df, pos, horizon, close0)
+
+        if enforce_matching and use_matching and got is not None and b is not None:
+            got[b] += 1
+
+        return {"covered": 1, "success": success, "h1": h1, "ff": ff, "mfe": mfe, "mae": mae}
+
+    def _run(files_iter, enforce_matching: bool) -> list[dict]:
         picked: list[dict] = []
         tries = 0
-
         for p in files_iter:
             if len(picked) >= k:
                 break
             tries += 1
-            if tries > 3000:
+            if tries > 4000:
                 break
-
             t = p.stem.upper()
             df = load_ohlcv(t)
-            if df is None or len(df) < 80:
-                continue
-
-            pos = find_pos_best_effort(df, window_end.normalize())
-            if pos is None or pos < 25:
-                continue
-
-            if pos + horizon >= len(df):
-                continue
-
-            close0 = float(df["close"].iloc[pos])
-            if close0 <= 0:
-                continue
-
-            trig = float(df["close"].iloc[pos-20:pos].max())
-            if trig <= 0:
-                continue
-
-            dist = (trig - close0) / close0 * 100.0
-            if not np.isfinite(dist):
-                continue
-
-            if enforce_matching and use_matching and bucket and want and got:
-                b = bucket(dist)
-                if got[b] >= want.get(b, 0):
-                    continue
-
-            trig_eff = trig * (1.0 + breakout_buffer_pct / 100.0)
-            end = pos + horizon
-            future = df.iloc[pos:end+1]["close"].values
-
-            success = 1 if np.any(future > trig_eff) else 0
-            h1 = 1 if float(df["close"].iloc[pos+1]) > trig_eff else 0
-
-            ff = 0
-            stop = float(df["close"].iloc[pos-10:pos].min()) * 0.95  # stop baseline genérico
-            for j in [pos+1, pos+2]:
-                if j < len(df) and float(df["close"].iloc[j]) < stop:
-                    ff = 1
-                    break
-
-            mfe, mae = mfe_mae_from_entry(df, pos, horizon, close0)
-
-            picked.append({"covered": 1, "success": success, "h1": h1, "ff": ff, "mfe": mfe, "mae": mae})
-
-            if enforce_matching and use_matching and got is not None:
-                got[b] += 1
-
+            item = _pick_one(df, enforce_matching=enforce_matching)
+            if item is not None:
+                picked.append(item)
         return picked
 
-    # Passo 1: matching (se possível)
-    picked = _try_pick(files, enforce_matching=True) if use_matching else _try_pick(files, enforce_matching=False)
+    picked = _run(files, enforce_matching=use_matching)
 
-    # Fallback: se matching não completou k, tenta completar sem matching
     if len(picked) < k and use_matching:
         dbg["fallback"] = 1
         remaining = k - len(picked)
-        # reset got para não bloquear
-        picked2 = _try_pick(files, enforce_matching=False)
-        # junta sem duplicar “covered rows” (não temos ticker no dict; aceitamos aproximação)
+        picked2 = _run(files, enforce_matching=False)
         picked.extend(picked2[:remaining])
 
     dbg["picked"] = len(picked)
@@ -450,13 +438,6 @@ def save_learned_params(version: int, asof: str, blend: float, params: dict, met
     LEARNED_JSON.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 def propose_learning_update(edge_pp: float | None, cov: int, current_params: dict) -> tuple[str, dict]:
-    """
-    Política conservadora:
-    - Só propõe mudança se cov >= LEARN_MIN_COV e edge_pp válido.
-    - Se edge_pp < 0: tornar gates ligeiramente MAIS estritos.
-    - Se edge_pp > +5: relaxar ligeiramente.
-    - Caso contrário: KEEP.
-    """
     if edge_pp is None or (not np.isfinite(edge_pp)) or cov < LEARN_MIN_COV:
         return ("NO_LEARN", current_params)
 
@@ -468,14 +449,14 @@ def propose_learning_update(edge_pp: float | None, cov: int, current_params: dic
     if edge_pp < 0:
         dist = _clamp(dist - LEARN_STEP_DIST, 10.0, 30.0)
         atrg = _clamp(atrg - LEARN_STEP_ATR, 0.25, 0.65)
-        bbzg = _clamp(bbzg - LEARN_STEP_BBZ, -2.50, -0.10)  # mais negativo = mais estrito
+        bbzg = _clamp(bbzg - LEARN_STEP_BBZ, -2.50, -0.10)
         volm = _clamp(volm + 0.01, 1.05, 1.40)
         return ("TIGHTEN", {"DIST_MAX_PCT": dist, "ATRPCTL_GATE": atrg, "BBZ_GATE": bbzg, "VOL_CONFIRM_MULT": volm})
 
     if edge_pp > 5:
         dist = _clamp(dist + LEARN_STEP_DIST, 10.0, 30.0)
         atrg = _clamp(atrg + LEARN_STEP_ATR, 0.25, 0.65)
-        bbzg = _clamp(bbzg + LEARN_STEP_BBZ, -2.50, -0.10)  # menos negativo = mais permissivo
+        bbzg = _clamp(bbzg + LEARN_STEP_BBZ, -2.50, -0.10)
         volm = _clamp(volm - 0.01, 1.05, 1.40)
         return ("RELAX", {"DIST_MAX_PCT": dist, "ATRPCTL_GATE": atrg, "BBZ_GATE": bbzg, "VOL_CONFIRM_MULT": volm})
 
@@ -543,7 +524,6 @@ def main() -> None:
     w = sig[(sig["eval_day"] >= lag_start) & (sig["eval_day"] <= lag_end)].copy()
 
     if w.empty:
-        # fallback: últimos 5 dias únicos disponíveis
         u = pd.to_datetime(sig["eval_day"], errors="coerce").dropna().dt.normalize().unique()
         u = sorted(u)
         if not u:
@@ -582,7 +562,6 @@ def main() -> None:
     m_over = aggregate_metrics(eval_over)
     m_exec = aggregate_metrics(eval_exec)
 
-    # baseline (+ dbg)
     dist_targets = w_watch["dist_pct"].dropna().tolist()
     baseline_rows, base_dbg = baseline_sample(
         dist_targets=dist_targets,
@@ -597,7 +576,6 @@ def main() -> None:
     if (int(m_base["cov"]) and int(m_all["cov"]) and (m_base["succ"] is not None) and (m_all["succ"] is not None)):
         edge_pp = (float(m_all["succ"]) - float(m_base["succ"])) * 100.0
 
-    # rolling-4
     hist = read_weekly_summary()
     rolling_txt = "📈 ROLLING-4: sem histórico (weekly_summary.csv vazio)."
     if hist is not None and (not hist.empty):
@@ -621,14 +599,10 @@ def main() -> None:
         except Exception:
             rolling_txt = "📈 ROLLING-4: histórico existe mas parsing falhou (ver CSV)."
 
-    # SANITY
     sanity = "OK"
     if w_watch.empty and w_exec.empty:
         sanity = "WARN (sem sinais WATCH/EXEC na janela)"
 
-    # =========================
-    # AUTO-LEARNING (com guardrails)
-    # =========================
     learned = load_learned_params()
     cur_params = DEFAULT_PARAMS.copy()
     if isinstance(learned.get("params", None), dict):
@@ -638,7 +612,6 @@ def main() -> None:
             except Exception:
                 pass
 
-    # baseline validity
     watch_n = int(len(w_watch))
     base_cov = int(m_base["cov"])
     base_cov_ratio = (base_cov / watch_n) if watch_n > 0 else 0.0
@@ -658,7 +631,7 @@ def main() -> None:
             action = action0
         else:
             blended = cur_params
-            action = action0  # KEEP ou NO_LEARN
+            action = action0
 
     save_learned_params(
         version=1,
@@ -674,13 +647,10 @@ def main() -> None:
             "baseline_cov_ratio": round(base_cov_ratio, 4),
             "baseline_fallback": int(base_dbg.get("fallback", 0)),
             "breakout_buffer_pct": BREAKOUT_BUFFER_PCT,
-            "notes": "Weekly learning with baseline validity guardrails; daily reads params and blends gates."
+            "notes": "Weekly learning with baseline validity guardrails; baseline is staleness-safe (pos<=len-horizon-1)."
         }
     )
 
-    # =========================
-    # persist weekly summary (LOUD header check inside)
-    # =========================
     append_weekly_summary({
         "week_end": week_end,
         "window_start": window_start,
@@ -725,13 +695,11 @@ def main() -> None:
         "learn_cov_used": int(m_all["cov"]),
     })
 
-    # PENDING
     pending_exec = max(0, len(w_exec) - int(m_exec["cov"]))
     pending_watch = max(0, len(w_watch) - int(m_all["cov"]))
 
     edge_txt = "—" if edge_val is None else f"{edge_val:+.1f}"
 
-    # baseline string
     if len(w_watch) == 0:
         base_line = "BASE: cov=0/0  S=—  MFE_med=—  MAE=—"
         edge_line = "EDGE: —"
@@ -747,9 +715,8 @@ def main() -> None:
         )
         edge_line = f"EDGE: {edge_txt} pp"
 
-    # mensagem
     lines: list[str] = []
-    lines.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v7.2)")
+    lines.append("📊 MICROCAP BREAKOUT — WEEKLY REVIEW (QUANT v7.3)")
     lines.append(f"Janela (lagged): {window_start} → {window_end}  (end=max(eval_day)-{HORIZON}d úteis)")
     lines.append(f"Horizonte métricas: {HORIZON} sessões | breakout_buffer={BREAKOUT_BUFFER_PCT:.1f}%")
     lines.append("")
@@ -814,9 +781,9 @@ def main() -> None:
     lines.append(rolling_txt)
     lines.append("")
     lines.append("Notas:")
-    lines.append("• weekly_summary.csv: schema fixo e LOUD FAIL se header não bater (evita corrupção silenciosa).")
+    lines.append("• weekly_summary.csv: schema fixo e LOUD FAIL se header não bater.")
+    lines.append("• Baseline é staleness-safe: escolhe sempre pos<=len-horizon-1 para garantir futuro.")
     lines.append("• Aprendizagem só mexe nos gates se houver cobertura suficiente e baseline válido (sem fallback).")
-    lines.append("• Ajustes são conservadores (LEARN_BLEND<=0.50); o daily ainda faz blending adicional.")
 
     tg_send("\n".join(lines))
 
