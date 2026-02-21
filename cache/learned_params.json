@@ -9,17 +9,14 @@
     "VOL_CONFIRM_MULT": 1.1225
   },
   "meta": {
-    "action": "TIGHTEN",
-    "edge_pp": -12.05128205128205,
+    "action": "NO_LEARN",
+    "edge_pp": null,
     "cov_used": 39,
-    "baseline_cov": 40,
+    "watch_count": 40,
+    "baseline_cov": 0,
+    "baseline_cov_ratio": 0.0,
+    "baseline_fallback": 1,
     "breakout_buffer_pct": 0.5,
-    "base_dbg": {
-      "ohlcv_files": 712,
-      "tries": 712,
-      "picked": 40,
-      "fallback_used": 1
-    },
-    "notes": "Conservative weekly learning; daily reads params and blends gates."
+    "notes": "Weekly learning with baseline validity guardrails; daily reads params and blends gates."
   }
 }
