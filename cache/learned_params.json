@@ -3,20 +3,20 @@
   "asof": "2026-02-12",
   "blend": 0.25,
   "params": {
-    "DIST_MAX_PCT": 17.75,
-    "ATRPCTL_GATE": 0.495,
-    "BBZ_GATE": -0.6124999999999999,
-    "VOL_CONFIRM_MULT": 1.1225
+    "DIST_MAX_PCT": 17.5,
+    "ATRPCTL_GATE": 0.49,
+    "BBZ_GATE": -0.625,
+    "VOL_CONFIRM_MULT": 1.125
   },
   "meta": {
-    "action": "NO_LEARN",
-    "edge_pp": null,
+    "action": "TIGHTEN",
+    "edge_pp": -9.551282051282053,
     "cov_used": 39,
     "watch_count": 40,
-    "baseline_cov": 0,
-    "baseline_cov_ratio": 0.0,
-    "baseline_fallback": 1,
+    "baseline_cov": 40,
+    "baseline_cov_ratio": 1.0,
+    "baseline_fallback": 0,
     "breakout_buffer_pct": 0.5,
-    "notes": "Weekly learning with baseline validity guardrails; daily reads params and blends gates."
+    "notes": "Weekly learning with baseline validity guardrails; baseline is staleness-safe (pos<=len-horizon-1)."
   }
 }
