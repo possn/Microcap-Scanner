@@ -3,6 +3,7 @@ name: microcap-weekly-eval
 on:
   workflow_dispatch: {}
   schedule:
+    # Sábado 02:00 UTC
     - cron: "0 2 * * 6"
 
 permissions:
