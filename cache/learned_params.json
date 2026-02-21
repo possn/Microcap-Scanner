@@ -3,17 +3,23 @@
   "asof": "2026-02-12",
   "blend": 0.25,
   "params": {
-    "DIST_MAX_PCT": 18.0,
-    "ATRPCTL_GATE": 0.5,
-    "BBZ_GATE": -0.6,
-    "VOL_CONFIRM_MULT": 1.12
+    "DIST_MAX_PCT": 17.75,
+    "ATRPCTL_GATE": 0.495,
+    "BBZ_GATE": -0.6124999999999999,
+    "VOL_CONFIRM_MULT": 1.1225
   },
   "meta": {
-    "action": "NO_LEARN",
-    "edge_pp": null,
+    "action": "TIGHTEN",
+    "edge_pp": -12.05128205128205,
     "cov_used": 39,
-    "baseline_cov": 0,
+    "baseline_cov": 40,
     "breakout_buffer_pct": 0.5,
+    "base_dbg": {
+      "ohlcv_files": 712,
+      "tries": 712,
+      "picked": 40,
+      "fallback_used": 1
+    },
     "notes": "Conservative weekly learning; daily reads params and blends gates."
   }
 }
