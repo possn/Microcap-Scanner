@@ -59,6 +59,8 @@ jobs:
 
           git pull --rebase || true
 
-          git add cache/weekly_summary.csv cache/learned_params.json || true
+          # Força add (mesmo se algo estiver em .gitignore)
+          git add -f cache/weekly_summary.csv cache/learned_params.json || true
+
           git commit -m "Update weekly outputs (weekly_summary + learned_params)" || exit 0
           git push
