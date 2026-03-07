@@ -133,7 +133,6 @@ def tg_send(cfg: Config, text: str) -> None:
         payload = {
             "chat_id": cfg.tg_chat_id,
             "text": chunk,
-            "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
         try:
@@ -455,9 +454,11 @@ def dryup_ratio(df: pd.DataFrame) -> float:
         return np.nan
     # ratio base (compatível com DRYUP_MAX gate existente)
     ratio = v_w1 / v60
-    # V9 B: penalizar se a tendência não é progressivamente decrescente
-    if not (v_w1 < v_w2 < v_w3):
-        ratio = ratio * 1.25  # eleva ratio artificialmente -> vai falhar o gate
+    # V9 B: penalizar levemente se tendência não é progressivamente decrescente
+    # Penalização suave (1.12x) para não ser demasiado restritivo
+    # Só penaliza se o volume mais recente (w1) subiu vs semana anterior (w2)
+    if v_w1 > v_w2:
+        ratio = ratio * 1.12  # volume a subir de novo -> sinal negativo
     return ratio
 
 def overhead_supply_touches(df: pd.DataFrame, trig: float, cfg: Config) -> int:
@@ -1028,16 +1029,16 @@ def main() -> None:
     if total_props < cfg.min_daily_proposals and near_relax:
         nr_sorted = sorted(near_relax, key=lambda x: (-float(x[3]) if np.isfinite(x[3]) else 0.0, str(x[1])))
         nr_sorted = nr_sorted[:cfg.watch_relax_top]
-        watch_relax_lines.append(f"⚙️ WATCH_RELAX (propostas &lt; {cfg.min_daily_proposals}):")
+        watch_relax_lines.append(f"WATCH_RELAX (propostas < {cfg.min_daily_proposals}):")
         for reason, t, c, dv, bbz, atrp in nr_sorted:
             watch_relax_lines.append(f"  {t} | {reason} | {c:.2f} | dv={dv/1e6:.1f}M | BBz={bbz:.2f}")
 
     # --- Compose message (HTML para Telegram) ---
     def fmt_exec(items, label):
-        lines = [f"<b>{label}</b>"]
+        lines = [f"--- {label} ---"]
         for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in items:
             lines.append(
-                f"  <code>{t}</code> sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% dv={dv/1e6:.1f}M "
+                f"  {t} sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% dv={dv/1e6:.1f}M "
                 f"BBz={bbz:.2f} trig={trig:.2f} stp={stop:.2f} R%={Rp:.1f} ovr={over:.1f}% vx={vm:.2f} oh={oh} b{win}"
             )
         return "\n".join(lines)
@@ -1052,19 +1053,19 @@ def main() -> None:
             if Rp >= 12: p += 1
             return (p, sc)
         items = sorted(items, key=prio, reverse=True)
-        lines = [f"<b>{label}</b>"]
+        lines = [f"--- {label} ---"]
         for x in items:
             sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
             p, _ = prio(x)
             em = "🔥" if p == 4 else "✅" if p == 3 else "⚠️" if p == 2 else "❌"
             lines.append(
-                f"  {em} <code>{t}</code> P={p}/4 sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% "
+                f"  {em} {t} P={p}/4 sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% "
                 f"dv={dv/1e6:.1f}M BBz={bbz:.2f} trig={trig:.2f} R%={Rp:.1f} oh={oh}"
             )
         return "\n".join(lines)
 
     msg_parts = [
-        f"📊 <b>V9 Scanner | {now}</b>",
+        f"=== V9 Scanner | {now} ===",
         f"ASOF={asof_str_global} | Modo={mode} | QQQ={reg['qqq_trend']} VIX={reg['vix_trend']}",
         f"Eval={len(tickers)} hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok}",
         f"ExecB={len(execB)} ExecA={len(execA)} WClean={len(watch_clean)} WOver={len(watch_over)}",
