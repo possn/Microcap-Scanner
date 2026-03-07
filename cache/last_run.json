@@ -1,5 +1,5 @@
 {
-  "run_utc": "2026-03-07 23:04 UTC",
+  "run_utc": "2026-03-07 23:42 UTC",
   "asof": "2026-03-06",
   "mode": "TRANSITION",
   "eval": 450,
@@ -13,12 +13,10 @@
     "cache_miss": 0
   },
   "gates": {
-    "bbz_gate": -0.60625,
-    "atrpctl_gate": 0.4975,
-    "dist_max_pct": 17.875,
-    "vol_confirm_mult_base": 1.12125,
-    "used": true,
-    "blend": 0.25,
-    "learned_ts": ""
+    "bbz_gate": -0.6,
+    "atrpctl_gate": 0.5,
+    "dist_max_pct": 12.0,
+    "vol_confirm_mult_base": 1.12,
+    "used": false
   }
 }
