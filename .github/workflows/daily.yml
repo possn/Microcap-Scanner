@@ -34,6 +34,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Reset learned params (força defaults V9)
+        run: rm -f cache/learned_params.json
+
       - name: Run scanner (pre-open, EOD prior day)
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -66,7 +69,7 @@ jobs:
 
           VOL_CONFIRM_MULT: "1.12"
           MAX_GAP_UP: "1.14"
-          DIST_MAX_PCT: "18.0"
+          DIST_MAX_PCT: "12.0"
           EXEC_MAX_OVERSHOOT_PCT: "8.0"
 
           EXEC_BBZ_MAX: "-0.90"
@@ -81,9 +84,13 @@ jobs:
           WATCH_BOOST_MIN_DAYS: "3"
           WATCH_STALE_DAYS: "10"
 
+          BASE_POSITION_MIN: "0.65"
+          RS20_MIN: "-0.05"
+
           HORIZON_SESS: "40"
           REG_QQQ: "QQQ"
-          REG_VIX: "VIX"
+          REG_VIX: "^VIX"
+
         run: |
           python scanner.py
 
