@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "asof": "2026-02-19",
+  "asof": "2026-02-26",
   "blend": 0.25,
   "params": {
     "DIST_MAX_PCT": 17.5,
@@ -10,10 +10,10 @@
   },
   "meta": {
     "action": "KEEP",
-    "edge_pp": 0.8704061895551257,
-    "cov_used": 44,
-    "watch_count": 47,
-    "baseline_cov": 47,
+    "edge_pp": 0.7786429365962189,
+    "cov_used": 58,
+    "watch_count": 62,
+    "baseline_cov": 62,
     "baseline_cov_ratio": 1.0,
     "baseline_fallback": 0,
     "breakout_buffer_pct": 0.5,
