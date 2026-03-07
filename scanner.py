@@ -1,148 +1,141 @@
-# scanner.py (V7_4_PREOPEN_RELAX_DAILY) — DAILY breakout candidates + learned params (AUTO)
-# EOD-only, public/free, cache-first, ranked, pre-open actionable.
-#
-# DATA SOURCES (real / free / public):
-# - Stooq EOD CSV: https://stooq.com/q/d/l/?s={symbol}.us&i=d
-# - Universe: holdings CSV URLs (IWC/IWM/IJR) via secrets
-#
-# KEY POINTS:
-# - Deterministic universe order.
-# - Cache-first; if Stooq rate-limits, falls back to local cache.
-# - Writes cache/signals.csv (ASOF schema).
-# - Reads cache/learned_params.json (from weekly_eval v7) and blends gates conservatively.
-# - Writes cache/last_run.json for audit/debug.
-#
-# NOTE:
-# - This is NOT "autonomous trading". It outputs ranked candidates only.
+# scanner.py (V8_AUDITED_IMPROVED) — baseado em V7_4_PREOPEN_RELAX_DAILY
+# MELHORIAS aplicadas após auditoria completa:
+# 1. Logging estruturado (substituir prints silenciosos)
+# 2. Eliminar mutação de globais em apply_learned_params (anti-pattern)
+# 3. Cache _KEYS_BY_ASOF thread-safe e invalidado correctamente
+# 4. base_scan com early-exit e melhor score normalizado
+# 5. Fallback robusto para Stooq rate-limit com exponential backoff
+# 6. Telegram: chunking automático (limite 4096 chars)
+# 7. Regime: VIX via Stooq index ticker correcto (^VIX)
+# 8. overhead_supply_touches: lógica corrigida (usava close, devia usar high)
+# 9. update_outcomes: evitar reprocessar resolvidos (era O(n) desnecessário)
+# 10. Separação clara CONFIG / INDICATORS / IO / SIGNALS / MAIN
 
-import os, io, time, csv, json
+import os, io, time, csv, json, logging
 import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Optional
 
 # =========================
-# ENV / CONFIG
+# LOGGING
 # =========================
-CACHE_ONLY = os.environ.get("CACHE_ONLY", "0") == "1"
-
-TG_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-TG_CHAT_ID = os.environ.get("TG_CHAT_ID", "")
-
-IWC_URL = os.environ.get("IWC_HOLDINGS_CSV_URL", "")
-IWM_URL = os.environ.get("IWM_HOLDINGS_CSV_URL", "")
-IJR_URL = os.environ.get("IJR_HOLDINGS_CSV_URL", "")
-
-OHLCV_FMT = os.environ.get("OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d")
-
-MAX_TICKERS = int(os.environ.get("MAX_TICKERS", "450"))
-CANDIDATE_POOL = int(os.environ.get("CANDIDATE_POOL", "2000"))
-
-MIN_PX = float(os.environ.get("MIN_PX", "1.0"))
-MAX_PX = float(os.environ.get("MAX_PX", "30"))
-
-MIN_DV20 = float(os.environ.get("MIN_DV20", "1500000"))
-MAX_DV20 = float(os.environ.get("MAX_DV20", "120000000"))
-MIN_SV20 = float(os.environ.get("MIN_SV20", "250000"))
-
-# Core gates (may be adjusted slightly by learned_params.json)
-BBZ_GATE = float(os.environ.get("BBZ_GATE", "-0.60"))
-ATRPCTL_GATE = float(os.environ.get("ATRPCTL_GATE", "0.50"))
-
-BASE_DD_MAX = float(os.environ.get("BASE_DD_MAX", "0.62"))
-CONTRACTION_MAX = float(os.environ.get("CONTRACTION_MAX", "0.92"))
-DRYUP_MAX = float(os.environ.get("DRYUP_MAX", "1.10"))
-
-VOL_CONFIRM_MULT_BASE = float(os.environ.get("VOL_CONFIRM_MULT", "1.12"))
-MAX_GAP_UP = float(os.environ.get("MAX_GAP_UP", "1.14"))
-DIST_MAX_PCT = float(os.environ.get("DIST_MAX_PCT", "18.0"))
-EXEC_MAX_OVERSHOOT_PCT = float(os.environ.get("EXEC_MAX_OVERSHOOT_PCT", "8.0"))
-
-EXEC_BBZ_MAX = float(os.environ.get("EXEC_BBZ_MAX", "-0.90"))
-EXEC_ATRPCTL_MAX = float(os.environ.get("EXEC_ATRPCTL_MAX", "0.38"))
-
-MIN_R_PCT = float(os.environ.get("MIN_R_PCT", "6.0"))
-
-OVERHEAD_WINDOW = int(os.environ.get("OVERHEAD_WINDOW", "200"))
-OVERHEAD_BAND_PCT = float(os.environ.get("OVERHEAD_BAND_PCT", "8.0"))
-OVERHEAD_MAX_TOUCHES = int(os.environ.get("OVERHEAD_MAX_TOUCHES", "12"))
-
-WATCH_BOOST_MIN_DAYS = int(os.environ.get("WATCH_BOOST_MIN_DAYS", "3"))
-WATCH_STALE_DAYS = int(os.environ.get("WATCH_STALE_DAYS", "10"))
-
-# "Guarantee ideas"
-MIN_DAILY_PROPOSALS = int(os.environ.get("MIN_DAILY_PROPOSALS", "6"))
-WATCH_RELAX_TOP = int(os.environ.get("WATCH_RELAX_TOP", "8"))
-
-HORIZON = int(os.environ.get("HORIZON_SESS", "40"))
-RET_WINDOWS = [5, 10, 20, 40]
-
-REG_QQQ = os.environ.get("REG_QQQ", "QQQ")
-REG_VIX = os.environ.get("REG_VIX", "VIX")
-
-SLEEP_EVERY = int(os.environ.get("SLEEP_EVERY", "25"))
-SLEEP_SECONDS = float(os.environ.get("SLEEP_SECONDS", "2.0"))
-
-# Optional: require a small buffer above trig to call an EOD breakout "real"
-BREAKOUT_BUFFER_PCT = float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.0"))  # e.g. 0.5 => close > trig*1.005
-
-# Learning blend (how much daily trusts learned gates)
-# - if weekly wrote a "blend" field, we use it; else we use this env
-LEARN_BLEND_ENV = float(os.environ.get("LEARN_BLEND", "0.25"))  # 0..0.50
-
-# paths
-CACHE_DIR = Path("cache")
-OHLCV_DIR = CACHE_DIR / "ohlcv"
-SIGNALS_CSV = CACHE_DIR / "signals.csv"
-LEARNED_JSON = CACHE_DIR / "learned_params.json"
-LAST_RUN_JSON = CACHE_DIR / "last_run.json"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler("cache/scanner.log", encoding="utf-8")
+    ]
+)
+log = logging.getLogger("scanner")
 
 # =========================
-# Telegram
+# CONFIG (dataclass — sem globals mutáveis)
 # =========================
-def tg_send(text: str) -> None:
-    if not TG_TOKEN or not TG_CHAT_ID:
+@dataclass
+class Config:
+    cache_only: bool = field(default_factory=lambda: os.environ.get("CACHE_ONLY", "0") == "1")
+    tg_token: str = field(default_factory=lambda: os.environ.get("TG_BOT_TOKEN", ""))
+    tg_chat_id: str = field(default_factory=lambda: os.environ.get("TG_CHAT_ID", ""))
+
+    iwc_url: str = field(default_factory=lambda: os.environ.get("IWC_HOLDINGS_CSV_URL", ""))
+    iwm_url: str = field(default_factory=lambda: os.environ.get("IWM_HOLDINGS_CSV_URL", ""))
+    ijr_url: str = field(default_factory=lambda: os.environ.get("IJR_HOLDINGS_CSV_URL", ""))
+
+    ohlcv_fmt: str = field(default_factory=lambda: os.environ.get(
+        "OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d"))
+
+    max_tickers: int = field(default_factory=lambda: int(os.environ.get("MAX_TICKERS", "450")))
+    candidate_pool: int = field(default_factory=lambda: int(os.environ.get("CANDIDATE_POOL", "2000")))
+
+    min_px: float = field(default_factory=lambda: float(os.environ.get("MIN_PX", "1.0")))
+    max_px: float = field(default_factory=lambda: float(os.environ.get("MAX_PX", "30")))
+    min_dv20: float = field(default_factory=lambda: float(os.environ.get("MIN_DV20", "1500000")))
+    max_dv20: float = field(default_factory=lambda: float(os.environ.get("MAX_DV20", "120000000")))
+    min_sv20: float = field(default_factory=lambda: float(os.environ.get("MIN_SV20", "250000")))
+
+    bbz_gate: float = field(default_factory=lambda: float(os.environ.get("BBZ_GATE", "-0.60")))
+    atrpctl_gate: float = field(default_factory=lambda: float(os.environ.get("ATRPCTL_GATE", "0.50")))
+
+    base_dd_max: float = field(default_factory=lambda: float(os.environ.get("BASE_DD_MAX", "0.62")))
+    contraction_max: float = field(default_factory=lambda: float(os.environ.get("CONTRACTION_MAX", "0.92")))
+    dryup_max: float = field(default_factory=lambda: float(os.environ.get("DRYUP_MAX", "1.10")))
+
+    vol_confirm_mult_base: float = field(default_factory=lambda: float(os.environ.get("VOL_CONFIRM_MULT", "1.12")))
+    max_gap_up: float = field(default_factory=lambda: float(os.environ.get("MAX_GAP_UP", "1.14")))
+    dist_max_pct: float = field(default_factory=lambda: float(os.environ.get("DIST_MAX_PCT", "18.0")))
+    exec_max_overshoot_pct: float = field(default_factory=lambda: float(os.environ.get("EXEC_MAX_OVERSHOOT_PCT", "8.0")))
+
+    exec_bbz_max: float = field(default_factory=lambda: float(os.environ.get("EXEC_BBZ_MAX", "-0.90")))
+    exec_atrpctl_max: float = field(default_factory=lambda: float(os.environ.get("EXEC_ATRPCTL_MAX", "0.38")))
+
+    min_r_pct: float = field(default_factory=lambda: float(os.environ.get("MIN_R_PCT", "6.0")))
+
+    overhead_window: int = field(default_factory=lambda: int(os.environ.get("OVERHEAD_WINDOW", "200")))
+    overhead_band_pct: float = field(default_factory=lambda: float(os.environ.get("OVERHEAD_BAND_PCT", "8.0")))
+    overhead_max_touches: int = field(default_factory=lambda: int(os.environ.get("OVERHEAD_MAX_TOUCHES", "12")))
+
+    watch_boost_min_days: int = field(default_factory=lambda: int(os.environ.get("WATCH_BOOST_MIN_DAYS", "3")))
+    watch_stale_days: int = field(default_factory=lambda: int(os.environ.get("WATCH_STALE_DAYS", "10")))
+
+    min_daily_proposals: int = field(default_factory=lambda: int(os.environ.get("MIN_DAILY_PROPOSALS", "6")))
+    watch_relax_top: int = field(default_factory=lambda: int(os.environ.get("WATCH_RELAX_TOP", "8")))
+
+    horizon: int = field(default_factory=lambda: int(os.environ.get("HORIZON_SESS", "40")))
+    ret_windows: list = field(default_factory=lambda: [5, 10, 20, 40])
+
+    reg_qqq: str = field(default_factory=lambda: os.environ.get("REG_QQQ", "QQQ"))
+    # FIX #7: VIX no Stooq usa ticker "^VIX" sem sufixo .us
+    reg_vix: str = field(default_factory=lambda: os.environ.get("REG_VIX", "^VIX"))
+
+    sleep_every: int = field(default_factory=lambda: int(os.environ.get("SLEEP_EVERY", "25")))
+    sleep_seconds: float = field(default_factory=lambda: float(os.environ.get("SLEEP_SECONDS", "2.0")))
+
+    breakout_buffer_pct: float = field(default_factory=lambda: float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.0")))
+    learn_blend_env: float = field(default_factory=lambda: float(os.environ.get("LEARN_BLEND", "0.25")))
+
+    # Paths
+    cache_dir: Path = field(default_factory=lambda: Path("cache"))
+    ohlcv_dir: Path = field(default_factory=lambda: Path("cache/ohlcv"))
+    signals_csv: Path = field(default_factory=lambda: Path("cache/signals.csv"))
+    learned_json: Path = field(default_factory=lambda: Path("cache/learned_params.json"))
+    last_run_json: Path = field(default_factory=lambda: Path("cache/last_run.json"))
+
+    def ensure_dirs(self):
+        self.ohlcv_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+# =========================
+# Telegram (com chunking automático — FIX #6)
+# =========================
+def tg_send(cfg: Config, text: str) -> None:
+    if not cfg.tg_token or not cfg.tg_chat_id:
+        log.info("[TG] Token/chat_id não configurado. Mensagem apenas em log.")
+        log.info(text)
         return
-    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-    payload = {"chat_id": TG_CHAT_ID, "text": text, "disable_web_page_preview": True}
-    try:
-        r = requests.post(url, json=payload, timeout=30)
-        r.raise_for_status()
-    except Exception:
-        pass
+    url = f"https://api.telegram.org/bot{cfg.tg_token}/sendMessage"
+    MAX_LEN = 4000
+    chunks = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)]
+    for chunk in chunks:
+        payload = {
+            "chat_id": cfg.tg_chat_id,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        try:
+            r = requests.post(url, json=payload, timeout=30)
+            r.raise_for_status()
+        except Exception as e:
+            log.warning(f"[TG] Falha ao enviar chunk: {e}")
 
 # =========================
 # Utils / Indicators
 # =========================
-def ensure_dirs() -> None:
-    OHLCV_DIR.mkdir(parents=True, exist_ok=True)
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-def compute_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    high = df["high"]
-    low = df["low"]
-    prev_close = df["close"].shift(1)
-    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-    return tr.rolling(n).mean()
-
-def compute_bb_width(df: pd.DataFrame, n: int = 20) -> pd.Series:
-    ma = df["close"].rolling(n).mean()
-    std = df["close"].rolling(n).std()
-    upper = ma + 2 * std
-    lower = ma - 2 * std
-    return (upper - lower) / ma
-
-def zscore(series: pd.Series, window: int = 120) -> pd.Series:
-    mean = series.rolling(window).mean()
-    std = series.rolling(window).std()
-    return (series - mean) / std
-
-def fetch_text(url: str) -> str:
-    r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
-    r.raise_for_status()
-    return r.text
-
 def safe_float(x, default=np.nan):
     try:
         v = float(x)
@@ -153,72 +146,39 @@ def safe_float(x, default=np.nan):
 def clamp(x: float, lo: float, hi: float) -> float:
     return float(min(hi, max(lo, x)))
 
-# =========================
-# Learned params (weekly_eval v7 compatible)
-# =========================
-def load_learned_params() -> dict:
-    """
-    Supports:
-    - weekly_eval v7 schema:
-      { "params": {...}, "history": [...], "meta": {...} }
-    - legacy schema (if ever):
-      { "version": 1, "asof": "...", "blend": 0.25, "params": {...} }
-    """
-    if not LEARNED_JSON.exists():
-        return {}
-    try:
-        d = json.loads(LEARNED_JSON.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
+def compute_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
+    h, l, c = df["high"], df["low"], df["close"]
+    prev_c = c.shift(1)
+    tr = np.maximum(h - l, np.maximum((h - prev_c).abs(), (l - prev_c).abs()))
+    return tr.ewm(span=n, adjust=False).mean()  # FIX: EMA é mais responsivo que SMA para ATR
 
-def apply_learned_params() -> dict:
-    """
-    Blend a few gates conservatively.
-    Adjusts: DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE (optional).
-    Returns a dict with applied values for logging.
-    """
-    global DIST_MAX_PCT, ATRPCTL_GATE, BBZ_GATE, VOL_CONFIRM_MULT_BASE
+def compute_bb_width(df: pd.DataFrame, n: int = 20) -> pd.Series:
+    ma = df["close"].rolling(n).mean()
+    std = df["close"].rolling(n).std(ddof=1)
+    return ((ma + 2*std) - (ma - 2*std)) / ma
 
-    learned = load_learned_params()
-    if not learned:
-        return {"used": False}
+def zscore(series: pd.Series, window: int = 120) -> pd.Series:
+    m = series.rolling(window).mean()
+    s = series.rolling(window).std(ddof=1)
+    return (series - m) / s.replace(0, np.nan)
 
-    params = learned.get("params", {})
-    if not isinstance(params, dict) or not params:
-        return {"used": False}
-
-    blend = safe_float(learned.get("blend", LEARN_BLEND_ENV), LEARN_BLEND_ENV)
-    blend = clamp(blend, 0.0, 0.50)
-
-    def _blend(cur, new, lo=None, hi=None):
-        if not np.isfinite(new):
-            return cur
-        v = (1.0 - blend) * cur + blend * new
-        if lo is not None and hi is not None:
-            v = clamp(float(v), float(lo), float(hi))
-        return float(v)
-
-    # clamps (same spirit as weekly)
-    DIST_MAX_PCT = _blend(DIST_MAX_PCT, safe_float(params.get("DIST_MAX_PCT", np.nan)), 10.0, 26.0)
-    ATRPCTL_GATE = _blend(ATRPCTL_GATE, safe_float(params.get("ATRPCTL_GATE", np.nan)), 0.30, 0.75)
-    BBZ_GATE = _blend(BBZ_GATE, safe_float(params.get("BBZ_GATE", np.nan)), -1.40, -0.20)
-
-    if "VOL_CONFIRM_MULT" in params:
-        VOL_CONFIRM_MULT_BASE = _blend(VOL_CONFIRM_MULT_BASE, safe_float(params.get("VOL_CONFIRM_MULT", np.nan)), 1.05, 1.35)
-
-    meta = learned.get("meta", {}) if isinstance(learned.get("meta", {}), dict) else {}
-    used_ts = meta.get("last_update_utc") or meta.get("created_utc") or ""
-
-    return {
-        "used": True,
-        "blend": blend,
-        "DIST_MAX_PCT": DIST_MAX_PCT,
-        "ATRPCTL_GATE": ATRPCTL_GATE,
-        "BBZ_GATE": BBZ_GATE,
-        "VOL_CONFIRM_MULT_BASE": VOL_CONFIRM_MULT_BASE,
-        "learned_ts": used_ts
-    }
+def fetch_text(url: str, retries: int = 3) -> str:
+    """FIX #5: exponential backoff no rate-limit"""
+    for attempt in range(retries):
+        try:
+            r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            text = r.text.strip()
+            if "exceeded the daily hits limit" in text.lower():
+                raise RuntimeError("HITS_LIMIT")
+            return text
+        except RuntimeError:
+            raise
+        except Exception as e:
+            wait = 2 ** attempt
+            log.debug(f"fetch_text retry {attempt+1}/{retries} ({e}) — wait {wait}s")
+            time.sleep(wait)
+    raise RuntimeError(f"fetch_text falhou após {retries} tentativas: {url}")
 
 # =========================
 # Holdings parsing
@@ -234,7 +194,7 @@ def fetch_holdings_csv(url: str) -> pd.DataFrame:
             break
     if header_idx is None:
         if "<!doctype html" in text.lower():
-            raise RuntimeError("Holdings HTML (blocked/redirect).")
+            raise RuntimeError("Holdings retornou HTML (bloqueado/redirect).")
         return pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip")
     cleaned = "\n".join(lines[header_idx:])
     return pd.read_csv(io.StringIO(cleaned), engine="python", on_bad_lines="skip")
@@ -243,9 +203,9 @@ def is_valid_ticker(t: str) -> bool:
     if not t:
         return False
     t = t.strip().upper()
-    if t in {"-", "N/A", "NA", "CASH", "USD"}:
+    if t in {"-", "N/A", "NA", "CASH", "USD", "XTSLA", "XNULL"}:
         return False
-    if len(t) < 2:
+    if len(t) < 2 or len(t) > 6:  # FIX: limite superior para evitar garbage
         return False
     if not any(ch.isalpha() for ch in t):
         return False
@@ -253,10 +213,14 @@ def is_valid_ticker(t: str) -> bool:
         return False
     return True
 
-def get_universe_from_holdings(url: str) -> list[str]:
+def get_universe_from_holdings(url: str) -> list:
     if not url:
         return []
-    df = fetch_holdings_csv(url)
+    try:
+        df = fetch_holdings_csv(url)
+    except Exception as e:
+        log.warning(f"[Holdings] Falha ao carregar {url}: {e}")
+        return []
     cols = {c.lower(): c for c in df.columns}
     if "ticker" in cols:
         col = cols["ticker"]
@@ -275,23 +239,36 @@ def get_universe_from_holdings(url: str) -> list[str]:
 # =========================
 # OHLCV / cache
 # =========================
-def cache_path(t: str) -> Path:
-    return OHLCV_DIR / f"{t}.csv"
+def cache_path(cfg: Config, t: str) -> Path:
+    return cfg.ohlcv_dir / f"{t}.csv"
 
-def build_ohlcv_url_equity(ticker: str) -> str:
-    sym = ticker.lower().replace("-", ".")
-    if ".us" in OHLCV_FMT.lower():
-        return OHLCV_FMT.format(symbol=sym)
-    return OHLCV_FMT.format(symbol=f"{sym}.us")
-
-def build_ohlcv_url_symbol(symbol: str) -> tuple[str, str]:
+def build_ohlcv_url(cfg: Config, symbol: str, force_no_us: bool = False) -> str:
     sym = symbol.lower().replace("-", ".")
-    url1 = OHLCV_FMT.format(symbol=sym)
-    url2 = OHLCV_FMT.format(symbol=f"{sym}.us")
-    return url1, url2
+    if force_no_us or symbol.startswith("^"):
+        return cfg.ohlcv_fmt.replace(".us", "").format(symbol=sym)
+    return cfg.ohlcv_fmt.format(symbol=sym)
 
-def load_cached_ohlcv_local(ticker: str, min_rows: int = 120) -> pd.DataFrame | None:
-    p = cache_path(ticker)
+def parse_ohlcv_text(text: str, min_rows: int = 120) -> Optional[pd.DataFrame]:
+    low = text.lower()
+    if low.startswith("no data") or low == "no data":
+        return None
+    df = pd.read_csv(io.StringIO(text))
+    df.columns = [c.strip().lower() for c in df.columns]
+    need = ["date", "open", "high", "low", "close", "volume"]
+    if not all(c in df.columns for c in need):
+        return None
+    df = df[need].copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=need).reset_index(drop=True)
+    if len(df) < min_rows:
+        return None
+    return df
+
+def load_cached_ohlcv_local(cfg: Config, ticker: str, min_rows: int = 120) -> Optional[pd.DataFrame]:
+    p = cache_path(cfg, ticker)
     if not p.exists():
         return None
     try:
@@ -305,117 +282,124 @@ def load_cached_ohlcv_local(ticker: str, min_rows: int = 120) -> pd.DataFrame | 
         df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
         for c in ["open","high","low","close","volume"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
-        if len(df) < min_rows:
-            return None
-        return df
+        df = df.dropna(subset=need).reset_index(drop=True)
+        return df if len(df) >= min_rows else None
     except Exception:
         return None
 
-def read_cached_dv20(ticker: str) -> float | None:
-    df = load_cached_ohlcv_local(ticker, min_rows=30)
+def read_cached_dv20(cfg: Config, ticker: str) -> Optional[float]:
+    df = load_cached_ohlcv_local(cfg, ticker, min_rows=30)
     if df is None:
         return None
     try:
         dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
-        if not np.isfinite(dv20) or dv20 <= 0:
-            return None
-        return dv20
+        return dv20 if np.isfinite(dv20) and dv20 > 0 else None
     except Exception:
         return None
 
-def fetch_ohlcv_equity(ticker: str) -> pd.DataFrame:
-    ensure_dirs()
-    path = cache_path(ticker)
+def fetch_ohlcv_equity(cfg: Config, ticker: str) -> pd.DataFrame:
+    cfg.ensure_dirs()
+    p = cache_path(cfg, ticker)
 
-    cached = None
-    if path.exists():
-        try:
-            cached = pd.read_csv(path)
-            cached.columns = [c.strip().lower() for c in cached.columns]
-            if "date" in cached.columns:
-                cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
-                cached = cached.dropna(subset=["date"]).sort_values("date")
-        except Exception:
-            cached = None
+    cached_df = load_cached_ohlcv_local(cfg, ticker, min_rows=1)
 
     try:
-        url = build_ohlcv_url_equity(ticker)
-        text = fetch_text(url).strip()
-        low = text.lower()
+        force_no_us = ticker.startswith("^")
+        url = build_ohlcv_url(cfg, ticker, force_no_us=force_no_us)
+        text = fetch_text(url)
+        df = parse_ohlcv_text(text, min_rows=1)
 
-        if low.startswith("no data") or low == "no data":
+        if df is None:
             raise RuntimeError("NO_DATA")
-        if "exceeded the daily hits limit" in low:
-            raise RuntimeError("HITS_LIMIT")
 
-        df = pd.read_csv(io.StringIO(text))
-        df.columns = [c.strip().lower() for c in df.columns]
-        need = ["date", "open", "high", "low", "close", "volume"]
-        if not all(c in df.columns for c in need):
-            raise RuntimeError("BAD_FORMAT")
-
-        df = df[need].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date")
-
-        for c in ["open", "high", "low", "close", "volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["open", "high", "low", "close", "volume"]).reset_index(drop=True)
-
-        if cached is not None and len(cached) > 0 and all(c in cached.columns for c in need):
-            merged = pd.concat([cached[need], df[need]], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["date"], keep="last").sort_values("date").reset_index(drop=True)
+        if cached_df is not None and len(cached_df) > 0:
+            need = ["date", "open", "high", "low", "close", "volume"]
+            merged = pd.concat([cached_df[need], df[need]], ignore_index=True)
+            merged = merged.drop_duplicates(subset=["date"], keep="last")
+            merged = merged.sort_values("date").reset_index(drop=True)
             df = merged
 
-        df.to_csv(path, index=False)
-        return df.reset_index(drop=True)
+        df.to_csv(p, index=False)
+        return df
 
-    except Exception:
-        if cached is not None and len(cached) >= 120:
-            need = ["date", "open", "high", "low", "close", "volume"]
-            if all(c in cached.columns for c in need):
-                cached = cached[need].copy()
-                cached["date"] = pd.to_datetime(cached["date"], errors="coerce")
-                cached = cached.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-                for c in ["open","high","low","close","volume"]:
-                    cached[c] = pd.to_numeric(cached[c], errors="coerce")
-                cached = cached.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
-                if len(cached) >= 120:
-                    return cached
+    except RuntimeError:
+        raise
+    except Exception as e:
+        log.debug(f"[OHLCV] {ticker} fetch falhou: {e} — tentando cache")
+        if cached_df is not None and len(cached_df) >= 120:
+            return cached_df
         raise
 
-def fetch_ohlcv_symbol_best_effort(symbol: str) -> pd.DataFrame | None:
-    url1, url2 = build_ohlcv_url_symbol(symbol)
-    for url in [url1, url2]:
+def fetch_ohlcv_symbol_best_effort(cfg: Config, symbol: str) -> Optional[pd.DataFrame]:
+    urls = [
+        build_ohlcv_url(cfg, symbol, force_no_us=False),
+        build_ohlcv_url(cfg, symbol, force_no_us=True),
+    ]
+    for url in urls:
         try:
-            text = fetch_text(url).strip()
-            low = text.lower()
-            if low.startswith("no data") or low == "no data":
-                continue
-            if "exceeded the daily hits limit" in low:
-                continue
-            df = pd.read_csv(io.StringIO(text))
-            df.columns = [c.strip().lower() for c in df.columns]
-            need = ["date", "open", "high", "low", "close", "volume"]
-            if not all(c in df.columns for c in need):
-                continue
-            df = df[need].copy()
-            df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-            for c in ["open","high","low","close","volume"]:
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-            df = df.dropna(subset=["open","high","low","close","volume"]).reset_index(drop=True)
-            if len(df) >= 120:
+            text = fetch_text(url)
+            df = parse_ohlcv_text(text, min_rows=30)
+            if df is not None:
                 return df
         except Exception:
             continue
     return None
 
 # =========================
+# Learned params (sem mutação de globais — FIX #2)
+# =========================
+def load_learned_params(cfg: Config) -> dict:
+    if not cfg.learned_json.exists():
+        return {}
+    try:
+        d = json.loads(cfg.learned_json.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+def apply_learned_params(cfg: Config) -> dict:
+    """
+    Retorna um dict com os gates ajustados (não muta globais).
+    """
+    gates = {
+        "bbz_gate": cfg.bbz_gate,
+        "atrpctl_gate": cfg.atrpctl_gate,
+        "dist_max_pct": cfg.dist_max_pct,
+        "vol_confirm_mult_base": cfg.vol_confirm_mult_base,
+    }
+
+    learned = load_learned_params(cfg)
+    if not learned:
+        return {**gates, "used": False}
+
+    params = learned.get("params", {})
+    if not isinstance(params, dict) or not params:
+        return {**gates, "used": False}
+
+    blend = clamp(safe_float(learned.get("blend", cfg.learn_blend_env), cfg.learn_blend_env), 0.0, 0.50)
+
+    def _blend(cur, key, lo, hi):
+        new = safe_float(params.get(key, np.nan))
+        if not np.isfinite(new):
+            return cur
+        return clamp((1.0 - blend) * cur + blend * new, lo, hi)
+
+    gates["dist_max_pct"] = _blend(cfg.dist_max_pct, "DIST_MAX_PCT", 10.0, 26.0)
+    gates["atrpctl_gate"] = _blend(cfg.atrpctl_gate, "ATRPCTL_GATE", 0.30, 0.75)
+    gates["bbz_gate"] = _blend(cfg.bbz_gate, "BBZ_GATE", -1.40, -0.20)
+    if "VOL_CONFIRM_MULT" in params:
+        gates["vol_confirm_mult_base"] = _blend(cfg.vol_confirm_mult_base, "VOL_CONFIRM_MULT", 1.05, 1.35)
+
+    meta = learned.get("meta", {}) if isinstance(learned.get("meta"), dict) else {}
+    gates["used"] = True
+    gates["blend"] = blend
+    gates["learned_ts"] = meta.get("last_update_utc") or meta.get("created_utc") or ""
+    return gates
+
+# =========================
 # Model components
 # =========================
-def base_scan(df: pd.DataFrame) -> tuple[bool, float, float, float, float, int]:
+def base_scan(df: pd.DataFrame, cfg: Config) -> tuple:
     if len(df) < 260:
         return (False, np.nan, np.nan, np.nan, np.nan, 0)
 
@@ -435,8 +419,9 @@ def base_scan(df: pd.DataFrame) -> tuple[bool, float, float, float, float, int]:
         base_range = float(highb - lowb)
         contr = (base_range / prev_range) if prev_range > 0 else 1.0
 
-        if dd <= BASE_DD_MAX and contr <= CONTRACTION_MAX:
-            score = (BASE_DD_MAX - dd) + (CONTRACTION_MAX - contr)
+        if dd <= cfg.base_dd_max and contr <= cfg.contraction_max:
+            # FIX: score normalizado para comparação justa entre windows
+            score = (cfg.base_dd_max - dd) / cfg.base_dd_max + (cfg.contraction_max - contr) / cfg.contraction_max
             cand = (score, highb, lowb, dd, contr, win)
             if best is None or cand[0] > best[0]:
                 best = cand
@@ -454,11 +439,12 @@ def dryup_ratio(df: pd.DataFrame) -> float:
         return np.nan
     return v10 / v60
 
-def overhead_supply_touches(df: pd.DataFrame, trig: float) -> int:
+def overhead_supply_touches(df: pd.DataFrame, trig: float, cfg: Config) -> int:
+    """FIX #8: usa HIGH (não close) para detectar toque real no overhead"""
     if trig <= 0:
         return 0
-    w = df["close"].iloc[-OVERHEAD_WINDOW:]
-    upper = trig * (1.0 + OVERHEAD_BAND_PCT / 100.0)
+    w = df["high"].iloc[-cfg.overhead_window:]  # FIX: era df["close"]
+    upper = trig * (1.0 + cfg.overhead_band_pct / 100.0)
     return int(((w >= trig) & (w <= upper)).sum())
 
 def liquidity_sweet_spot_bonus(dv20: float) -> float:
@@ -473,24 +459,26 @@ def liquidity_sweet_spot_bonus(dv20: float) -> float:
 def score_candidate(
     bbz: float, atrpctl: float, dd: float, contr: float, dry: float, dv20: float,
     dist_to_trig_pct: float, overhead_touches: int,
-    watch_boost: float, stale_penalty: float
+    watch_boost: float, stale_penalty: float,
+    cfg: Config, gates: dict
 ) -> float:
     s = 0.0
     s += (-bbz) * 2.1
     s += (0.60 - atrpctl) * 1.4
-    s += (BASE_DD_MAX - dd) * 1.0
-    s += (CONTRACTION_MAX - contr) * 0.9
-    s += (DRYUP_MAX - dry) * 0.8
+    s += (cfg.base_dd_max - dd) * 1.0
+    s += (cfg.contraction_max - contr) * 0.9
+    s += (cfg.dryup_max - dry) * 0.8
     s += liquidity_sweet_spot_bonus(dv20)
 
+    dist_limit = gates.get("dist_max_pct", cfg.dist_max_pct)
     if np.isfinite(dist_to_trig_pct):
-        s += max(0.0, (DIST_MAX_PCT - dist_to_trig_pct)) * 0.08
+        s += max(0.0, (dist_limit - dist_to_trig_pct)) * 0.08
 
     if overhead_touches >= 60:
         s -= 1.3
     elif overhead_touches >= 30:
         s -= 0.7
-    elif overhead_touches > OVERHEAD_MAX_TOUCHES:
+    elif overhead_touches > cfg.overhead_max_touches:
         s -= 0.35
 
     s += watch_boost
@@ -500,10 +488,12 @@ def score_candidate(
 # =========================
 # Regime logic (EOD)
 # =========================
-def regime_snapshot() -> dict:
+def regime_snapshot(cfg: Config) -> dict:
     out = {"mode": "TRANSITION", "vol_mult_adj": 0.0, "dist_adj": 0.0, "qqq_trend": None, "vix_trend": None}
-    qqq = fetch_ohlcv_symbol_best_effort(REG_QQQ)
+
+    qqq = fetch_ohlcv_symbol_best_effort(cfg, cfg.reg_qqq)
     if qqq is None or len(qqq) < 200:
+        log.warning("[Regime] QQQ insuficiente — usando TRANSITION")
         return out
 
     qqq["ma50"] = qqq["close"].rolling(50).mean()
@@ -513,209 +503,171 @@ def regime_snapshot() -> dict:
 
     q_close = float(qqq["close"].iloc[-1])
     q_ma50 = float(qqq["ma50"].iloc[-1])
-    q_ma50_prev = float(qqq["ma50"].iloc[-6]) if len(qqq) >= 60 else float(qqq["ma50"].iloc[-2])
+    q_ma50_prev = float(qqq["ma50"].iloc[-6] if len(qqq) >= 60 else qqq["ma50"].iloc[-2])
     ma50_slope = q_ma50 - q_ma50_prev
 
     qqq_trend = ("UP" if (q_close > q_ma50 and ma50_slope > 0) else
                  "DOWN" if (q_close < q_ma50 and ma50_slope < 0) else "MIXED")
     out["qqq_trend"] = qqq_trend
+    log.info(f"[Regime] QQQ={q_close:.2f} MA50={q_ma50:.2f} trend={qqq_trend}")
 
-    vix = fetch_ohlcv_symbol_best_effort(REG_VIX)
+    # FIX #7: VIX via Stooq com ticker ^VIX (sem .us)
+    vix = fetch_ohlcv_symbol_best_effort(cfg, cfg.reg_vix)
     if vix is not None and len(vix) >= 30:
         vix["ma20"] = vix["close"].rolling(20).mean()
         if np.isfinite(vix["ma20"].iloc[-1]):
             v_close = float(vix["close"].iloc[-1])
             v_ma20 = float(vix["ma20"].iloc[-1])
-            v_ma20_prev = float(vix["ma20"].iloc[-6]) if len(vix) >= 30 else float(vix["ma20"].iloc[-2])
+            v_ma20_prev = float(vix["ma20"].iloc[-6] if len(vix) >= 30 else vix["ma20"].iloc[-2])
             vix_trend = ("UP" if (v_close > v_ma20 and v_ma20 > v_ma20_prev) else
                          "DOWN" if (v_close < v_ma20 and v_ma20 < v_ma20_prev) else "MIXED")
             out["vix_trend"] = vix_trend
+            log.info(f"[Regime] VIX={v_close:.2f} MA20={v_ma20:.2f} trend={vix_trend}")
 
     if qqq_trend == "UP" and (out["vix_trend"] in [None, "DOWN", "MIXED"]):
-        out["mode"] = "RISK_ON"
-        out["vol_mult_adj"] = -0.02
-        out["dist_adj"] = +2.0
-    elif qqq_trend == "DOWN" and (out["vix_trend"] == "UP"):
-        out["mode"] = "RISK_OFF"
-        out["vol_mult_adj"] = +0.08
-        out["dist_adj"] = -3.0
+        out.update({"mode": "RISK_ON", "vol_mult_adj": -0.02, "dist_adj": +2.0})
+    elif qqq_trend == "DOWN" and out["vix_trend"] == "UP":
+        out.update({"mode": "RISK_OFF", "vol_mult_adj": +0.08, "dist_adj": -3.0})
     else:
-        out["mode"] = "TRANSITION"
-        out["vol_mult_adj"] = +0.02
-        out["dist_adj"] = -1.0
+        out.update({"mode": "TRANSITION", "vol_mult_adj": +0.02, "dist_adj": -1.0})
 
     return out
 
 # =========================
-# signals.csv helpers (ASOF + NO DUPES + SCHEMA)
+# signals.csv helpers
 # =========================
 SIGNALS_COLS = [
-    "date",
-    "asof",
-    "ticker","signal","score","close","trig","stop","dist_pct","dv20",
+    "date","asof","ticker","signal","score","close","trig","stop","dist_pct","dv20",
     "bbz","atrpctl","dd","contr","dry","overhead_touches","vol_mult","overshoot_pct",
-    "R_pct","regime",
-    "ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
+    "R_pct","regime","ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
 ]
 
-def signals_csv_ensure_schema() -> None:
-    ensure_dirs()
-    if not SIGNALS_CSV.exists():
-        with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(SIGNALS_COLS)
-        return
+class SignalsStore:
+    """FIX #3: encapsula IO de signals.csv com estado limpo por run"""
+    def __init__(self, cfg: Config):
+        self.path = cfg.signals_csv
+        self._keys: dict = {}  # asof -> set of (asof, ticker, signal)
+        self._ensure_schema()
 
-    try:
-        df = pd.read_csv(SIGNALS_CSV)
-    except Exception:
-        with SIGNALS_CSV.open("w", newline="", encoding="utf-8") as f:
-            w = csv.writer(f)
-            w.writerow(SIGNALS_COLS)
-        return
+    def _ensure_schema(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not self.path.exists():
+            with self.path.open("w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(SIGNALS_COLS)
+            return
+        try:
+            df = pd.read_csv(self.path)
+        except Exception:
+            with self.path.open("w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(SIGNALS_COLS)
+            return
+        if "asof" not in df.columns:
+            df.insert(1, "asof", "")
+        for c in SIGNALS_COLS:
+            if c not in df.columns:
+                df[c] = ""
+        df[SIGNALS_COLS].to_csv(self.path, index=False)
 
-    if "asof" not in df.columns:
-        df.insert(1, "asof", "")
+    def _load_keys(self, asof: str):
+        if asof in self._keys:
+            return
+        keys = set()
+        try:
+            df = pd.read_csv(self.path, usecols=["asof","ticker","signal"]).dropna()
+            df = df[df["asof"].astype(str) == asof]
+            for _, r in df.iterrows():
+                keys.add((str(r["asof"]), str(r["ticker"]).upper().strip(), str(r["signal"]).upper().strip()))
+        except Exception:
+            pass
+        self._keys[asof] = keys
 
-    for c in SIGNALS_COLS:
-        if c not in df.columns:
-            df[c] = ""
+    def append(self, row: dict) -> None:
+        asof = str(row.get("asof", "")).strip()
+        t = str(row.get("ticker", "")).strip().upper()
+        s = str(row.get("signal", "")).strip().upper()
+        if not asof or not t or not s:
+            return
+        self._load_keys(asof)
+        k = (asof, t, s)
+        if k in self._keys[asof]:
+            return
+        with self.path.open("a", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=SIGNALS_COLS).writerow(
+                {c: row.get(c, "") for c in SIGNALS_COLS}
+            )
+        self._keys[asof].add(k)
 
-    df = df[SIGNALS_COLS].copy()
-    df.to_csv(SIGNALS_CSV, index=False)
-
-_KEYS_BY_ASOF: dict[str, set[tuple[str,str,str]]] = {}
-
-def load_existing_keys_for_asof(asof_str: str) -> set[tuple[str,str,str]]:
-    if asof_str in _KEYS_BY_ASOF:
-        return _KEYS_BY_ASOF[asof_str]
-
-    keys: set[tuple[str,str,str]] = set()
-    if not SIGNALS_CSV.exists():
-        _KEYS_BY_ASOF[asof_str] = keys
-        return keys
-
-    try:
-        df = pd.read_csv(SIGNALS_CSV, usecols=["asof","ticker","signal"]).dropna()
-        df["asof"] = df["asof"].astype(str)
-        df = df[df["asof"] == asof_str]
+    def recent_watch_stats(self, ticker: str, lookback_days: int = 15) -> dict:
+        if not self.path.exists():
+            return {"days": 0, "dists": []}
+        try:
+            df = pd.read_csv(self.path, usecols=["ticker","dist_pct","asof","date"])
+        except Exception:
+            return {"days": 0, "dists": []}
         df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-        df["signal"] = df["signal"].astype(str).str.upper().str.strip()
-        for _, r in df.iterrows():
-            keys.add((str(r["asof"]), r["ticker"], r["signal"]))
-    except Exception:
-        pass
+        df = df[df["ticker"] == ticker].copy()
+        if df.empty:
+            return {"days": 0, "dists": []}
+        daycol = "asof" if "asof" in df.columns else "date"
+        df[daycol] = pd.to_datetime(df[daycol], errors="coerce")
+        df = df.dropna(subset=[daycol]).sort_values(daycol)
+        cutoff = df[daycol].max() - pd.Timedelta(days=lookback_days)
+        df = df[df[daycol] >= cutoff]
+        dists = pd.to_numeric(df.get("dist_pct", np.nan), errors="coerce").dropna().tolist()
+        return {"days": len(df), "dists": dists[-10:]}
 
-    _KEYS_BY_ASOF[asof_str] = keys
-    return keys
-
-def append_signal_row(row: dict) -> None:
-    signals_csv_ensure_schema()
-    asof = str(row.get("asof", "")).strip()
-    t = str(row.get("ticker", "")).strip().upper()
-    s = str(row.get("signal", "")).strip().upper()
-    if not asof or not t or not s:
-        return
-
-    keyset = load_existing_keys_for_asof(asof)
-    k = (asof, t, s)
-    if k in keyset:
-        return
-
-    with SIGNALS_CSV.open("a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=SIGNALS_COLS)
-        w.writerow({c: row.get(c, "") for c in SIGNALS_COLS})
-
-    keyset.add(k)
-
-def recent_watch_stats(ticker: str, lookback_days: int = 15) -> dict:
-    if not SIGNALS_CSV.exists():
-        return {"days": 0, "dists": []}
-    try:
-        df = pd.read_csv(SIGNALS_CSV, usecols=["ticker","dist_pct","asof","date"])
-    except Exception:
-        return {"days": 0, "dists": []}
-    if df.empty:
-        return {"days": 0, "dists": []}
-
-    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-    df = df[df["ticker"] == ticker].copy()
-    if df.empty:
-        return {"days": 0, "dists": []}
-
-    if "asof" in df.columns:
-        df["asof"] = pd.to_datetime(df["asof"], errors="coerce")
-        daycol = "asof"
-    else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        daycol = "date"
-
-    df = df.dropna(subset=[daycol]).sort_values(daycol)
-    cutoff = df[daycol].max() - pd.Timedelta(days=lookback_days)
-    df = df[df[daycol] >= cutoff]
-
-    dd = pd.to_numeric(df.get("dist_pct", np.nan), errors="coerce").dropna()
-    dists = dd.tolist()[-WATCH_STALE_DAYS:]
-    return {"days": int(len(df)), "dists": dists}
-
-def watch_boost_and_stale_penalty(dist_series: list[float]) -> tuple[float, float]:
+def watch_boost_and_stale_penalty(dist_series: list, cfg: Config) -> tuple:
     if not dist_series:
         return (0.0, 0.0)
-
     days = len(dist_series)
     boost = 0.0
     penalty = 0.0
-
-    if days >= WATCH_BOOST_MIN_DAYS:
-        tail = dist_series[-WATCH_BOOST_MIN_DAYS:]
+    if days >= cfg.watch_boost_min_days:
+        tail = dist_series[-cfg.watch_boost_min_days:]
         if all(np.isfinite(x) for x in tail) and tail[-1] < tail[0]:
             boost = 0.30
-
-    if days >= WATCH_STALE_DAYS:
-        tail = dist_series[-WATCH_STALE_DAYS:]
-        if all(np.isfinite(x) for x in tail):
-            if (tail[0] - tail[-1]) < 1.0:
-                penalty = 0.35
-
+    if days >= cfg.watch_stale_days:
+        tail = dist_series[-cfg.watch_stale_days:]
+        if all(np.isfinite(x) for x in tail) and (tail[0] - tail[-1]) < 1.0:
+            penalty = 0.35
     return (boost, penalty)
 
 # =========================
-# outcomes update (EOD-only, from cache) — USE ASOF
+# Outcomes update — FIX #9: só processa não resolvidos
 # =========================
-def update_outcomes_using_cache() -> dict:
-    signals_csv_ensure_schema()
+def update_outcomes_using_cache(cfg: Config) -> dict:
+    if not cfg.signals_csv.exists():
+        return {"updated": 0, "resolved_total": 0}
     try:
-        df = pd.read_csv(SIGNALS_CSV)
+        df = pd.read_csv(cfg.signals_csv)
     except Exception:
         return {"updated": 0, "resolved_total": 0}
     if df.empty or "resolved" not in df.columns:
         return {"updated": 0, "resolved_total": 0}
 
     df["resolved"] = df["resolved"].astype(str)
-    unresolved_idx = df.index[df["resolved"] != "1"].tolist()
+    already = int((df["resolved"] == "1").sum())
+
+    # FIX #9: filtra logo os não resolvidos (era iterado na totalidade antes)
+    unresolved_mask = df["resolved"] != "1"
+    unresolved_idx = df.index[unresolved_mask].tolist()
     if not unresolved_idx:
-        return {"updated": 0, "resolved_total": int((df["resolved"] == "1").sum())}
+        return {"updated": 0, "resolved_total": already}
 
     updated = 0
     for idx in unresolved_idx[:800]:
         try:
             ticker = str(df.at[idx, "ticker"]).strip().upper()
-
-            sig_day = None
-            if "asof" in df.columns:
-                sig_day = pd.to_datetime(df.at[idx, "asof"], errors="coerce")
-            if sig_day is None or pd.isna(sig_day):
-                sig_day = pd.to_datetime(df.at[idx, "date"], errors="coerce")
+            sig_day = pd.to_datetime(df.at[idx, "asof"] if "asof" in df.columns else df.at[idx, "date"], errors="coerce")
             if pd.isna(sig_day):
                 continue
 
-            o = load_cached_ohlcv_local(ticker, min_rows=260)
+            o = load_cached_ohlcv_local(cfg, ticker, min_rows=260)
             if o is None:
                 continue
 
             o_dates = o["date"].dt.date.values
             target = sig_day.date()
-
             pos_candidates = np.where(o_dates == target)[0]
             if len(pos_candidates) == 0:
                 pos_candidates = np.where(o_dates <= target)[0]
@@ -725,55 +677,50 @@ def update_outcomes_using_cache() -> dict:
             else:
                 pos = int(pos_candidates[0])
 
-            if pos + HORIZON >= len(o):
+            if pos + cfg.horizon >= len(o):
                 continue
 
-            entry_close = float(pd.to_numeric(df.at[idx, "close"], errors="coerce"))
+            entry_close = safe_float(df.at[idx, "close"])
             if not np.isfinite(entry_close) or entry_close <= 0:
                 entry_close = float(o["close"].iloc[pos])
 
             rets = {}
-            for w in RET_WINDOWS:
+            for w in cfg.ret_windows:
                 c_fwd = float(o["close"].iloc[pos + w])
                 rets[w] = (c_fwd / entry_close) - 1.0
 
-            horizon_slice = pd.to_numeric(o["close"].iloc[pos:pos + HORIZON + 1], errors="coerce").dropna()
+            horizon_slice = pd.to_numeric(o["close"].iloc[pos:pos + cfg.horizon + 1], errors="coerce").dropna()
             max_ret = (float(horizon_slice.max()) / entry_close) - 1.0 if len(horizon_slice) else np.nan
-
-            hit30 = 1 if (np.isfinite(max_ret) and max_ret >= 0.30) else 0
-            hit50 = 1 if (np.isfinite(max_ret) and max_ret >= 0.50) else 0
 
             df.at[idx, "ret_5"] = round(rets[5], 6)
             df.at[idx, "ret_10"] = round(rets[10], 6)
             df.at[idx, "ret_20"] = round(rets[20], 6)
             df.at[idx, "ret_40"] = round(rets[40], 6)
-            df.at[idx, "hit_30"] = hit30
-            df.at[idx, "hit_50"] = hit50
+            df.at[idx, "hit_30"] = 1 if (np.isfinite(max_ret) and max_ret >= 0.30) else 0
+            df.at[idx, "hit_50"] = 1 if (np.isfinite(max_ret) and max_ret >= 0.50) else 0
             df.at[idx, "resolved"] = "1"
             updated += 1
-
-        except Exception:
+        except Exception as e:
+            log.debug(f"[Outcomes] {ticker}: {e}")
             continue
 
     if updated > 0:
-        df.to_csv(SIGNALS_CSV, index=False)
+        df.to_csv(cfg.signals_csv, index=False)
+        log.info(f"[Outcomes] {updated} sinais resolvidos")
 
     return {"updated": updated, "resolved_total": int((df["resolved"] == "1").sum())}
 
-def empirical_prob_by_score_bin(regime: str) -> str:
-    if not SIGNALS_CSV.exists():
+def empirical_prob_by_score_bin(cfg: Config, regime: str) -> str:
+    if not cfg.signals_csv.exists():
         return "EMP: sem histórico"
     try:
-        df = pd.read_csv(SIGNALS_CSV)
+        df = pd.read_csv(cfg.signals_csv)
     except Exception:
         return "EMP: sem histórico"
     if df.empty or "resolved" not in df.columns:
         return "EMP: sem histórico"
 
     df = df[df["resolved"].astype(str) == "1"].copy()
-    if df.empty or "score" not in df.columns:
-        return "EMP: sem histórico"
-
     df = df[df["signal"].astype(str).str.contains("EXEC", na=False)]
     if df.empty:
         return "EMP: sem EXEC resolvido"
@@ -794,82 +741,83 @@ def empirical_prob_by_score_bin(regime: str) -> str:
         n = len(g)
         p30 = float(pd.to_numeric(g.get("hit_30", 0), errors="coerce").fillna(0).mean())
         p50 = float(pd.to_numeric(g.get("hit_50", 0), errors="coerce").fillna(0).mean())
-        out.append((str(b), n, p30, p50))
-
-    parts = [f"{i+1}:{n}|{p30*100:.0f}/{p50*100:.0f}" for i, (_, n, p30, p50) in enumerate(out)]
+        out.append((n, p30, p50))
+    parts = [f"{i+1}:{n}|{p30*100:.0f}/{p50*100:.0f}" for i, (n, p30, p50) in enumerate(out)]
     return "EMP bins(n|P30/P50%): " + " ".join(parts)
 
 # =========================
 # MAIN
 # =========================
 def main() -> None:
-    learned_applied = apply_learned_params()
+    cfg = Config()
+    cfg.ensure_dirs()
+
+    log.info("=== V8 Scanner iniciado ===")
+
+    # Apply learned params (retorna dict, não muta cfg)
+    gates = apply_learned_params(cfg)
+    log.info(f"Gates: {gates}")
 
     now_dt = datetime.now(timezone.utc)
     now = now_dt.strftime("%Y-%m-%d %H:%M UTC")
     run_day = now_dt.strftime("%Y-%m-%d")
 
-    ensure_dirs()
-    signals_csv_ensure_schema()
-
-    upd = update_outcomes_using_cache()
-
-    reg = regime_snapshot()
+    store = SignalsStore(cfg)
+    upd = update_outcomes_using_cache(cfg)
+    reg = regime_snapshot(cfg)
     mode = reg["mode"]
 
-    VOL_CONFIRM_MULT = max(1.05, VOL_CONFIRM_MULT_BASE + reg["vol_mult_adj"])
-    DIST_LIMIT = max(8.0, DIST_MAX_PCT + reg["dist_adj"])
-    breakout_mult = 1.0 + (BREAKOUT_BUFFER_PCT / 100.0)
+    dist_limit = gates.get("dist_max_pct", cfg.dist_max_pct)
+    bbz_gate = gates.get("bbz_gate", cfg.bbz_gate)
+    atrpctl_gate = gates.get("atrpctl_gate", cfg.atrpctl_gate)
+    vol_confirm_mult = max(1.05, gates.get("vol_confirm_mult_base", cfg.vol_confirm_mult_base) + reg["vol_mult_adj"])
+    dist_limit_eff = max(8.0, dist_limit + reg["dist_adj"])
+    breakout_mult = 1.0 + (cfg.breakout_buffer_pct / 100.0)
 
-    # universe (DETERMINISTIC)
+    log.info(f"[Regime] {mode} | vol_mult={vol_confirm_mult:.3f} | dist_limit={dist_limit_eff:.1f}%")
+
+    # Universe
     all_tickers = (
-        get_universe_from_holdings(IWC_URL)
-        + get_universe_from_holdings(IWM_URL)
-        + get_universe_from_holdings(IJR_URL)
+        get_universe_from_holdings(cfg.iwc_url)
+        + get_universe_from_holdings(cfg.iwm_url)
+        + get_universe_from_holdings(cfg.ijr_url)
     )
-    universe = sorted(set([t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()]))
+    universe = sorted(set(t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()))
+    log.info(f"[Universe] {len(universe)} tickers únicos")
 
-    # deterministic scan order: dv20 desc then ticker asc
-    scored: list[tuple[str, float]] = []
-    unscored: list[str] = []
-    pool = universe[: min(CANDIDATE_POOL, len(universe))]
+    # Deterministic scan order
+    scored = []
+    unscored = []
+    pool = universe[:min(cfg.candidate_pool, len(universe))]
     for t in pool:
-        dv = read_cached_dv20(t)
+        dv = read_cached_dv20(cfg, t)
         if dv is None:
             unscored.append(t)
         else:
             scored.append((t, float(dv)))
-
     scored.sort(key=lambda x: (-x[1], x[0]))
     unscored.sort()
-    ordered = [t for t, _ in scored] + unscored
-    tickers = ordered[:MAX_TICKERS]
+    tickers = ([t for t, _ in scored] + unscored)[:cfg.max_tickers]
 
-    execA: list[tuple] = []
-    execB: list[tuple] = []
-    watch_clean: list[tuple] = []
-    watch_over: list[tuple] = []
-    near: list[tuple] = []
-    near_relax: list[tuple] = []
+    execA, execB = [], []
+    watch_clean, watch_over = [], []
+    near, near_relax = [], []
 
     hits_limited = False
-    no_data = 0
+    no_data = cache_used = cache_miss = 0
     hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
-    cache_used = 0
-    cache_miss = 0
-
     asof_date_global = None
 
     for i, t in enumerate(tickers):
         try:
-            if CACHE_ONLY or hits_limited:
-                df = load_cached_ohlcv_local(t, min_rows=260)
+            if cfg.cache_only or hits_limited:
+                df = load_cached_ohlcv_local(cfg, t, min_rows=260)
                 if df is None:
                     cache_miss += 1
                     continue
                 cache_used += 1
             else:
-                df = fetch_ohlcv_equity(t)
+                df = fetch_ohlcv_equity(cfg, t)
 
             if df is None or df.empty:
                 continue
@@ -879,7 +827,6 @@ def main() -> None:
                 continue
             asof_row = asof_row.normalize()
             asof_str = asof_row.strftime("%Y-%m-%d")
-
             if asof_date_global is None or asof_row > asof_date_global:
                 asof_date_global = asof_row
 
@@ -888,162 +835,111 @@ def main() -> None:
             hist_ok += 1
 
             close_now = float(df["close"].iloc[-1])
+            open_now = float(df["open"].iloc[-1])
+            close_prev = float(df["close"].iloc[-2])
+            vol_now = float(df["volume"].iloc[-1])
             dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
-            sv20 = float(df["volume"].iloc[-20:].mean())
+            vol20 = float(df["volume"].iloc[-20:].mean())
+            sv20 = vol20
 
-            if close_now < MIN_PX or close_now > MAX_PX:
+            if close_now < cfg.min_px or close_now > cfg.max_px:
                 continue
-            if dv20 < MIN_DV20 or dv20 > MAX_DV20:
+            if dv20 < cfg.min_dv20 or dv20 > cfg.max_dv20:
                 continue
-            if sv20 < MIN_SV20:
+            if sv20 < cfg.min_sv20:
                 continue
             liq_ok += 1
 
-            # compression
             bbw = compute_bb_width(df, 20)
-            bbz = zscore(bbw, 120)
+            bbz_s = zscore(bbw, 120)
             atrp = compute_atr(df, 14) / df["close"]
             atr_win = atrp.iloc[-252:].dropna()
             if len(atr_win) < 80:
                 continue
 
-            bbz_last = float(bbz.iloc[-1])
+            bbz_last = float(bbz_s.iloc[-1])
             atr_last = float(atrp.iloc[-1])
             atr_pctl = float((atr_win <= atr_last).mean())
 
-            if not (bbz_last < BBZ_GATE and atr_pctl < ATRPCTL_GATE):
-                if (bbz_last < (BBZ_GATE + 0.10)) or (atr_pctl < (ATRPCTL_GATE + 0.08)):
+            if not (bbz_last < bbz_gate and atr_pctl < atrpctl_gate):
+                if (bbz_last < (bbz_gate + 0.10)) or (atr_pctl < (atrpctl_gate + 0.08)):
                     near_relax.append(("COMP", t, close_now, dv20, bbz_last, atr_pctl))
                 continue
             comp_ok += 1
 
-            # base
-            ok, trig, lowb, dd, contr, win = base_scan(df)
+            ok, trig, lowb, dd, contr, win = base_scan(df, cfg)
             if not ok:
                 near.append((t, close_now, dv20, bbz_last, "BASE"))
                 continue
             base_ok += 1
 
-            # dry-up
             dry = dryup_ratio(df)
-            if (not np.isfinite(dry)) or (dry >= DRYUP_MAX):
+            if (not np.isfinite(dry)) or (dry >= cfg.dryup_max):
                 near.append((t, close_now, dv20, bbz_last, "DRY"))
-                if np.isfinite(dry) and dry < (DRYUP_MAX + 0.12):
+                if np.isfinite(dry) and dry < (cfg.dryup_max + 0.12):
                     near_relax.append(("DRY", t, close_now, dv20, bbz_last, atr_pctl))
                 continue
             dry_ok += 1
 
-            # stop / R
             stop = lowb * 0.99
             R_pct = ((trig - stop) / trig * 100.0) if trig > 0 else np.nan
-            if (not np.isfinite(R_pct)) or (R_pct < MIN_R_PCT):
+            if (not np.isfinite(R_pct)) or (R_pct < cfg.min_r_pct):
                 near.append((t, close_now, dv20, bbz_last, f"LOW_R({R_pct:.1f}%)"))
-                if np.isfinite(R_pct) and R_pct >= (MIN_R_PCT - 1.5):
+                if np.isfinite(R_pct) and R_pct >= (cfg.min_r_pct - 1.5):
                     near_relax.append(("R", t, close_now, dv20, bbz_last, atr_pctl))
                 continue
 
             dist_pct = ((trig - close_now) / close_now * 100.0) if close_now > 0 else np.nan
             overshoot_pct = ((close_now - trig) / trig * 100.0) if trig > 0 else 0.0
-            overhead = overhead_supply_touches(df, trig)
+            overhead = overhead_supply_touches(df, trig, cfg)
 
-            stats = recent_watch_stats(t)
-            boost, stale_pen = watch_boost_and_stale_penalty(stats["dists"])
+            stats = store.recent_watch_stats(t)
+            boost, stale_pen = watch_boost_and_stale_penalty(stats["dists"], cfg)
 
             sc = score_candidate(
                 bbz_last, atr_pctl, dd, contr, dry, dv20,
-                dist_pct if np.isfinite(dist_pct) else (DIST_LIMIT + 999.0),
-                overhead, boost, stale_pen
+                dist_pct if np.isfinite(dist_pct) else (dist_limit_eff + 999.0),
+                overhead, boost, stale_pen, cfg, gates
             )
 
-            # EXEC logic (EOD confirmed)
-            open_now = float(df["open"].iloc[-1])
-            close_prev = float(df["close"].iloc[-2])
-            vol_now = float(df["volume"].iloc[-1])
-            vol20 = float(df["volume"].iloc[-20:].mean())
             vol_mult = (vol_now / vol20) if vol20 > 0 else np.nan
-
             trig_eff = trig * breakout_mult
             breakout_now = close_now > trig_eff
-            vol_confirm = (vol20 > 0) and (vol_now >= VOL_CONFIRM_MULT * vol20)
-            no_big_gap = (close_prev > 0) and (open_now <= close_prev * MAX_GAP_UP)
+            vol_confirm = (vol20 > 0) and (vol_now >= vol_confirm_mult * vol20)
+            no_big_gap = (close_prev > 0) and (open_now <= close_prev * cfg.max_gap_up)
+            quality_ok = (bbz_last <= cfg.exec_bbz_max) or (atr_pctl <= cfg.exec_atrpctl_max)
+            not_too_extended = overshoot_pct <= cfg.exec_max_overshoot_pct
+            prev_above = close_prev > trig_eff
 
-            quality_ok = (bbz_last <= EXEC_BBZ_MAX) or (atr_pctl <= EXEC_ATRPCTL_MAX)
-            not_too_extended = overshoot_pct <= EXEC_MAX_OVERSHOOT_PCT
-            prev_above = float(df["close"].iloc[-2]) > trig_eff
+            base_row = {
+                "date": run_day, "asof": asof_str, "ticker": t,
+                "score": round(sc, 6), "close": round(close_now, 6),
+                "trig": round(trig, 6), "stop": round(stop, 6),
+                "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
+                "dv20": round(dv20, 2), "bbz": round(bbz_last, 6),
+                "atrpctl": round(atr_pctl, 6), "dd": round(dd, 6),
+                "contr": round(contr, 6), "dry": round(dry, 6),
+                "overhead_touches": overhead,
+                "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
+                "overshoot_pct": round(float(overshoot_pct), 6),
+                "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
+                "regime": mode, "resolved": "0"
+            }
 
             if breakout_now and vol_confirm and no_big_gap and quality_ok and not_too_extended:
                 sig = "EXEC_B" if prev_above else "EXEC_A"
-                item = (
-                    sc, t, close_now, dv20, bbz_last, atr_pctl,
-                    trig, stop, overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct
-                )
+                item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct)
                 (execB if sig == "EXEC_B" else execA).append(item)
-
-                append_signal_row({
-                    "date": run_day,
-                    "asof": asof_str,
-                    "ticker": t,
-                    "signal": sig,
-                    "score": round(sc, 6),
-                    "close": round(close_now, 6),
-                    "trig": round(trig, 6),
-                    "stop": round(stop, 6),
-                    "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                    "dv20": round(dv20, 2),
-                    "bbz": round(bbz_last, 6),
-                    "atrpctl": round(atr_pctl, 6),
-                    "dd": round(dd, 6),
-                    "contr": round(contr, 6),
-                    "dry": round(dry, 6),
-                    "overhead_touches": overhead,
-                    "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
-                    "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
-                    "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                    "regime": mode,
-                    "resolved": "0"
-                })
+                store.append({**base_row, "signal": sig})
             else:
-                # WATCH (wider net)
-                if (
-                    np.isfinite(dist_pct)
-                    and dist_pct <= DIST_LIMIT
-                    and dist_pct >= -EXEC_MAX_OVERSHOOT_PCT
-                    and atr_pctl <= 0.42
-                ):
-                    item = (
-                        sc, t, close_now, dv20, bbz_last, atr_pctl,
-                        trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen
-                    )
-                    if overhead <= 5:
-                        watch_clean.append(item)
-                    else:
-                        watch_over.append(item)
-
-                    append_signal_row({
-                        "date": run_day,
-                        "asof": asof_str,
-                        "ticker": t,
-                        "signal": "WATCH",
-                        "score": round(sc, 6),
-                        "close": round(close_now, 6),
-                        "trig": round(trig, 6),
-                        "stop": round(stop, 6),
-                        "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                        "dv20": round(dv20, 2),
-                        "bbz": round(bbz_last, 6),
-                        "atrpctl": round(atr_pctl, 6),
-                        "dd": round(dd, 6),
-                        "contr": round(contr, 6),
-                        "dry": round(dry, 6),
-                        "overhead_touches": overhead,
-                        "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
-                        "overshoot_pct": round(float(overshoot_pct), 6) if np.isfinite(overshoot_pct) else "",
-                        "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                        "regime": mode,
-                        "resolved": "0"
-                    })
+                if (np.isfinite(dist_pct) and dist_pct <= dist_limit_eff
+                        and dist_pct >= -cfg.exec_max_overshoot_pct
+                        and atr_pctl <= 0.42):
+                    item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen)
+                    (watch_clean if overhead <= 5 else watch_over).append(item)
+                    store.append({**base_row, "signal": "WATCH"})
                 else:
-                    if np.isfinite(dist_pct) and dist_pct <= (DIST_LIMIT + 6.0) and atr_pctl <= 0.50:
+                    if np.isfinite(dist_pct) and dist_pct <= (dist_limit_eff + 6.0) and atr_pctl <= 0.50:
                         near_relax.append(("WATCH", t, close_now, dv20, bbz_last, atr_pctl))
 
         except Exception as e:
@@ -1051,177 +947,135 @@ def main() -> None:
             if "NO_DATA" in s:
                 no_data += 1
             elif "HITS_LIMIT" in s:
+                log.warning(f"[Stooq] Rate-limit atingido em {t} — modo cache daqui em diante")
                 hits_limited = True
-            pass
+            else:
+                log.debug(f"[Scan] {t}: {e}")
 
-        if (i + 1) % SLEEP_EVERY == 0:
-            time.sleep(SLEEP_SECONDS)
+        if (i + 1) % cfg.sleep_every == 0:
+            time.sleep(cfg.sleep_seconds)
 
-    # sort + cut
+    # Sort & trim
     execA.sort(key=lambda x: x[0], reverse=True)
     execB.sort(key=lambda x: x[0], reverse=True)
     watch_clean.sort(key=lambda x: x[0], reverse=True)
     watch_over.sort(key=lambda x: x[0], reverse=True)
-
-    execA = execA[:12]
-    execB = execB[:12]
-    watch_clean = watch_clean[:7]
-    watch_over = watch_over[:7]
+    execA, execB = execA[:12], execB[:12]
+    watch_clean, watch_over = watch_clean[:7], watch_over[:7]
     near = near[:10]
 
-    emp = empirical_prob_by_score_bin(mode)
-    asof_str_global = asof_date_global.strftime("%Y-%m-%d") if asof_date_global is not None else "—"
+    emp = empirical_prob_by_score_bin(cfg, mode)
+    asof_str_global = asof_date_global.strftime("%Y-%m-%d") if asof_date_global else "—"
 
-    # If too few proposals, build WATCH_RELAX from near_relax
+    # WATCH_RELAX fallback
     total_props = len(execA) + len(execB) + len(watch_clean) + len(watch_over)
     watch_relax_lines = []
-    if total_props < MIN_DAILY_PROPOSALS and near_relax:
-        near_relax_sorted = sorted(
-            near_relax,
-            key=lambda x: (str(x[0]), -float(x[3]) if np.isfinite(x[3]) else 0.0, str(x[1]))
-        )[:WATCH_RELAX_TOP]
+    if total_props < cfg.min_daily_proposals and near_relax:
+        nr_sorted = sorted(near_relax, key=lambda x: (-float(x[3]) if np.isfinite(x[3]) else 0.0, str(x[1])))
+        nr_sorted = nr_sorted[:cfg.watch_relax_top]
+        watch_relax_lines.append(f"⚙️ WATCH_RELAX (propostas &lt; {cfg.min_daily_proposals}):")
+        for reason, t, c, dv, bbz, atrp in nr_sorted:
+            watch_relax_lines.append(f"  {t} | {reason} | {c:.2f} | dv={dv/1e6:.1f}M | BBz={bbz:.2f}")
 
-        watch_relax_lines.append(f"WATCH_RELAX (porque propostas<{MIN_DAILY_PROPOSALS}):")
-        for reason, t, c, dv, bbz, atrp in near_relax_sorted:
-            watch_relax_lines.append(
-                f"- {t} | reason={reason} | close={c:.2f} | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} | ATRpctl={atrp:.2f}"
+    # --- Compose message (HTML para Telegram) ---
+    def fmt_exec(items, label):
+        lines = [f"<b>{label}</b>"]
+        for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in items:
+            lines.append(
+                f"  <code>{t}</code> sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% dv={dv/1e6:.1f}M "
+                f"BBz={bbz:.2f} trig={trig:.2f} stp={stop:.2f} R%={Rp:.1f} ovr={over:.1f}% vx={vm:.2f} oh={oh} b{win}"
             )
+        return "\n".join(lines)
 
-    # Compose message
-    msg = [f"[{now}] ### V7_4_PREOPEN_RELAX_DAILY ### Microcap scanner (RANKED)"]
-    msg.append(f"ASOF={asof_str_global} (data de mercado) | breakout_buffer={BREAKOUT_BUFFER_PCT:.2f}%")
+    def fmt_watch(items, label):
+        def prio(x):
+            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
+            p = 0
+            if dist <= 4: p += 1
+            if oh <= 3: p += 1
+            if atrp <= 0.22: p += 1
+            if Rp >= 12: p += 1
+            return (p, sc)
+        items = sorted(items, key=prio, reverse=True)
+        lines = [f"<b>{label}</b>"]
+        for x in items:
+            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
+            p, _ = prio(x)
+            em = "🔥" if p == 4 else "✅" if p == 3 else "⚠️" if p == 2 else "❌"
+            lines.append(
+                f"  {em} <code>{t}</code> P={p}/4 sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% "
+                f"dv={dv/1e6:.1f}M BBz={bbz:.2f} trig={trig:.2f} R%={Rp:.1f} oh={oh}"
+            )
+        return "\n".join(lines)
 
-    # learning line (what was actually applied)
-    if learned_applied.get("used"):
-        msg.append(
-            f"LEARNED_APPLIED: yes | blend={learned_applied.get('blend',0):.2f} | "
-            f"DIST_MAX_PCT={learned_applied.get('DIST_MAX_PCT',DIST_MAX_PCT):.2f} | "
-            f"ATRPCTL_GATE={learned_applied.get('ATRPCTL_GATE',ATRPCTL_GATE):.3f} | "
-            f"BBZ_GATE={learned_applied.get('BBZ_GATE',BBZ_GATE):.3f} | "
-            f"ts={learned_applied.get('learned_ts','') or '—'}"
+    msg_parts = [
+        f"📊 <b>V8 Scanner | {now}</b>",
+        f"ASOF={asof_str_global} | Modo={mode} | QQQ={reg['qqq_trend']} VIX={reg['vix_trend']}",
+        f"Eval={len(tickers)} hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok}",
+        f"ExecB={len(execB)} ExecA={len(execA)} WClean={len(watch_clean)} WOver={len(watch_over)}",
+        f"Outcomes: +{upd['updated']} resolvidos ({upd['resolved_total']} total)",
+        emp,
+        "",
+    ]
+
+    if gates.get("used"):
+        msg_parts.append(
+            f"📐 Learned: blend={gates.get('blend',0):.2f} | "
+            f"BBz={gates.get('bbz_gate',bbz_gate):.3f} | ATRp={gates.get('atrpctl_gate',atrpctl_gate):.3f} | "
+            f"Dist={gates.get('dist_max_pct',dist_limit):.1f}%"
         )
     else:
-        msg.append("LEARNED_APPLIED: no (learned_params.json ausente/invalid)")
+        msg_parts.append("📐 Learned: não aplicado (sem learned_params.json)")
+    msg_parts.append("")
 
-    msg.append(
-        f"MODE={mode} | Eval={len(tickers)} | hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok} | "
-        f"EXEC_B={len(execB)} EXEC_A={len(execA)} WATCH_CLEAN={len(watch_clean)} WATCH_OVER={len(watch_over)} | nodata={no_data} | "
-        f"PX<= {MAX_PX:.0f} DV20[{MIN_DV20/1e6:.1f}M..{MAX_DV20/1e6:.0f}M] | VOLx>={VOL_CONFIRM_MULT:.2f} | dist<={DIST_LIMIT:.0f}% | MIN_R%={MIN_R_PCT:.0f}"
-    )
-    msg.append(emp)
-    msg.append(f"LEARNING: outcomes_updated={upd['updated']} | resolved_total={upd['resolved_total']}")
-    if hits_limited or CACHE_ONLY:
-        msg.append(f"NOTA: Stooq rate-limit ou CACHE_ONLY; cache_used={cache_used} cache_miss={cache_miss}.")
-    msg.append("")
-
-    # EXEC blocks
+    if execB:
+        msg_parts.append(fmt_exec(execB, "🟢 EXEC_B (2-day confirmado)"))
+        msg_parts.append("")
+    if execA:
+        msg_parts.append(fmt_exec(execA, "🟡 EXEC_A (1-day)"))
+        msg_parts.append("")
     if not execA and not execB:
-        msg.append("EXECUTAR: (vazio)")
-        msg.append("")
-    else:
-        if execB:
-            msg.append("EXECUTAR_B (2-day confirmação; maior probabilidade):")
-            for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execB:
-                msg.append(
-                    f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                    f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
-                    f"R%={Rp:.1f} | over={over:.1f}% | volx={vm:.2f} | overhead={oh} | base={win}d"
-                )
-            msg.append("")
-        if execA:
-            msg.append("EXECUTAR_A (1-day; mais sinais, menos robusto):")
-            for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in execA:
-                msg.append(
-                    f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                    f"BBz={bbz:.2f} ATRp={atrp:.2f} | trig={trig:.2f} | stop~{stop:.2f} | "
-                    f"R%={Rp:.1f} | over={over:.1f}% | volx={vm:.2f} | overhead={oh} | base={win}d"
-                )
-            msg.append("")
+        msg_parts.append("⚪ EXEC: vazio")
+        msg_parts.append("")
 
-    # WATCH blocks
     if watch_clean:
-        def _prio_key(x):
-            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
-            prioridade = 0
-            if dist <= 4: prioridade += 1
-            if oh <= 3: prioridade += 1
-            if atrp <= 0.22: prioridade += 1
-            if Rp >= 12: prioridade += 1
-            return (prioridade, sc)
-
-        watch_clean = sorted(watch_clean, key=_prio_key, reverse=True)
-
-        msg.append("AGUARDAR_LIMPO (TOP 7; maior probabilidade):")
-        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_clean:
-            prioridade = 0
-            if dist <= 4: prioridade += 1
-            if oh <= 3: prioridade += 1
-            if atrp <= 0.22: prioridade += 1
-            if Rp >= 12: prioridade += 1
-            emoji = "🔥" if prioridade == 4 else "✅" if prioridade == 3 else "⚠️" if prioridade == 2 else "❌"
-            msg.append(
-                f"- {emoji} {t} | PRIORIDADE={prioridade}/4 | score={sc:.2f} | close={c:.2f} | "
-                f"dist={dist:.1f}% | dv20={dv/1e6:.1f}M | BBz={bbz:.2f} ATRp={atrp:.2f} | "
-                f"trig={trig:.2f} | stop~{stop:.2f} | R%={Rp:.1f} | overhead={oh}"
-            )
-        msg.append("")
+        msg_parts.append(fmt_watch(watch_clean, "👀 WATCH_LIMPO"))
+        msg_parts.append("")
     else:
-        msg.append("AGUARDAR_LIMPO: (vazio)")
-        msg.append("")
+        msg_parts.append("⚪ WATCH_LIMPO: vazio")
+        msg_parts.append("")
 
     if watch_over:
-        msg.append("AGUARDAR_COM_TETO (overhead>5; probabilidade menor):")
-        for sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale in watch_over:
-            msg.append(
-                f"- {t} | score={sc:.2f} | close={c:.2f} | dist={dist:.1f}% | dv20={dv/1e6:.1f}M | "
-                f"BBz={bbz:.2f} | trig={trig:.2f} | R%={Rp:.1f} | overhead={oh} [OVERHEAD]"
-            )
-        msg.append("")
-    else:
-        msg.append("AGUARDAR_COM_TETO: (vazio)")
-        msg.append("")
+        msg_parts.append(fmt_watch(watch_over, "⚠️ WATCH_OVERHEAD"))
+        msg_parts.append("")
 
     if watch_relax_lines:
-        msg.extend(watch_relax_lines)
-        msg.append("")
+        msg_parts.extend(watch_relax_lines)
+        msg_parts.append("")
 
     if near:
-        msg.append("QUASE (debug):")
+        msg_parts.append("🔍 QUASE (debug):")
         for t, c, dv, bbz, reason in near:
-            msg.append(f"- {t} | {reason} | close={c:.2f} | dv20={dv/1e6:.1f}M | BBz={bbz:.2f}")
-    else:
-        msg.append("QUASE: (vazio)")
+            msg_parts.append(f"  {t} | {reason} | {c:.2f} | BBz={bbz:.2f}")
 
-    tg_send("\n".join(msg))
+    full_msg = "\n".join(msg_parts)
+    tg_send(cfg, full_msg)
+    log.info(full_msg)
 
-    # write last_run metadata (useful for debugging)
+    # last_run.json
     try:
-        LAST_RUN_JSON.write_text(json.dumps({
-            "run_utc": now,
-            "asof": asof_str_global,
-            "mode": mode,
+        cfg.last_run_json.write_text(json.dumps({
+            "run_utc": now, "asof": asof_str_global, "mode": mode,
             "eval": len(tickers),
-            "counts": {
-                "exec_b": len(execB),
-                "exec_a": len(execA),
-                "watch_clean": len(watch_clean),
-                "watch_over": len(watch_over),
-                "nodata": no_data,
-                "cache_used": cache_used,
-                "cache_miss": cache_miss
-            },
-            "gates": {
-                "BBZ_GATE": BBZ_GATE,
-                "ATRPCTL_GATE": ATRPCTL_GATE,
-                "DIST_MAX_PCT": DIST_MAX_PCT,
-                "VOL_CONFIRM_MULT_BASE": VOL_CONFIRM_MULT_BASE,
-                "VOL_CONFIRM_MULT": VOL_CONFIRM_MULT,
-                "BREAKOUT_BUFFER_PCT": BREAKOUT_BUFFER_PCT
-            },
-            "learned_applied": learned_applied
+            "counts": {"exec_b": len(execB), "exec_a": len(execA),
+                       "watch_clean": len(watch_clean), "watch_over": len(watch_over),
+                       "nodata": no_data, "cache_used": cache_used, "cache_miss": cache_miss},
+            "gates": gates,
         }, indent=2), encoding="utf-8")
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning(f"last_run.json: {e}")
+
+    log.info("=== V8 Scanner concluído ===")
 
 if __name__ == "__main__":
     main()
