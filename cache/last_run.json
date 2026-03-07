@@ -1,32 +1,24 @@
 {
-  "run_utc": "2026-03-06 14:02 UTC",
-  "asof": "2026-03-05",
+  "run_utc": "2026-03-07 21:18 UTC",
+  "asof": "2026-03-06",
   "mode": "TRANSITION",
   "eval": 450,
   "counts": {
     "exec_b": 0,
     "exec_a": 0,
-    "watch_clean": 4,
-    "watch_over": 6,
+    "watch_clean": 3,
+    "watch_over": 5,
     "nodata": 0,
     "cache_used": 0,
     "cache_miss": 0
   },
   "gates": {
-    "BBZ_GATE": -0.60625,
-    "ATRPCTL_GATE": 0.4975,
-    "DIST_MAX_PCT": 17.875,
-    "VOL_CONFIRM_MULT_BASE": 1.12125,
-    "VOL_CONFIRM_MULT": 1.14125,
-    "BREAKOUT_BUFFER_PCT": 0.0
-  },
-  "learned_applied": {
+    "bbz_gate": -0.60625,
+    "atrpctl_gate": 0.4975,
+    "dist_max_pct": 17.875,
+    "vol_confirm_mult_base": 1.12125,
     "used": true,
     "blend": 0.25,
-    "DIST_MAX_PCT": 17.875,
-    "ATRPCTL_GATE": 0.4975,
-    "BBZ_GATE": -0.60625,
-    "VOL_CONFIRM_MULT_BASE": 1.12125,
     "learned_ts": ""
   }
 }
