@@ -1,15 +1,18 @@
-# scanner.py (V8_AUDITED_IMPROVED) — baseado em V7_4_PREOPEN_RELAX_DAILY
-# MELHORIAS aplicadas após auditoria completa:
-# 1. Logging estruturado (substituir prints silenciosos)
-# 2. Eliminar mutação de globais em apply_learned_params (anti-pattern)
-# 3. Cache _KEYS_BY_ASOF thread-safe e invalidado correctamente
-# 4. base_scan com early-exit e melhor score normalizado
-# 5. Fallback robusto para Stooq rate-limit com exponential backoff
-# 6. Telegram: chunking automático (limite 4096 chars)
-# 7. Regime: VIX via Stooq index ticker correcto (^VIX)
-# 8. overhead_supply_touches: lógica corrigida (usava close, devia usar high)
-# 9. update_outcomes: evitar reprocessar resolvidos (era O(n) desnecessário)
-# 10. Separação clara CONFIG / INDICATORS / IO / SIGNALS / MAIN
+# scanner.py (V9_PERFORMANCE) — baseado em V8_AUDITED_IMPROVED
+# MELHORIAS V8 (auditoria estrutural):
+# 1-10. Ver histórico V8
+#
+# MELHORIAS V9 (performance — baseadas em análise MAE/MFE semanal):
+# A. Base position filter: close deve estar nos 65%+ superiores da base
+#    (elimina entradas prematuras — causa raiz do MAE -8.7%)
+# B. Dryup progressivo: volume deve estar a secar em 3 semanas consecutivas
+#    (não só v10/v60 — detecta dry-up sustentado vs ruído pontual)
+# C. Força relativa vs QQQ (RS20): filtra stocks que underperformam o índice
+#    (com QQQ=DOWN, só interessa quem aguenta melhor)
+# D. DIST_MAX_PCT reduzido: 18% → 12% (default)
+#    (distâncias grandes = MAE enorme antes de chegar ao trigger)
+# E. Base mínima 30 dias: remove janelas de 20 e 25 dias do base_scan
+#    (bases curtas raramente absorvem oferta suficientemente)
 
 import os, io, time, csv, json, logging
 import requests
@@ -67,8 +70,14 @@ class Config:
 
     vol_confirm_mult_base: float = field(default_factory=lambda: float(os.environ.get("VOL_CONFIRM_MULT", "1.12")))
     max_gap_up: float = field(default_factory=lambda: float(os.environ.get("MAX_GAP_UP", "1.14")))
-    dist_max_pct: float = field(default_factory=lambda: float(os.environ.get("DIST_MAX_PCT", "18.0")))
+    dist_max_pct: float = field(default_factory=lambda: float(os.environ.get("DIST_MAX_PCT", "12.0")))
     exec_max_overshoot_pct: float = field(default_factory=lambda: float(os.environ.get("EXEC_MAX_OVERSHOOT_PCT", "8.0")))
+
+    # V9 A: base position — close deve estar no top (1-base_position_min) da base
+    base_position_min: float = field(default_factory=lambda: float(os.environ.get("BASE_POSITION_MIN", "0.65")))
+
+    # V9 C: força relativa mínima vs QQQ 20 dias (-0.05 = tolera até -5pp)
+    rs20_min: float = field(default_factory=lambda: float(os.environ.get("RS20_MIN", "-0.05")))
 
     exec_bbz_max: float = field(default_factory=lambda: float(os.environ.get("EXEC_BBZ_MAX", "-0.90")))
     exec_atrpctl_max: float = field(default_factory=lambda: float(os.environ.get("EXEC_ATRPCTL_MAX", "0.38")))
@@ -404,7 +413,7 @@ def base_scan(df: pd.DataFrame, cfg: Config) -> tuple:
         return (False, np.nan, np.nan, np.nan, np.nan, 0)
 
     best = None
-    for win in [20, 25, 30, 35, 40, 50, 60, 70, 80]:
+    for win in [30, 35, 40, 50, 60, 70, 80]:  # V9 E: mínimo 30 dias (bases curtas não absorvem oferta)
         base = df.iloc[-win:]
         highb = float(base["high"].max())
         lowb = float(base["low"].min())
@@ -433,11 +442,23 @@ def base_scan(df: pd.DataFrame, cfg: Config) -> tuple:
     return (True, float(highb), float(lowb), float(dd), float(contr), int(win))
 
 def dryup_ratio(df: pd.DataFrame) -> float:
-    v10 = float(df["volume"].iloc[-10:].mean())
-    v60 = float(df["volume"].iloc[-60:].mean())
-    if v60 <= 0:
+    """
+    V9 B: dry-up progressivo em 3 semanas consecutivas.
+    Retorna v10/v60 (< 1.0 = secando) MAS só passa se tendência for decrescente
+    (cada semana mais seca que a anterior). Penaliza se volume voltou a subir.
+    """
+    v_w1 = float(df["volume"].iloc[-5:].mean())    # semana mais recente
+    v_w2 = float(df["volume"].iloc[-10:-5].mean()) # semana anterior
+    v_w3 = float(df["volume"].iloc[-15:-10].mean())# 2 semanas atrás
+    v60  = float(df["volume"].iloc[-60:].mean())
+    if v60 <= 0 or v_w3 <= 0:
         return np.nan
-    return v10 / v60
+    # ratio base (compatível com DRYUP_MAX gate existente)
+    ratio = v_w1 / v60
+    # V9 B: penalizar se a tendência não é progressivamente decrescente
+    if not (v_w1 < v_w2 < v_w3):
+        ratio = ratio * 1.25  # eleva ratio artificialmente -> vai falhar o gate
+    return ratio
 
 def overhead_supply_touches(df: pd.DataFrame, trig: float, cfg: Config) -> int:
     """FIX #8: usa HIGH (não close) para detectar toque real no overhead"""
@@ -485,6 +506,22 @@ def score_candidate(
     s -= stale_penalty
     return float(s)
 
+
+def compute_rs20(df: pd.DataFrame, qqq_df: Optional[pd.DataFrame]) -> Optional[float]:
+    """
+    V9 C: força relativa vs QQQ nos últimos 20 dias.
+    Retorna (ret_stock - ret_qqq). None se QQQ não disponível (não filtra).
+    """
+    if qqq_df is None or len(qqq_df) < 21 or len(df) < 21:
+        return None
+    try:
+        ret_stock = float(df["close"].iloc[-1]) / float(df["close"].iloc[-20]) - 1.0
+        ret_qqq   = float(qqq_df["close"].iloc[-1]) / float(qqq_df["close"].iloc[-20]) - 1.0
+        rs = ret_stock - ret_qqq
+        return rs if np.isfinite(rs) else None
+    except Exception:
+        return None
+
 # =========================
 # Regime logic (EOD)
 # =========================
@@ -531,6 +568,7 @@ def regime_snapshot(cfg: Config) -> dict:
     else:
         out.update({"mode": "TRANSITION", "vol_mult_adj": +0.02, "dist_adj": -1.0})
 
+    out["qqq_df"] = qqq  # V9 C: reutilizado para RS20 no loop principal
     return out
 
 # =========================
@@ -752,7 +790,7 @@ def main() -> None:
     cfg = Config()
     cfg.ensure_dirs()
 
-    log.info("=== V8 Scanner iniciado ===")
+    log.info("=== V9 Scanner iniciado ===")
 
     # Apply learned params (retorna dict, não muta cfg)
     gates = apply_learned_params(cfg)
@@ -872,6 +910,23 @@ def main() -> None:
                 near.append((t, close_now, dv20, bbz_last, "BASE"))
                 continue
             base_ok += 1
+
+            # V9 A: base position filter — close deve estar nos 65%+ superiores da base
+            base_range = trig - lowb
+            if base_range > 0:
+                base_pos = (close_now - lowb) / base_range
+                if base_pos < cfg.base_position_min:
+                    near.append((t, close_now, dv20, bbz_last, f"BASE_POS({base_pos:.2f}<{cfg.base_position_min})"))
+                    near_relax.append(("BPOS", t, close_now, dv20, bbz_last, atr_pctl))
+                    continue
+
+            # V9 C: força relativa vs QQQ (RS20)
+            qqq_df_reg = reg.get("qqq_df")
+            rs20 = compute_rs20(df, qqq_df_reg)
+            if rs20 is not None and rs20 < cfg.rs20_min:
+                near.append((t, close_now, dv20, bbz_last, f"RS20({rs20:.2f}<{cfg.rs20_min})"))
+                near_relax.append(("RS20", t, close_now, dv20, bbz_last, atr_pctl))
+                continue
 
             dry = dryup_ratio(df)
             if (not np.isfinite(dry)) or (dry >= cfg.dryup_max):
@@ -1009,7 +1064,7 @@ def main() -> None:
         return "\n".join(lines)
 
     msg_parts = [
-        f"📊 <b>V8 Scanner | {now}</b>",
+        f"📊 <b>V9 Scanner | {now}</b>",
         f"ASOF={asof_str_global} | Modo={mode} | QQQ={reg['qqq_trend']} VIX={reg['vix_trend']}",
         f"Eval={len(tickers)} hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok}",
         f"ExecB={len(execB)} ExecA={len(execA)} WClean={len(watch_clean)} WOver={len(watch_over)}",
