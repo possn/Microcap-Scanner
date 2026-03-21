@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "asof": "2026-03-09",
+  "blend": 0.25,
+  "params": {
+    "DIST_MAX_PCT": 18.25,
+    "ATRPCTL_GATE": 0.505,
+    "BBZ_GATE": -0.5874999999999999,
+    "VOL_CONFIRM_MULT": 1.1175000000000002
+  },
+  "meta": {
+    "action": "RELAX",
+    "edge_pp": 12.903225806451616,
+    "edge_mfe_pp": 3.227131062570665,
+    "cov_used": 31,
+    "watch_count": 31,
+    "baseline_cov": 31,
+    "baseline_cov_ratio": 1.0,
+    "baseline_fallback": 0,
+    "breakout_buffer_pct": 0.5
+  }
+}
