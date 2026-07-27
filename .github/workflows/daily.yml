@@ -35,6 +35,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Run tests
+        run: PYTHONPATH=. pytest -q
+
       - name: Run Heartbeat Stage 2 scanner
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
@@ -64,8 +67,14 @@ jobs:
 
           MIN_AVG_VOLUME_20: "100000"
           MIN_AVG_DOLLAR_VOLUME_20: "75000"
-          MAX_CANDIDATES: "500"
+          MAX_CANDIDATES: "0"
+          BREAKOUT_VOLUME_WINDOW: "3"
+          NEAR_MISS_LIMIT: "5"
           MAX_RESULTS: "10"
+          MIN_QUALITY_SCORE: "68"
+          MIN_REWARD_RISK: "2.0"
+          MIN_CLOSE_LOCATION: "0.60"
+          MAX_FAILED_BREAKOUTS: "3"
           REQUEST_PAUSE: "0.12"
         run: python scanner.py
 
@@ -74,6 +83,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git pull --rebase || true
-          git add cache/heartbeat_results.json cache/heartbeat_results.csv cache/last_run.json cache/ohlcv || true
+          git add cache/heartbeat_results.json cache/heartbeat_results.csv cache/last_run.json cache/signal_journal.json cache/ohlcv || true
           git commit -m "Update Heartbeat Stage 2 scan" || exit 0
           git push
