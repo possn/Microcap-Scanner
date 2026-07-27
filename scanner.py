@@ -259,6 +259,24 @@ def parse_money(value: Any) -> Optional[float]:
 # ---------------------------------------------------------------------------
 # Universe: Nasdaq-listed stocks only
 # ---------------------------------------------------------------------------
+NON_COMMON_NAME_RE = re.compile(
+    r"\b(warrants?|rights?|units?|preferred|depositary|notes?)\b", re.IGNORECASE
+)
+
+
+def is_probably_common_stock(ticker: str, name: str) -> bool:
+    """Exclude warrants/rights/units, abundant and toxic below $1.
+
+    Nasdaq 5th-letter convention: W=warrant, R=right, U=unit. Name regex catches
+    the rest (e.g. 4-letter warrant symbols listed with explicit names).
+    """
+    if len(ticker) == 5 and ticker[-1] in {"W", "R", "U"}:
+        return False
+    if NON_COMMON_NAME_RE.search(name or ""):
+        return False
+    return True
+
+
 def fetch_nasdaq_universe(cfg: Config) -> list[UniverseRow]:
     url = (
         "https://api.nasdaq.com/api/screener/stocks"
@@ -281,6 +299,8 @@ def fetch_nasdaq_universe(cfg: Config) -> list[UniverseRow]:
         cap = parse_money(row.get("marketCap"))
         volume = parse_money(row.get("volume"))
         if not ticker or price is None:
+            continue
+        if not is_probably_common_stock(ticker, str(row.get("name") or "")):
             continue
         if not (cfg.min_price <= price < cfg.max_price):
             continue
@@ -372,7 +392,14 @@ def load_ohlcv(ticker: str, cfg: Config) -> Optional[pd.DataFrame]:
             log.debug("%s OHLCV falhou em %s: %s", ticker, loader.__name__, exc)
     if frame is not None:
         frame.to_csv(path, index=False)
-    return frame
+        return frame
+    # Both remote sources failed: a stale cache beats no data at all.
+    if path.exists():
+        try:
+            return _normalise_ohlcv(pd.read_csv(path))
+        except Exception:  # noqa: BLE001
+            pass
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -417,9 +444,21 @@ def swing_slopes(base: pd.DataFrame) -> tuple[float, float]:
     # Compare successive 10-session extrema. Negative high slope + positive low
     # slope is the geometric signature of a triangle/VCP.
     blocks = max(4, min(10, len(base) // 10))
-    chunks = np.array_split(base.tail(blocks * 10), blocks)
-    highs = [chunk["high"].max() for chunk in chunks if not chunk.empty]
-    lows = [chunk["low"].min() for chunk in chunks if not chunk.empty]
+    tail = base.tail(blocks * 10)
+    # Positional slicing, not np.array_split. np.array_split on a DataFrame
+    # routes through the deprecated DataFrame.swapaxes and returns raw ndarrays
+    # under pandas 3.x, which raises AttributeError here — an exception that the
+    # caller's broad try/except swallows, turning every candidate into a silent
+    # "error" and making a fully broken scan look like a legitimately empty one.
+    bounds = np.linspace(0, len(tail), blocks + 1).astype(int)
+    highs: list[float] = []
+    lows: list[float] = []
+    for start, stop in zip(bounds[:-1], bounds[1:]):
+        if stop <= start:
+            continue
+        chunk = tail.iloc[start:stop]
+        highs.append(float(chunk["high"].max()))
+        lows.append(float(chunk["low"].min()))
     scale = max(float(base["close"].median()), 1e-6)
     return linear_slope(lows) / scale, linear_slope(highs) / scale
 
@@ -647,8 +686,12 @@ def enhanced_metrics(base: dict[str, Any], breakout: dict[str, Any], df: pd.Data
     clv=close_location(volrow)
     pre=df.iloc[max(0, breakout["idx"]-20):breakout["idx"]]
     dry=float(pre["volume"].tail(10).mean()/max(pre["volume"].tail(50).mean(),1)) if len(pre)>=10 else 1.0
-    rs20=aligned_return(df, BENCHMARKS.get("QQQ"), 20)
-    rs60=aligned_return(df, BENCHMARKS.get("QQQ"), 60)
+    # IWM is the correct RS benchmark for micro caps; QQQ only as fallback.
+    rs_bench = BENCHMARKS.get("IWM")
+    if rs_bench is None:
+        rs_bench = BENCHMARKS.get("QQQ")
+    rs20=aligned_return(df, rs_bench, 20)
+    rs60=aligned_return(df, rs_bench, 60)
     resistance=float(base["resistance"]); current=float(df["close"].iloc[-1])
     rbreak=current/resistance-1 if resistance else 0.0
     support=min(float(base["support"]), float(breakout["sma150"]))
@@ -761,7 +804,7 @@ def human_number(value: Optional[float]) -> str:
     return f"{value:.0f}"
 
 
-def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], near_misses: list[dict[str, Any]]) -> str:
+def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], near_misses: list[dict[str, Any]], calibration: Optional[str] = None) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     reason_labels = {
         "no_history": "sem histórico/dados",
@@ -836,7 +879,10 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
             suffix = f" | {', '.join(metrics)}" if metrics else ""
             header.append(f"• {item['ticker']}: falhou {reason_labels.get(item['reason'], item['reason'])}{suffix}")
 
+    if calibration:
+        header.extend(["", calibration])
     header.append("\nA análise SEC/diluição continua manual.")
+    header.append("Score = ranking técnico. Só é probabilidade depois de calibrado com amostra suficiente.")
     return "\n".join(header)
 
 def tg_send(cfg: Config, text: str) -> None:
@@ -903,37 +949,156 @@ def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int
 
 
 
-def update_signal_journal(results: list[TechnicalResult], cfg: Config) -> None:
+JOURNAL_HORIZONS = (5, 10, 20, 40, 60)
+CONTROL_REASONS = {"weak_close", "poor_reward_risk", "repeated_failures", "quality_score"}
+
+
+def update_signal_journal(
+    results: list[TechnicalResult],
+    cfg: Config,
+    near_misses: Optional[list[dict[str, Any]]] = None,
+) -> None:
     """Persist signals and evaluate realised 5/10/20/40/60-session outcomes.
 
-    This is not used to manufacture a probability claim. It creates the data
-    required to calibrate the score empirically over time.
+    Statistical integrity rules:
+    1. Returns are computed against the ADJUSTED close on the signal date taken
+       from the same freshly fetched series ("entry_price_adjusted"), never the
+       stored nominal price. Reverse splits — endemic below $1 — retroactively
+       rescale the whole adjusted history; comparing a stale nominal price with
+       adjusted future prices fabricates phantom gains and corrupts calibration.
+    2. Signals whose data stream dies (delisting/suspension) are explicitly
+       flagged "data_missing" instead of silently dropped; ignoring them is
+       survivorship bias that inflates every hit rate.
+    3. Final-gate rejects are logged as an unpublished control group so the
+       lift of the quality gates can actually be measured.
     """
     try:
         journal = json.loads(cfg.signal_journal_json.read_text(encoding="utf-8")) if cfg.signal_journal_json.exists() else []
     except Exception:
         journal = []
-    today = datetime.now(timezone.utc).date().isoformat()
-    keys={(x.get("ticker"),x.get("signal_date")) for x in journal}
+    today_date = datetime.now(timezone.utc).date()
+    today = today_date.isoformat()
+    keys = {(x.get("ticker"), x.get("signal_date")) for x in journal}
     for r in results:
-        key=(r.ticker,today)
-        if key not in keys:
-            journal.append({"ticker":r.ticker,"signal_date":today,"signal_price":r.price,"score":r.total_score,"band":r.probability_band,"state":r.setup_state,"outcomes":{}})
-    horizons=(5,10,20,40,60)
-    unresolved=[x for x in journal if any(str(h) not in x.get("outcomes",{}) for h in horizons)]
-    for item in unresolved[-150:]:
-        df=load_ohlcv(item["ticker"],cfg)
-        if df is None: continue
-        dates=pd.to_datetime(df["date"]).dt.date
-        sig=datetime.fromisoformat(item["signal_date"]).date()
-        idxs=np.where(dates>=sig)[0]
-        if len(idxs)==0: continue
-        i=int(idxs[0]); entry=float(item["signal_price"]); outcomes=item.setdefault("outcomes",{})
-        for h in horizons:
-            if str(h) not in outcomes and i+h < len(df):
-                segment=df.iloc[i:i+h+1]
-                outcomes[str(h)]={"return_pct":round(100*(float(df.iloc[i+h]["close"])/entry-1),2),"max_gain_pct":round(100*(float(segment["high"].max())/entry-1),2),"max_drawdown_pct":round(100*(float(segment["low"].min())/entry-1),2)}
-    cfg.signal_journal_json.write_text(json.dumps(journal,ensure_ascii=False,indent=2),encoding="utf-8")
+        if (r.ticker, today) not in keys:
+            journal.append({
+                "ticker": r.ticker, "signal_date": today, "signal_price": r.price,
+                "score": r.total_score, "band": r.probability_band, "state": r.setup_state,
+                "published": True, "outcomes": {},
+            })
+            keys.add((r.ticker, today))
+    for item in near_misses or []:
+        if item.get("reason") not in CONTROL_REASONS:
+            continue
+        ticker = item.get("ticker")
+        price = item.get("latest_price")
+        if not ticker or price is None or (ticker, today) in keys:
+            continue
+        journal.append({
+            "ticker": ticker, "signal_date": today, "signal_price": float(price),
+            "score": item.get("quality_score"), "band": None, "state": None,
+            "published": False, "reject_reason": item["reason"], "outcomes": {},
+        })
+        keys.add((ticker, today))
+
+    def _pending(entry: dict[str, Any]) -> bool:
+        outcomes = entry.get("outcomes", {})
+        return any(str(h) not in outcomes for h in JOURNAL_HORIZONS)
+
+    unresolved = [x for x in journal if _pending(x)]
+    for item in unresolved[-200:]:
+        sig = datetime.fromisoformat(item["signal_date"]).date()
+        age_days = (today_date - sig).days
+        df = load_ohlcv(item["ticker"], cfg)
+        outcomes = item.setdefault("outcomes", {})
+        if df is None:
+            if age_days > 120:
+                for h in JOURNAL_HORIZONS:
+                    outcomes.setdefault(str(h), {"data_missing": True})
+                item["data_missing_note"] = "sem dados >120d — possível delisting/suspensão"
+            continue
+        dates = pd.to_datetime(df["date"]).dt.date
+        idxs = np.where(dates >= sig)[0]
+        if len(idxs) == 0:
+            continue
+        i = int(idxs[0])
+        entry = float(df.iloc[i]["close"])  # adjusted series: reverse-split safe
+        item["entry_price_adjusted"] = round(entry, 6)
+        last_date = dates.iloc[-1]
+        stream_dead = (today_date - last_date).days > 21
+        for h in JOURNAL_HORIZONS:
+            key = str(h)
+            if key in outcomes:
+                continue
+            if i + h < len(df):
+                segment = df.iloc[i + 1 : i + h + 1]  # post-entry window only
+                outcomes[key] = {
+                    "return_pct": round(100 * (float(df.iloc[i + h]["close"]) / entry - 1), 2),
+                    "max_gain_pct": round(100 * (float(segment["high"].max()) / entry - 1), 2),
+                    "max_drawdown_pct": round(100 * (float(segment["low"].min()) / entry - 1), 2),
+                }
+            elif stream_dead:
+                outcomes[key] = {
+                    "data_missing": True,
+                    "truncated_return_pct": round(100 * (float(df.iloc[-1]["close"]) / entry - 1), 2),
+                }
+    cfg.signal_journal_json.write_text(json.dumps(journal, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def wilson_ci(successes: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval — correct for small samples, unlike the normal
+    approximation, which is invalid at the sample sizes this journal will hold
+    for months."""
+    if n <= 0:
+        return 0.0, 1.0
+    p = successes / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    margin = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - margin), min(1.0, centre + margin)
+
+
+def calibration_summary(cfg: Config, horizon: int = 20, min_n: int = 20) -> Optional[str]:
+    """Empirical hit rates (published vs control) with Wilson 95% CIs.
+
+    data_missing signals count as failures: assuming the worst for dead data
+    streams is the only assumption that does not flatter the model.
+    """
+    try:
+        journal = json.loads(cfg.signal_journal_json.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    groups: dict[str, list[float]] = {"publicados": [], "controlo": []}
+    missing = {"publicados": 0, "controlo": 0}
+    for item in journal:
+        outcome = (item.get("outcomes") or {}).get(str(horizon))
+        if not outcome:
+            continue
+        group = "publicados" if item.get("published", True) else "controlo"
+        if outcome.get("data_missing"):
+            missing[group] += 1
+            groups[group].append(-100.0)  # worst-case assumption
+        else:
+            groups[group].append(float(outcome["return_pct"]))
+    if len(groups["publicados"]) < min_n:
+        resolved = len(groups["publicados"])
+        return (
+            f"CALIBRAÇÃO ({horizon} sessões): amostra insuficiente "
+            f"({resolved}/{min_n} sinais resolvidos). O score continua a ser um ranking, não uma probabilidade."
+        )
+    lines = [f"CALIBRAÇÃO EMPÍRICA — retorno a {horizon} sessões"]
+    for group, values in groups.items():
+        if not values:
+            continue
+        n = len(values)
+        wins = sum(1 for v in values if v > 0)
+        lo, hi = wilson_ci(wins, n)
+        median = float(np.median(values))
+        note = f", {missing[group]} sem dados (contados como perda)" if missing[group] else ""
+        lines.append(
+            f"• {group}: n={n}, %positivos {100*wins/n:.0f}% (IC95 {100*lo:.0f}–{100*hi:.0f}%), mediana {median:+.1f}%{note}"
+        )
+    return "\n".join(lines)
 
 def main() -> None:
     global MARKET_REGIME
@@ -990,13 +1155,28 @@ def main() -> None:
         if cfg.request_pause:
             time.sleep(cfg.request_pause)
 
+    # A broken scan and an empty scan produce the same Telegram message unless
+    # the error rate is checked. Fail loudly instead of implying "no setups".
+    errors = funnel.get("reason:error", 0)
+    error_rate = errors / max(scanned, 1)
+    if scanned >= 20 and error_rate > 0.25:
+        alert = (
+            "🚨 HEARTBEAT — VARRIMENTO INVÁLIDO\n"
+            f"{errors}/{scanned} candidatas falharam com erro técnico ({100*error_rate:.0f}%).\n"
+            "O resultado de hoje NÃO é 'nenhum setup': é um varrimento corrompido. Ver cache/scanner.log."
+        )
+        log.error("Taxa de erro %.0f%% — varrimento inválido.", 100 * error_rate)
+        tg_send(cfg, alert)
+
     results.sort(key=lambda item: (item.total_score, item.technical_score), reverse=True)
     results = results[: cfg.max_results]
     near_misses.sort(key=lambda x: (x.get("progress", 0), x.get("breakout_volume_multiple", 0), x.get("base_sessions", 0)), reverse=True)
+    control_pool = list(near_misses)  # full reject pool: the control group must not be truncated
     near_misses = near_misses[: cfg.near_miss_limit]
     save_outputs(results, cfg, len(universe), scanned, funnel, near_misses)
-    update_signal_journal(results, cfg)
-    message = telegram_message(results, funnel, near_misses)
+    update_signal_journal(results, cfg, control_pool)
+    calibration = calibration_summary(cfg)
+    message = telegram_message(results, funnel, near_misses, calibration)
     tg_send(cfg, message)
     log.info("Concluído: %d/%d qualificadas", len(results), scanned)
 

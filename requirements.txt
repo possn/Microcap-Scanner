@@ -1,4 +1,5 @@
 pandas>=2.1,<3
 numpy>=1.26,<3
+# pandas 3.x removeu DataFrame.swapaxes; ver nota em swing_slopes()
 requests>=2.31,<3
 pytest>=8,<10
