@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-07-27T18:44:43.062342+00:00",
-  "universe_size": 308,
-  "scanned": 308,
+  "generated_at": "2026-07-27T22:31:01.661998+00:00",
+  "universe_size": 304,
+  "scanned": 304,
   "qualified": 0,
   "criteria": {
     "exchange": "NASDAQ",
@@ -15,21 +15,19 @@
     "maximum_gain_since_breakout": 0.5
   },
   "funnel": {
-    "universe": 308,
-    "scanned": 308,
-    "reason:no_sma150_cross": 175,
-    "history_ok": 300,
-    "liquidity_ok": 219,
+    "universe": 304,
+    "scanned": 304,
+    "reason:no_sma150_cross": 174,
+    "history_ok": 296,
+    "liquidity_ok": 217,
     "reason:liquidity": 79,
     "reason:below_sma150": 26,
     "reason:breakout_volume": 14,
     "reason:no_history": 3,
-    "reason:falling_sma150": 1,
     "reason:short_history": 5,
     "reason:base_compression": 2,
     "breakout_ok": 2,
-    "reason:extended_sma": 1,
-    "reason:price_changed": 2
+    "reason:extended_sma": 1
   },
   "near_misses": [
     {
@@ -81,13 +79,13 @@
       "progress": 4
     },
     {
-      "ticker": "CNET",
-      "name": "ZW Data Action Technologies Inc. Common Stock",
+      "ticker": "CELZ",
+      "name": "Creative Medical Technology Holdings Inc. Common Stock",
       "history_sessions": 499,
-      "latest_price": 0.9399999976158142,
-      "avg_volume_20": 256999.6,
-      "avg_dollar_volume_20": 298956.8815354586,
-      "reason": "falling_sma150",
+      "latest_price": 0.7957000136375427,
+      "avg_volume_20": 10138315.7,
+      "avg_dollar_volume_20": 14459400.407565933,
+      "reason": "below_sma150",
       "progress": 4
     }
   ],
