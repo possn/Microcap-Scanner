@@ -1,1137 +1,781 @@
-# scanner.py (V9_PERFORMANCE) — baseado em V8_AUDITED_IMPROVED
-# MELHORIAS V8 (auditoria estrutural):
-# 1-10. Ver histórico V8
-#
-# MELHORIAS V9 (performance — baseadas em análise MAE/MFE semanal):
-# A. Base position filter: close deve estar nos 65%+ superiores da base
-#    (elimina entradas prematuras — causa raiz do MAE -8.7%)
-# B. Dryup progressivo: volume deve estar a secar em 3 semanas consecutivas
-#    (não só v10/v60 — detecta dry-up sustentado vs ruído pontual)
-# C. Força relativa vs QQQ (RS20): filtra stocks que underperformam o índice
-#    (com QQQ=DOWN, só interessa quem aguenta melhor)
-# D. DIST_MAX_PCT reduzido: 18% → 12% (default)
-#    (distâncias grandes = MAE enorme antes de chegar ao trigger)
-# E. Base mínima 30 dias: remove janelas de 20 e 25 dias do base_scan
-#    (bases curtas raramente absorvem oferta suficientemente)
+"""Heartbeat Stage 2 Scanner.
 
-import os, io, time, csv, json, logging
-import requests
-import pandas as pd
-import numpy as np
+Strict NASDAQ sub-$1 scanner designed to detect prolonged volatility contraction
+bases shortly after a high-volume reclaim of the 150-day simple moving average.
+
+Data sources (no paid API required):
+- Nasdaq public stock screener: exchange membership, last price, market cap, volume.
+- Yahoo chart endpoint, with Stooq fallback: daily OHLCV.
+
+The scanner never pads the result set. A ticker is published only when every hard
+technical criterion is satisfied. Float is reported only when available from market-data sources; no SEC or financial-risk analysis is performed automatically.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import math
+import os
+import re
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Iterable, Optional
 
-# =========================
-# LOGGING
-# =========================
+import numpy as np
+import pandas as pd
+import requests
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("cache/scanner.log", encoding="utf-8")
-    ]
+        logging.FileHandler(CACHE_DIR / "scanner.log", encoding="utf-8"),
+    ],
 )
-log = logging.getLogger("scanner")
+log = logging.getLogger("heartbeat-stage2")
 
-# =========================
-# CONFIG (dataclass — sem globals mutáveis)
-# =========================
-@dataclass
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
 class Config:
-    cache_only: bool = field(default_factory=lambda: os.environ.get("CACHE_ONLY", "0") == "1")
-    tg_token: str = field(default_factory=lambda: os.environ.get("TG_BOT_TOKEN", ""))
-    tg_chat_id: str = field(default_factory=lambda: os.environ.get("TG_CHAT_ID", ""))
+    tg_token: str = field(default_factory=lambda: os.getenv("TG_BOT_TOKEN", ""))
+    tg_chat_id: str = field(default_factory=lambda: os.getenv("TG_CHAT_ID", ""))
 
-    iwc_url: str = field(default_factory=lambda: os.environ.get("IWC_HOLDINGS_CSV_URL", ""))
-    iwm_url: str = field(default_factory=lambda: os.environ.get("IWM_HOLDINGS_CSV_URL", ""))
-    ijr_url: str = field(default_factory=lambda: os.environ.get("IJR_HOLDINGS_CSV_URL", ""))
+    max_price: float = field(default_factory=lambda: float(os.getenv("MAX_PRICE", "1.0")))
+    min_price: float = field(default_factory=lambda: float(os.getenv("MIN_PRICE", "0.08")))
+    min_history_sessions: int = field(
+        default_factory=lambda: int(os.getenv("MIN_HISTORY_SESSIONS", "190"))
+    )
+    min_base_sessions: int = field(
+        default_factory=lambda: int(os.getenv("MIN_BASE_SESSIONS", "84"))
+    )
+    preferred_base_sessions: int = field(
+        default_factory=lambda: int(os.getenv("PREFERRED_BASE_SESSIONS", "126"))
+    )
+    max_base_sessions: int = field(
+        default_factory=lambda: int(os.getenv("MAX_BASE_SESSIONS", "252"))
+    )
+    breakout_min_age: int = field(
+        default_factory=lambda: int(os.getenv("BREAKOUT_MIN_AGE", "10"))
+    )
+    breakout_max_age: int = field(
+        default_factory=lambda: int(os.getenv("BREAKOUT_MAX_AGE", "40"))
+    )
+    breakout_volume_mult: float = field(
+        default_factory=lambda: float(os.getenv("BREAKOUT_VOLUME_MULT", "3.0"))
+    )
+    max_gain_since_breakout: float = field(
+        default_factory=lambda: float(os.getenv("MAX_GAIN_SINCE_BREAKOUT", "0.50"))
+    )
+    max_distance_sma150: float = field(
+        default_factory=lambda: float(os.getenv("MAX_DISTANCE_SMA150", "0.35"))
+    )
+    max_atr_contraction_ratio: float = field(
+        default_factory=lambda: float(os.getenv("MAX_ATR_CONTRACTION_RATIO", "0.78"))
+    )
+    max_weekly_range_ratio: float = field(
+        default_factory=lambda: float(os.getenv("MAX_WEEKLY_RANGE_RATIO", "0.82"))
+    )
+    max_base_drawdown: float = field(
+        default_factory=lambda: float(os.getenv("MAX_BASE_DRAWDOWN", "0.62"))
+    )
+    max_recent_vertical_drop: float = field(
+        default_factory=lambda: float(os.getenv("MAX_RECENT_VERTICAL_DROP", "0.45"))
+    )
+    min_avg_volume_20: int = field(
+        default_factory=lambda: int(os.getenv("MIN_AVG_VOLUME_20", "100000"))
+    )
+    min_avg_dollar_volume_20: float = field(
+        default_factory=lambda: float(os.getenv("MIN_AVG_DOLLAR_VOLUME_20", "75000"))
+    )
+    max_market_cap: float = field(
+        default_factory=lambda: float(os.getenv("MAX_MARKET_CAP", "150000000"))
+    )
+    preferred_float: float = field(
+        default_factory=lambda: float(os.getenv("PREFERRED_FLOAT", "30000000"))
+    )
+    ideal_float: float = field(
+        default_factory=lambda: float(os.getenv("IDEAL_FLOAT", "15000000"))
+    )
+    max_results: int = field(
+        default_factory=lambda: int(os.getenv("MAX_RESULTS", "10"))
+    )
+    max_candidates: int = field(
+        default_factory=lambda: int(os.getenv("MAX_CANDIDATES", "500"))
+    )
+    request_pause: float = field(
+        default_factory=lambda: float(os.getenv("REQUEST_PAUSE", "0.12"))
+    )
+    cache_hours: int = field(
+        default_factory=lambda: int(os.getenv("CACHE_HOURS", "18"))
+    )
+    strict_market_cap: bool = field(
+        default_factory=lambda: os.getenv("STRICT_MARKET_CAP", "1") == "1"
+    )
+    strict_float: bool = field(
+        default_factory=lambda: os.getenv("STRICT_FLOAT", "0") == "1"
+    )
 
-    ohlcv_fmt: str = field(default_factory=lambda: os.environ.get(
-        "OHLCV_URL_FMT", "https://stooq.com/q/d/l/?s={symbol}.us&i=d"))
+    results_json: Path = Path("cache/heartbeat_results.json")
+    results_csv: Path = Path("cache/heartbeat_results.csv")
+    last_run_json: Path = Path("cache/last_run.json")
+    ohlcv_dir: Path = Path("cache/ohlcv")
 
-    max_tickers: int = field(default_factory=lambda: int(os.environ.get("MAX_TICKERS", "450")))
-    candidate_pool: int = field(default_factory=lambda: int(os.environ.get("CANDIDATE_POOL", "2000")))
 
-    min_px: float = field(default_factory=lambda: float(os.environ.get("MIN_PX", "1.0")))
-    max_px: float = field(default_factory=lambda: float(os.environ.get("MAX_PX", "30")))
-    min_dv20: float = field(default_factory=lambda: float(os.environ.get("MIN_DV20", "1500000")))
-    max_dv20: float = field(default_factory=lambda: float(os.environ.get("MAX_DV20", "120000000")))
-    min_sv20: float = field(default_factory=lambda: float(os.environ.get("MIN_SV20", "250000")))
+@dataclass
+class UniverseRow:
+    ticker: str
+    name: str
+    price: float
+    market_cap: Optional[float]
+    reported_volume: Optional[float]
+    sector: str = ""
+    industry: str = ""
 
-    bbz_gate: float = field(default_factory=lambda: float(os.environ.get("BBZ_GATE", "-0.60")))
-    atrpctl_gate: float = field(default_factory=lambda: float(os.environ.get("ATRPCTL_GATE", "0.50")))
 
-    base_dd_max: float = field(default_factory=lambda: float(os.environ.get("BASE_DD_MAX", "0.62")))
-    contraction_max: float = field(default_factory=lambda: float(os.environ.get("CONTRACTION_MAX", "0.92")))
-    dryup_max: float = field(default_factory=lambda: float(os.environ.get("DRYUP_MAX", "1.10")))
+@dataclass
+class MarketSnapshot:
+    float_shares: Optional[float] = None
 
-    vol_confirm_mult_base: float = field(default_factory=lambda: float(os.environ.get("VOL_CONFIRM_MULT", "1.12")))
-    max_gap_up: float = field(default_factory=lambda: float(os.environ.get("MAX_GAP_UP", "1.14")))
-    dist_max_pct: float = field(default_factory=lambda: float(os.environ.get("DIST_MAX_PCT", "12.0")))
-    exec_max_overshoot_pct: float = field(default_factory=lambda: float(os.environ.get("EXEC_MAX_OVERSHOOT_PCT", "8.0")))
 
-    # V9 A: base position — close deve estar no top (1-base_position_min) da base
-    base_position_min: float = field(default_factory=lambda: float(os.environ.get("BASE_POSITION_MIN", "0.65")))
+@dataclass
+class TechnicalResult:
+    ticker: str
+    name: str
+    price: float
+    market_cap: Optional[float]
+    float_shares: Optional[float]
+    avg_volume_20: float
+    avg_dollar_volume_20: float
+    breakout_volume: float
+    breakout_volume_multiple: float
+    breakout_date: str
+    breakout_age_sessions: int
+    distance_sma150_pct: float
+    gain_since_breakout_pct: float
+    consolidation_sessions: int
+    consolidation_months: float
+    pattern: str
+    support: float
+    resistance: float
+    ideal_entry_low: float
+    ideal_entry_high: float
+    invalidation: float
+    confirmation: str
+    atr_contraction_ratio: float
+    weekly_range_ratio: float
+    higher_lows_slope: float
+    lower_highs_slope: float
+    sma150_slope_pct_20d: float
+    market: MarketSnapshot
+    catalysts: list[str]
+    technical_score: float
+    total_score: float
 
-    # V9 C: força relativa mínima vs QQQ 20 dias (-0.05 = tolera até -5pp)
-    rs20_min: float = field(default_factory=lambda: float(os.environ.get("RS20_MIN", "-0.05")))
 
-    exec_bbz_max: float = field(default_factory=lambda: float(os.environ.get("EXEC_BBZ_MAX", "-0.90")))
-    exec_atrpctl_max: float = field(default_factory=lambda: float(os.environ.get("EXEC_ATRPCTL_MAX", "0.38")))
+# ---------------------------------------------------------------------------
+# HTTP and caching
+# ---------------------------------------------------------------------------
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "User-Agent": "Mozilla/5.0 (compatible; HeartbeatStage2/1.0)",
+        "Accept": "application/json,text/plain,*/*",
+    }
+)
 
-    min_r_pct: float = field(default_factory=lambda: float(os.environ.get("MIN_R_PCT", "6.0")))
 
-    overhead_window: int = field(default_factory=lambda: int(os.environ.get("OVERHEAD_WINDOW", "200")))
-    overhead_band_pct: float = field(default_factory=lambda: float(os.environ.get("OVERHEAD_BAND_PCT", "8.0")))
-    overhead_max_touches: int = field(default_factory=lambda: int(os.environ.get("OVERHEAD_MAX_TOUCHES", "12")))
+def _fresh(path: Path, hours: int) -> bool:
+    return path.exists() and (time.time() - path.stat().st_mtime) < hours * 3600
 
-    watch_boost_min_days: int = field(default_factory=lambda: int(os.environ.get("WATCH_BOOST_MIN_DAYS", "3")))
-    watch_stale_days: int = field(default_factory=lambda: int(os.environ.get("WATCH_STALE_DAYS", "10")))
 
-    min_daily_proposals: int = field(default_factory=lambda: int(os.environ.get("MIN_DAILY_PROPOSALS", "6")))
-    watch_relax_top: int = field(default_factory=lambda: int(os.environ.get("WATCH_RELAX_TOP", "8")))
-
-    horizon: int = field(default_factory=lambda: int(os.environ.get("HORIZON_SESS", "40")))
-    ret_windows: list = field(default_factory=lambda: [5, 10, 20, 40])
-
-    reg_qqq: str = field(default_factory=lambda: os.environ.get("REG_QQQ", "QQQ"))
-    # FIX #7: VIX no Stooq usa ticker "^VIX" sem sufixo .us
-    reg_vix: str = field(default_factory=lambda: os.environ.get("REG_VIX", "^VIX"))
-
-    sleep_every: int = field(default_factory=lambda: int(os.environ.get("SLEEP_EVERY", "25")))
-    sleep_seconds: float = field(default_factory=lambda: float(os.environ.get("SLEEP_SECONDS", "2.0")))
-
-    breakout_buffer_pct: float = field(default_factory=lambda: float(os.environ.get("BREAKOUT_BUFFER_PCT", "0.0")))
-    learn_blend_env: float = field(default_factory=lambda: float(os.environ.get("LEARN_BLEND", "0.25")))
-
-    # Paths
-    cache_dir: Path = field(default_factory=lambda: Path("cache"))
-    ohlcv_dir: Path = field(default_factory=lambda: Path("cache/ohlcv"))
-    signals_csv: Path = field(default_factory=lambda: Path("cache/signals.csv"))
-    learned_json: Path = field(default_factory=lambda: Path("cache/learned_params.json"))
-    last_run_json: Path = field(default_factory=lambda: Path("cache/last_run.json"))
-
-    def ensure_dirs(self):
-        self.ohlcv_dir.mkdir(parents=True, exist_ok=True)
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-
-# =========================
-# Telegram (com chunking automático — FIX #6)
-# =========================
-def tg_send(cfg: Config, text: str) -> None:
-    if not cfg.tg_token or not cfg.tg_chat_id:
-        log.info("[TG] Token/chat_id não configurado. Mensagem apenas em log.")
-        log.info(text)
-        return
-    url = f"https://api.telegram.org/bot{cfg.tg_token}/sendMessage"
-    MAX_LEN = 4000
-    chunks = [text[i:i+MAX_LEN] for i in range(0, len(text), MAX_LEN)]
-    for chunk in chunks:
-        payload = {
-            "chat_id": cfg.tg_chat_id,
-            "text": chunk,
-            "disable_web_page_preview": True
-        }
-        try:
-            r = requests.post(url, json=payload, timeout=30)
-            r.raise_for_status()
-        except Exception as e:
-            log.warning(f"[TG] Falha ao enviar chunk: {e}")
-
-# =========================
-# Utils / Indicators
-# =========================
-def safe_float(x, default=np.nan):
-    try:
-        v = float(x)
-        return v if np.isfinite(v) else default
-    except Exception:
-        return default
-
-def clamp(x: float, lo: float, hi: float) -> float:
-    return float(min(hi, max(lo, x)))
-
-def compute_atr(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    h, l, c = df["high"], df["low"], df["close"]
-    prev_c = c.shift(1)
-    tr = np.maximum(h - l, np.maximum((h - prev_c).abs(), (l - prev_c).abs()))
-    return tr.ewm(span=n, adjust=False).mean()  # FIX: EMA é mais responsivo que SMA para ATR
-
-def compute_bb_width(df: pd.DataFrame, n: int = 20) -> pd.Series:
-    ma = df["close"].rolling(n).mean()
-    std = df["close"].rolling(n).std(ddof=1)
-    return ((ma + 2*std) - (ma - 2*std)) / ma
-
-def zscore(series: pd.Series, window: int = 120) -> pd.Series:
-    m = series.rolling(window).mean()
-    s = series.rolling(window).std(ddof=1)
-    return (series - m) / s.replace(0, np.nan)
-
-def fetch_text(url: str, retries: int = 3) -> str:
-    """FIX #5: exponential backoff no rate-limit"""
+def get_json(url: str, *, headers: Optional[dict[str, str]] = None, retries: int = 3) -> Any:
+    last_error: Optional[Exception] = None
     for attempt in range(retries):
         try:
-            r = requests.get(url, timeout=90, headers={"User-Agent": "Mozilla/5.0"})
-            r.raise_for_status()
-            text = r.text.strip()
-            if "exceeded the daily hits limit" in text.lower():
-                raise RuntimeError("HITS_LIMIT")
-            return text
-        except RuntimeError:
-            raise
-        except Exception as e:
-            wait = 2 ** attempt
-            log.debug(f"fetch_text retry {attempt+1}/{retries} ({e}) — wait {wait}s")
-            time.sleep(wait)
-    raise RuntimeError(f"fetch_text falhou após {retries} tentativas: {url}")
+            response = SESSION.get(url, headers=headers, timeout=40)
+            response.raise_for_status()
+            return response.json()
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            time.sleep(1.5 * (attempt + 1))
+    raise RuntimeError(f"Falha HTTP após {retries} tentativas: {url}: {last_error}")
 
-# =========================
-# Holdings parsing
-# =========================
-def fetch_holdings_csv(url: str) -> pd.DataFrame:
-    text = fetch_text(url)
-    lines = text.splitlines()
-    header_idx = None
-    for i, ln in enumerate(lines[:800]):
-        s = ln.strip().lower()
-        if s.startswith("ticker,") or s.startswith("symbol,"):
-            header_idx = i
-            break
-    if header_idx is None:
-        if "<!doctype html" in text.lower():
-            raise RuntimeError("Holdings retornou HTML (bloqueado/redirect).")
-        return pd.read_csv(io.StringIO(text), engine="python", on_bad_lines="skip")
-    cleaned = "\n".join(lines[header_idx:])
-    return pd.read_csv(io.StringIO(cleaned), engine="python", on_bad_lines="skip")
 
-def is_valid_ticker(t: str) -> bool:
-    if not t:
-        return False
-    t = t.strip().upper()
-    if t in {"-", "N/A", "NA", "CASH", "USD", "XTSLA", "XNULL"}:
-        return False
-    if len(t) < 2 or len(t) > 6:  # FIX: limite superior para evitar garbage
-        return False
-    if not any(ch.isalpha() for ch in t):
-        return False
-    if any(ch in t for ch in [" ", "/", "\\"]):
-        return False
-    return True
-
-def get_universe_from_holdings(url: str) -> list:
-    if not url:
-        return []
+def parse_money(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if math.isfinite(float(value)) else None
+    text = str(value).strip().replace("$", "").replace(",", "")
+    if not text or text in {"N/A", "--", "-"}:
+        return None
+    multiplier = 1.0
+    if text[-1:].upper() in {"K", "M", "B", "T"}:
+        multiplier = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}[text[-1].upper()]
+        text = text[:-1]
     try:
-        df = fetch_holdings_csv(url)
-    except Exception as e:
-        log.warning(f"[Holdings] Falha ao carregar {url}: {e}")
-        return []
-    cols = {c.lower(): c for c in df.columns}
-    if "ticker" in cols:
-        col = cols["ticker"]
-    elif "symbol" in cols:
-        col = cols["symbol"]
-    else:
-        raise RuntimeError("Holdings sem Ticker/Symbol.")
-    raw = df[col].astype(str).str.strip().tolist()
-    out = []
-    for t in raw:
-        t = t.replace(".", "-").upper()
-        if is_valid_ticker(t):
-            out.append(t)
-    return out
-
-# =========================
-# OHLCV / cache
-# =========================
-def cache_path(cfg: Config, t: str) -> Path:
-    return cfg.ohlcv_dir / f"{t}.csv"
-
-def build_ohlcv_url(cfg: Config, symbol: str, force_no_us: bool = False) -> str:
-    sym = symbol.lower().replace("-", ".")
-    if force_no_us or symbol.startswith("^"):
-        return cfg.ohlcv_fmt.replace(".us", "").format(symbol=sym)
-    return cfg.ohlcv_fmt.format(symbol=sym)
-
-def parse_ohlcv_text(text: str, min_rows: int = 120) -> Optional[pd.DataFrame]:
-    low = text.lower()
-    if low.startswith("no data") or low == "no data":
-        return None
-    df = pd.read_csv(io.StringIO(text))
-    df.columns = [c.strip().lower() for c in df.columns]
-    need = ["date", "open", "high", "low", "close", "volume"]
-    if not all(c in df.columns for c in need):
-        return None
-    df = df[need].copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).sort_values("date")
-    for c in ["open", "high", "low", "close", "volume"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.dropna(subset=need).reset_index(drop=True)
-    if len(df) < min_rows:
-        return None
-    return df
-
-def load_cached_ohlcv_local(cfg: Config, ticker: str, min_rows: int = 120) -> Optional[pd.DataFrame]:
-    p = cache_path(cfg, ticker)
-    if not p.exists():
-        return None
-    try:
-        df = pd.read_csv(p)
-        df.columns = [c.strip().lower() for c in df.columns]
-        need = ["date", "open", "high", "low", "close", "volume"]
-        if not all(c in df.columns for c in need):
-            return None
-        df = df[need].copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
-        for c in ["open","high","low","close","volume"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=need).reset_index(drop=True)
-        return df if len(df) >= min_rows else None
-    except Exception:
+        result = float(text) * multiplier
+        return result if math.isfinite(result) else None
+    except ValueError:
         return None
 
-def read_cached_dv20(cfg: Config, ticker: str) -> Optional[float]:
-    df = load_cached_ohlcv_local(cfg, ticker, min_rows=30)
-    if df is None:
-        return None
-    try:
-        dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
-        return dv20 if np.isfinite(dv20) and dv20 > 0 else None
-    except Exception:
-        return None
 
-def fetch_ohlcv_equity(cfg: Config, ticker: str) -> pd.DataFrame:
-    cfg.ensure_dirs()
-    p = cache_path(cfg, ticker)
-
-    cached_df = load_cached_ohlcv_local(cfg, ticker, min_rows=1)
-
-    try:
-        force_no_us = ticker.startswith("^")
-        url = build_ohlcv_url(cfg, ticker, force_no_us=force_no_us)
-        text = fetch_text(url)
-        df = parse_ohlcv_text(text, min_rows=1)
-
-        if df is None:
-            raise RuntimeError("NO_DATA")
-
-        if cached_df is not None and len(cached_df) > 0:
-            need = ["date", "open", "high", "low", "close", "volume"]
-            merged = pd.concat([cached_df[need], df[need]], ignore_index=True)
-            merged = merged.drop_duplicates(subset=["date"], keep="last")
-            merged = merged.sort_values("date").reset_index(drop=True)
-            df = merged
-
-        df.to_csv(p, index=False)
-        return df
-
-    except RuntimeError:
-        raise
-    except Exception as e:
-        log.debug(f"[OHLCV] {ticker} fetch falhou: {e} — tentando cache")
-        if cached_df is not None and len(cached_df) >= 120:
-            return cached_df
-        raise
-
-def fetch_ohlcv_symbol_best_effort(cfg: Config, symbol: str) -> Optional[pd.DataFrame]:
-    urls = [
-        build_ohlcv_url(cfg, symbol, force_no_us=False),
-        build_ohlcv_url(cfg, symbol, force_no_us=True),
-    ]
-    for url in urls:
-        try:
-            text = fetch_text(url)
-            df = parse_ohlcv_text(text, min_rows=30)
-            if df is not None:
-                return df
-        except Exception:
+# ---------------------------------------------------------------------------
+# Universe: Nasdaq-listed stocks only
+# ---------------------------------------------------------------------------
+def fetch_nasdaq_universe(cfg: Config) -> list[UniverseRow]:
+    url = (
+        "https://api.nasdaq.com/api/screener/stocks"
+        "?tableonly=true&limit=10000&offset=0&exchange=NASDAQ&download=true"
+    )
+    payload = get_json(
+        url,
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": "https://www.nasdaq.com/market-activity/stocks/screener",
+        },
+    )
+    rows = (((payload or {}).get("data") or {}).get("rows") or [])
+    universe: list[UniverseRow] = []
+    for row in rows:
+        ticker = str(row.get("symbol") or "").strip().upper()
+        price = parse_money(row.get("lastsale"))
+        cap = parse_money(row.get("marketCap"))
+        volume = parse_money(row.get("volume"))
+        if not ticker or price is None:
             continue
-    return None
+        if not (cfg.min_price <= price < cfg.max_price):
+            continue
+        if cfg.strict_market_cap and cap is not None and cap > cfg.max_market_cap:
+            continue
+        universe.append(
+            UniverseRow(
+                ticker=ticker,
+                name=str(row.get("name") or ticker).strip(),
+                price=price,
+                market_cap=cap,
+                reported_volume=volume,
+                sector=str(row.get("sector") or "").strip(),
+                industry=str(row.get("industry") or "").strip(),
+            )
+        )
+    universe.sort(key=lambda item: (item.market_cap or float("inf"), -item.price))
+    return universe[: cfg.max_candidates]
 
-# =========================
-# Learned params (sem mutação de globais — FIX #2)
-# =========================
-def load_learned_params(cfg: Config) -> dict:
-    if not cfg.learned_json.exists():
-        return {}
-    try:
-        d = json.loads(cfg.learned_json.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else {}
-    except Exception:
-        return {}
 
-def apply_learned_params(cfg: Config) -> dict:
-    """
-    Retorna um dict com os gates ajustados (não muta globais).
-    """
-    gates = {
-        "bbz_gate": cfg.bbz_gate,
-        "atrpctl_gate": cfg.atrpctl_gate,
-        "dist_max_pct": cfg.dist_max_pct,
-        "vol_confirm_mult_base": cfg.vol_confirm_mult_base,
+# ---------------------------------------------------------------------------
+# OHLCV
+# ---------------------------------------------------------------------------
+def _normalise_ohlcv(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    if df is None or df.empty:
+        return None
+    df = df.rename(columns={c: c.lower() for c in df.columns}).copy()
+    required = {"date", "open", "high", "low", "close", "volume"}
+    if not required.issubset(df.columns):
+        return None
+    df["date"] = pd.to_datetime(df["date"], errors="coerce", utc=True).dt.tz_localize(None)
+    for column in ["open", "high", "low", "close", "volume"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+    df = df[(df["close"] > 0) & (df["high"] >= df["low"]) & (df["volume"] >= 0)]
+    df = df.sort_values("date").drop_duplicates("date").reset_index(drop=True)
+    return df if len(df) >= 50 else None
+
+
+def fetch_yahoo_ohlcv(ticker: str) -> Optional[pd.DataFrame]:
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?range=2y&interval=1d&events=history"
+    payload = get_json(url)
+    result = (((payload or {}).get("chart") or {}).get("result") or [])
+    if not result:
+        return None
+    block = result[0]
+    timestamps = block.get("timestamp") or []
+    quote = ((((block.get("indicators") or {}).get("quote") or [{}])[0]) or {})
+    if not timestamps:
+        return None
+    frame = pd.DataFrame(
+        {
+            "date": pd.to_datetime(timestamps, unit="s", utc=True),
+            "open": quote.get("open"),
+            "high": quote.get("high"),
+            "low": quote.get("low"),
+            "close": quote.get("close"),
+            "volume": quote.get("volume"),
+        }
+    )
+    return _normalise_ohlcv(frame)
+
+
+def fetch_stooq_ohlcv(ticker: str) -> Optional[pd.DataFrame]:
+    symbol = ticker.lower().replace("-", ".")
+    url = f"https://stooq.com/q/d/l/?s={symbol}.us&i=d"
+    response = SESSION.get(url, timeout=40)
+    response.raise_for_status()
+    if "No data" in response.text or len(response.text) < 100:
+        return None
+    return _normalise_ohlcv(pd.read_csv(io.StringIO(response.text)))
+
+
+def load_ohlcv(ticker: str, cfg: Config) -> Optional[pd.DataFrame]:
+    cfg.ohlcv_dir.mkdir(parents=True, exist_ok=True)
+    path = cfg.ohlcv_dir / f"{ticker}.csv"
+    if _fresh(path, cfg.cache_hours):
+        try:
+            return _normalise_ohlcv(pd.read_csv(path))
+        except Exception:  # noqa: BLE001
+            pass
+    frame: Optional[pd.DataFrame] = None
+    for loader in (fetch_yahoo_ohlcv, fetch_stooq_ohlcv):
+        try:
+            frame = loader(ticker)
+            if frame is not None:
+                break
+        except Exception as exc:  # noqa: BLE001
+            log.debug("%s OHLCV falhou em %s: %s", ticker, loader.__name__, exc)
+    if frame is not None:
+        frame.to_csv(path, index=False)
+    return frame
+
+
+# ---------------------------------------------------------------------------
+# Technical analysis
+# ---------------------------------------------------------------------------
+def true_range(df: pd.DataFrame) -> pd.Series:
+    prev_close = df["close"].shift(1)
+    return pd.concat(
+        [
+            df["high"] - df["low"],
+            (df["high"] - prev_close).abs(),
+            (df["low"] - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+
+def linear_slope(values: Iterable[float]) -> float:
+    arr = np.asarray(list(values), dtype=float)
+    if len(arr) < 2 or np.all(~np.isfinite(arr)):
+        return 0.0
+    x = np.arange(len(arr), dtype=float)
+    mask = np.isfinite(arr)
+    if mask.sum() < 2:
+        return 0.0
+    return float(np.polyfit(x[mask], arr[mask], 1)[0])
+
+
+def resample_weekly(df: pd.DataFrame) -> pd.DataFrame:
+    weekly = (
+        df.set_index("date")
+        .resample("W-FRI")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna()
+        .reset_index()
+    )
+    weekly["range_pct"] = (weekly["high"] - weekly["low"]) / weekly["close"].replace(0, np.nan)
+    return weekly
+
+
+def swing_slopes(base: pd.DataFrame) -> tuple[float, float]:
+    # Compare successive 10-session extrema. Negative high slope + positive low
+    # slope is the geometric signature of a triangle/VCP.
+    blocks = max(4, min(10, len(base) // 10))
+    chunks = np.array_split(base.tail(blocks * 10), blocks)
+    highs = [chunk["high"].max() for chunk in chunks if not chunk.empty]
+    lows = [chunk["low"].min() for chunk in chunks if not chunk.empty]
+    scale = max(float(base["close"].median()), 1e-6)
+    return linear_slope(lows) / scale, linear_slope(highs) / scale
+
+
+def detect_base(df: pd.DataFrame, breakout_idx: int, cfg: Config) -> Optional[dict[str, Any]]:
+    end = max(0, breakout_idx - 1)
+    best: Optional[dict[str, Any]] = None
+    for sessions in [252, 210, 168, 147, 126, 105, 84]:
+        if sessions < cfg.min_base_sessions or sessions > cfg.max_base_sessions:
+            continue
+        start = end - sessions + 1
+        if start < 0:
+            continue
+        base = df.iloc[start : end + 1].copy()
+        peak = float(base["high"].max())
+        trough = float(base["low"].min())
+        drawdown = 1 - trough / peak if peak else 1.0
+        if drawdown > cfg.max_base_drawdown:
+            continue
+
+        atr = true_range(base).rolling(14).mean() / base["close"].replace(0, np.nan)
+        if len(atr.dropna()) < 50:
+            continue
+        early_atr = float(atr.iloc[: max(20, len(atr) // 3)].median())
+        late_atr = float(atr.iloc[-max(20, len(atr) // 3) :].median())
+        atr_ratio = late_atr / early_atr if early_atr > 0 else 99.0
+
+        weekly = resample_weekly(base)
+        if len(weekly) < 12:
+            continue
+        split = max(4, len(weekly) // 3)
+        early_weekly = float(weekly["range_pct"].iloc[:split].median())
+        late_weekly = float(weekly["range_pct"].iloc[-split:].median())
+        weekly_ratio = late_weekly / early_weekly if early_weekly > 0 else 99.0
+
+        low_slope, high_slope = swing_slopes(base)
+        compression_ok = (
+            atr_ratio <= cfg.max_atr_contraction_ratio
+            and weekly_ratio <= cfg.max_weekly_range_ratio
+            and (low_slope > -0.0025)
+            and (high_slope < 0.0025)
+        )
+        if not compression_ok:
+            continue
+
+        # Reject a recent waterfall masquerading as a base.
+        recent_60 = base.tail(min(60, len(base)))
+        recent_peak = float(recent_60["high"].max())
+        recent_close = float(recent_60["close"].iloc[-1])
+        vertical_drop = 1 - recent_close / recent_peak if recent_peak else 1.0
+        if vertical_drop > cfg.max_recent_vertical_drop:
+            continue
+
+        if low_slope > 0.0008 and high_slope < -0.0008:
+            pattern = "Triângulo simétrico / VCP"
+        elif atr_ratio < 0.60 and weekly_ratio < 0.68:
+            pattern = "Heartbeat / VCP apertado"
+        elif abs(low_slope) < 0.0015 and abs(high_slope) < 0.0015:
+            pattern = "Caixa horizontal comprimida"
+        else:
+            pattern = "Ondulação horizontal em compressão"
+
+        support = float(base["low"].tail(30).quantile(0.20))
+        resistance = float(base["high"].tail(60).quantile(0.90))
+        quality = (1 - min(atr_ratio, 1)) + (1 - min(weekly_ratio, 1)) + min(sessions / 252, 1)
+        candidate = {
+            "sessions": sessions,
+            "base": base,
+            "atr_ratio": atr_ratio,
+            "weekly_ratio": weekly_ratio,
+            "low_slope": low_slope,
+            "high_slope": high_slope,
+            "pattern": pattern,
+            "support": support,
+            "resistance": resistance,
+            "quality": quality,
+        }
+        if best is None or candidate["quality"] > best["quality"]:
+            best = candidate
+    return best
+
+
+def find_sma150_breakout(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, Any]]:
+    work = df.copy()
+    work["sma150"] = work["close"].rolling(150).mean()
+    work["vol50"] = work["volume"].shift(1).rolling(50).mean()
+    latest = len(work) - 1
+    start = max(151, latest - cfg.breakout_max_age)
+    end = latest - cfg.breakout_min_age
+    if end < start:
+        return None
+
+    possibilities: list[dict[str, Any]] = []
+    for idx in range(start, end + 1):
+        previous = work.iloc[idx - 1]
+        row = work.iloc[idx]
+        if not np.isfinite(row["sma150"]) or not np.isfinite(row["vol50"]):
+            continue
+        crossed = previous["close"] <= previous["sma150"] and row["close"] > row["sma150"]
+        volume_multiple = row["volume"] / row["vol50"] if row["vol50"] > 0 else 0
+        if crossed and volume_multiple >= cfg.breakout_volume_mult:
+            possibilities.append({"idx": idx, "volume_multiple": float(volume_multiple)})
+    if not possibilities:
+        return None
+    # Prefer the most recent qualifying reclaim.
+    chosen = possibilities[-1]
+    idx = chosen["idx"]
+    row = work.iloc[idx]
+    current = work.iloc[-1]
+    if current["close"] <= current["sma150"]:
+        return None
+    gain = current["close"] / row["close"] - 1
+    distance = current["close"] / current["sma150"] - 1
+    if gain > cfg.max_gain_since_breakout or distance > cfg.max_distance_sma150:
+        return None
+    slope20 = work["sma150"].iloc[-1] / work["sma150"].iloc[-21] - 1
+    if slope20 < -0.035:  # sharply falling SMA150 is not Stage 2
+        return None
+    return {
+        "idx": idx,
+        "date": row["date"],
+        "age": latest - idx,
+        "price": float(row["close"]),
+        "volume": float(row["volume"]),
+        "volume_multiple": chosen["volume_multiple"],
+        "gain": float(gain),
+        "distance": float(distance),
+        "sma150": float(current["sma150"]),
+        "slope20": float(slope20),
     }
 
-    learned = load_learned_params(cfg)
-    if not learned:
-        return {**gates, "used": False}
 
-    params = learned.get("params", {})
-    if not isinstance(params, dict) or not params:
-        return {**gates, "used": False}
-
-    blend = clamp(safe_float(learned.get("blend", cfg.learn_blend_env), cfg.learn_blend_env), 0.0, 0.50)
-
-    def _blend(cur, key, lo, hi):
-        new = safe_float(params.get(key, np.nan))
-        if not np.isfinite(new):
-            return cur
-        return clamp((1.0 - blend) * cur + blend * new, lo, hi)
-
-    gates["dist_max_pct"] = _blend(cfg.dist_max_pct, "DIST_MAX_PCT", 10.0, 26.0)
-    gates["atrpctl_gate"] = _blend(cfg.atrpctl_gate, "ATRPCTL_GATE", 0.30, 0.75)
-    gates["bbz_gate"] = _blend(cfg.bbz_gate, "BBZ_GATE", -1.40, -0.20)
-    if "VOL_CONFIRM_MULT" in params:
-        gates["vol_confirm_mult_base"] = _blend(cfg.vol_confirm_mult_base, "VOL_CONFIRM_MULT", 1.05, 1.35)
-
-    meta = learned.get("meta", {}) if isinstance(learned.get("meta"), dict) else {}
-    gates["used"] = True
-    gates["blend"] = blend
-    gates["learned_ts"] = meta.get("last_update_utc") or meta.get("created_utc") or ""
-    return gates
-
-# =========================
-# Model components
-# =========================
-def base_scan(df: pd.DataFrame, cfg: Config) -> tuple:
-    if len(df) < 260:
-        return (False, np.nan, np.nan, np.nan, np.nan, 0)
-
-    best = None
-    for win in [30, 35, 40, 50, 60, 70, 80]:  # V9 E: mínimo 30 dias (bases curtas não absorvem oferta)
-        base = df.iloc[-win:]
-        highb = float(base["high"].max())
-        lowb = float(base["low"].min())
-        if highb <= 0:
-            continue
-        dd = (highb - lowb) / highb
-
-        prev = df.iloc[-(win + 120):-win]
-        if len(prev) < 60:
-            continue
-        prev_range = float(prev["high"].max() - prev["low"].min())
-        base_range = float(highb - lowb)
-        contr = (base_range / prev_range) if prev_range > 0 else 1.0
-
-        if dd <= cfg.base_dd_max and contr <= cfg.contraction_max:
-            # FIX: score normalizado para comparação justa entre windows
-            score = (cfg.base_dd_max - dd) / cfg.base_dd_max + (cfg.contraction_max - contr) / cfg.contraction_max
-            cand = (score, highb, lowb, dd, contr, win)
-            if best is None or cand[0] > best[0]:
-                best = cand
-
-    if best is None:
-        return (False, np.nan, np.nan, np.nan, np.nan, 0)
-
-    _, highb, lowb, dd, contr, win = best
-    return (True, float(highb), float(lowb), float(dd), float(contr), int(win))
-
-def dryup_ratio(df: pd.DataFrame) -> float:
-    """
-    V9 B: dry-up progressivo em 3 semanas consecutivas.
-    Retorna v10/v60 (< 1.0 = secando) MAS só passa se tendência for decrescente
-    (cada semana mais seca que a anterior). Penaliza se volume voltou a subir.
-    """
-    v_w1 = float(df["volume"].iloc[-5:].mean())    # semana mais recente
-    v_w2 = float(df["volume"].iloc[-10:-5].mean()) # semana anterior
-    v_w3 = float(df["volume"].iloc[-15:-10].mean())# 2 semanas atrás
-    v60  = float(df["volume"].iloc[-60:].mean())
-    if v60 <= 0 or v_w3 <= 0:
-        return np.nan
-    # ratio base (compatível com DRYUP_MAX gate existente)
-    ratio = v_w1 / v60
-    # V9 B: penalizar levemente se tendência não é progressivamente decrescente
-    # Penalização suave (1.12x) para não ser demasiado restritivo
-    # Só penaliza se o volume mais recente (w1) subiu vs semana anterior (w2)
-    if v_w1 > v_w2:
-        ratio = ratio * 1.12  # volume a subir de novo -> sinal negativo
-    return ratio
-
-def overhead_supply_touches(df: pd.DataFrame, trig: float, cfg: Config) -> int:
-    """FIX #8: usa HIGH (não close) para detectar toque real no overhead"""
-    if trig <= 0:
-        return 0
-    w = df["high"].iloc[-cfg.overhead_window:]  # FIX: era df["close"]
-    upper = trig * (1.0 + cfg.overhead_band_pct / 100.0)
-    return int(((w >= trig) & (w <= upper)).sum())
-
-def liquidity_sweet_spot_bonus(dv20: float) -> float:
-    if dv20 <= 0:
-        return -0.5
-    if 4_000_000 <= dv20 <= 45_000_000:
-        return 0.6
-    if dv20 < 4_000_000:
-        return -0.15
-    return -0.25
-
-def score_candidate(
-    bbz: float, atrpctl: float, dd: float, contr: float, dry: float, dv20: float,
-    dist_to_trig_pct: float, overhead_touches: int,
-    watch_boost: float, stale_penalty: float,
-    cfg: Config, gates: dict
-) -> float:
-    s = 0.0
-    s += (-bbz) * 2.1
-    s += (0.60 - atrpctl) * 1.4
-    s += (cfg.base_dd_max - dd) * 1.0
-    s += (cfg.contraction_max - contr) * 0.9
-    s += (cfg.dryup_max - dry) * 0.8
-    s += liquidity_sweet_spot_bonus(dv20)
-
-    dist_limit = gates.get("dist_max_pct", cfg.dist_max_pct)
-    if np.isfinite(dist_to_trig_pct):
-        s += max(0.0, (dist_limit - dist_to_trig_pct)) * 0.08
-
-    if overhead_touches >= 60:
-        s -= 1.3
-    elif overhead_touches >= 30:
-        s -= 0.7
-    elif overhead_touches > cfg.overhead_max_touches:
-        s -= 0.35
-
-    s += watch_boost
-    s -= stale_penalty
-    return float(s)
+def technical_score(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame, cfg: Config) -> float:
+    sessions = base["sessions"]
+    base_points = 12 + 8 * min(max((sessions - cfg.min_base_sessions) / 126, 0), 1)
+    atr_points = 15 * max(0, 1 - base["atr_ratio"] / cfg.max_atr_contraction_ratio)
+    weekly_points = 10 * max(0, 1 - base["weekly_ratio"] / cfg.max_weekly_range_ratio)
+    geometry_points = 10 * min(1, max(0, base["low_slope"] * 180) + max(0, -base["high_slope"] * 180) + 0.25)
+    vol_points = 15 * min((breakout["volume_multiple"] - 3) / 4 + 0.55, 1)
+    sma_points = 8 if breakout["slope20"] >= 0 else max(0, 8 + breakout["slope20"] * 200)
+    proximity_points = 10 * max(0, 1 - breakout["distance"] / cfg.max_distance_sma150)
+    avg_volume = float(df["volume"].tail(20).mean())
+    liquidity_points = 5 * min(avg_volume / 1_000_000, 1)
+    return round(min(100.0, base_points + atr_points + weekly_points + geometry_points + vol_points + sma_points + proximity_points + liquidity_points), 1)
 
 
-def compute_rs20(df: pd.DataFrame, qqq_df: Optional[pd.DataFrame]) -> Optional[float]:
-    """
-    V9 C: força relativa vs QQQ nos últimos 20 dias.
-    Retorna (ret_stock - ret_qqq). None se QQQ não disponível (não filtra).
-    """
-    if qqq_df is None or len(qqq_df) < 21 or len(df) < 21:
+# ---------------------------------------------------------------------------
+# Catalysts and final ranking
+# ---------------------------------------------------------------------------
+def infer_catalysts(company: UniverseRow) -> list[str]:
+    text = f"{company.name} {company.sector} {company.industry}".lower()
+    mapping = [
+        (("biotech", "pharmaceutical", "therapeutic", "medical"), "Biotecnologia/FDA e dados clínicos"),
+        (("semiconductor", "chip"), "Semicondutores"),
+        (("artificial intelligence", " ai ", "software"), "IA/software"),
+        (("defense", "aerospace"), "Defesa/aeroespacial"),
+        (("energy", "oil", "gas", "solar", "battery"), "Energia"),
+        (("quantum",), "Computação quântica"),
+        (("robot", "automation"), "Robótica/automação"),
+        (("data center", "cloud"), "Data centers/cloud"),
+    ]
+    catalysts = [label for keys, label in mapping if any(key in text for key in keys)]
+    return catalysts or ["Resultados, contratos ou atualização estratégica da empresa"]
+
+
+def market_adjustment(float_shares: Optional[float], market_cap: Optional[float], cfg: Config) -> float:
+    score = 0.0
+    if float_shares is not None:
+        if float_shares <= cfg.ideal_float:
+            score += 6
+        elif float_shares <= cfg.preferred_float:
+            score += 3
+        elif cfg.strict_float:
+            score -= 20
+    if market_cap is not None:
+        score += 4 if market_cap <= 50_000_000 else 2 if market_cap <= cfg.max_market_cap else -8
+    return score
+
+
+def analyse_candidate(company: UniverseRow, cfg: Config) -> Optional[TechnicalResult]:
+    df = load_ohlcv(company.ticker, cfg)
+    if df is None or len(df) < cfg.min_history_sessions:
         return None
-    try:
-        ret_stock = float(df["close"].iloc[-1]) / float(df["close"].iloc[-20]) - 1.0
-        ret_qqq   = float(qqq_df["close"].iloc[-1]) / float(qqq_df["close"].iloc[-20]) - 1.0
-        rs = ret_stock - ret_qqq
-        return rs if np.isfinite(rs) else None
-    except Exception:
+    latest_price = float(df["close"].iloc[-1])
+    if not (cfg.min_price <= latest_price < cfg.max_price):
         return None
 
-# =========================
-# Regime logic (EOD)
-# =========================
-def regime_snapshot(cfg: Config) -> dict:
-    out = {"mode": "TRANSITION", "vol_mult_adj": 0.0, "dist_adj": 0.0, "qqq_trend": None, "vix_trend": None}
+    avg_volume_20 = float(df["volume"].tail(20).mean())
+    avg_dollar_volume_20 = float((df["close"] * df["volume"]).tail(20).mean())
+    if avg_volume_20 < cfg.min_avg_volume_20 or avg_dollar_volume_20 < cfg.min_avg_dollar_volume_20:
+        return None
 
-    qqq = fetch_ohlcv_symbol_best_effort(cfg, cfg.reg_qqq)
-    if qqq is None or len(qqq) < 200:
-        log.warning("[Regime] QQQ insuficiente — usando TRANSITION")
-        return out
+    breakout = find_sma150_breakout(df, cfg)
+    if breakout is None:
+        return None
+    base = detect_base(df, breakout["idx"], cfg)
+    if base is None:
+        return None
 
-    qqq["ma50"] = qqq["close"].rolling(50).mean()
-    qqq["ma200"] = qqq["close"].rolling(200).mean()
-    if not (np.isfinite(qqq["ma50"].iloc[-1]) and np.isfinite(qqq["ma200"].iloc[-1])):
-        return out
+    snapshot = MarketSnapshot()
+    if cfg.strict_float and snapshot.float_shares is not None and snapshot.float_shares > cfg.preferred_float:
+        return None
 
-    q_close = float(qqq["close"].iloc[-1])
-    q_ma50 = float(qqq["ma50"].iloc[-1])
-    q_ma50_prev = float(qqq["ma50"].iloc[-6] if len(qqq) >= 60 else qqq["ma50"].iloc[-2])
-    ma50_slope = q_ma50 - q_ma50_prev
+    tech_score = technical_score(base, breakout, df, cfg)
+    total_score = round(max(0.0, min(100.0, tech_score + market_adjustment(snapshot.float_shares, company.market_cap, cfg))), 1)
 
-    qqq_trend = ("UP" if (q_close > q_ma50 and ma50_slope > 0) else
-                 "DOWN" if (q_close < q_ma50 and ma50_slope < 0) else "MIXED")
-    out["qqq_trend"] = qqq_trend
-    log.info(f"[Regime] QQQ={q_close:.2f} MA50={q_ma50:.2f} trend={qqq_trend}")
+    resistance = max(base["resistance"], breakout["price"])
+    support = min(base["support"], breakout["sma150"])
+    ideal_low = max(breakout["sma150"], resistance * 0.97)
+    ideal_high = resistance * 1.04
+    invalidation = min(support * 0.97, breakout["sma150"] * 0.96)
+    confirmation = f"Fecho acima de ${resistance:.3f} com volume ≥2x média de 50 sessões e manutenção acima da SMA150."
 
-    # FIX #7: VIX via Stooq com ticker ^VIX (sem .us)
-    vix = fetch_ohlcv_symbol_best_effort(cfg, cfg.reg_vix)
-    if vix is not None and len(vix) >= 30:
-        vix["ma20"] = vix["close"].rolling(20).mean()
-        if np.isfinite(vix["ma20"].iloc[-1]):
-            v_close = float(vix["close"].iloc[-1])
-            v_ma20 = float(vix["ma20"].iloc[-1])
-            v_ma20_prev = float(vix["ma20"].iloc[-6] if len(vix) >= 30 else vix["ma20"].iloc[-2])
-            vix_trend = ("UP" if (v_close > v_ma20 and v_ma20 > v_ma20_prev) else
-                         "DOWN" if (v_close < v_ma20 and v_ma20 < v_ma20_prev) else "MIXED")
-            out["vix_trend"] = vix_trend
-            log.info(f"[Regime] VIX={v_close:.2f} MA20={v_ma20:.2f} trend={vix_trend}")
+    return TechnicalResult(
+        ticker=company.ticker,
+        name=company.name,
+        price=latest_price,
+        market_cap=company.market_cap,
+        float_shares=snapshot.float_shares,
+        avg_volume_20=avg_volume_20,
+        avg_dollar_volume_20=avg_dollar_volume_20,
+        breakout_volume=breakout["volume"],
+        breakout_volume_multiple=breakout["volume_multiple"],
+        breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),
+        breakout_age_sessions=breakout["age"],
+        distance_sma150_pct=100 * breakout["distance"],
+        gain_since_breakout_pct=100 * breakout["gain"],
+        consolidation_sessions=base["sessions"],
+        consolidation_months=round(base["sessions"] / 21, 1),
+        pattern=base["pattern"],
+        support=support,
+        resistance=resistance,
+        ideal_entry_low=ideal_low,
+        ideal_entry_high=ideal_high,
+        invalidation=invalidation,
+        confirmation=confirmation,
+        atr_contraction_ratio=base["atr_ratio"],
+        weekly_range_ratio=base["weekly_ratio"],
+        higher_lows_slope=base["low_slope"],
+        lower_highs_slope=base["high_slope"],
+        sma150_slope_pct_20d=100 * breakout["slope20"],
+        market=snapshot,
+        catalysts=infer_catalysts(company),
+        technical_score=tech_score,
+        total_score=total_score,
+    )
 
-    if qqq_trend == "UP" and (out["vix_trend"] in [None, "DOWN", "MIXED"]):
-        out.update({"mode": "RISK_ON", "vol_mult_adj": -0.02, "dist_adj": +2.0})
-    elif qqq_trend == "DOWN" and out["vix_trend"] == "UP":
-        out.update({"mode": "RISK_OFF", "vol_mult_adj": +0.08, "dist_adj": -3.0})
-    else:
-        out.update({"mode": "TRANSITION", "vol_mult_adj": +0.02, "dist_adj": -1.0})
 
-    out["qqq_df"] = qqq  # V9 C: reutilizado para RS20 no loop principal
-    return out
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+def human_number(value: Optional[float]) -> str:
+    if value is None or not math.isfinite(value):
+        return "n/d"
+    for divisor, suffix in [(1e9, "B"), (1e6, "M"), (1e3, "K")]:
+        if abs(value) >= divisor:
+            return f"{value / divisor:.2f}{suffix}"
+    return f"{value:.0f}"
 
-# =========================
-# signals.csv helpers
-# =========================
-SIGNALS_COLS = [
-    "date","asof","ticker","signal","score","close","trig","stop","dist_pct","dv20",
-    "bbz","atrpctl","dd","contr","dry","overhead_touches","vol_mult","overshoot_pct",
-    "R_pct","regime","ret_5","ret_10","ret_20","ret_40","hit_30","hit_50","resolved"
-]
 
-class SignalsStore:
-    """FIX #3: encapsula IO de signals.csv com estado limpo por run"""
-    def __init__(self, cfg: Config):
-        self.path = cfg.signals_csv
-        self._keys: dict = {}  # asof -> set of (asof, ticker, signal)
-        self._ensure_schema()
+def telegram_message(results: list[TechnicalResult]) -> str:
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    if not results:
+        return (
+            "🫀 HEARTBEAT STAGE 2\n"
+            f"Execução: {stamp}\n\n"
+            "Nenhuma empresa cumpriu TODOS os critérios obrigatórios. "
+            "O scanner não adicionou candidatos fracos para preencher a lista."
+        )
+    blocks = [f"🫀 HEARTBEAT STAGE 2 — {len(results)} setup(s)\nExecução: {stamp}"]
+    for rank, result in enumerate(results, 1):
+        m = result.market
+        blocks.append(
+            f"\n#{rank} {result.ticker} — {result.name}\n"
+            f"Score: {result.total_score:.1f}/100 (técnico {result.technical_score:.1f})\n"
+            f"Preço: ${result.price:.3f} | Cap: ${human_number(result.market_cap)} | Float: {human_number(result.float_shares)}\n"
+            f"Vol. médio 20d: {human_number(result.avg_volume_20)} | Breakout: {human_number(result.breakout_volume)} ({result.breakout_volume_multiple:.1f}x)\n"
+            f"SMA150: breakout {result.breakout_date}, há {result.breakout_age_sessions} sessões | Distância {result.distance_sma150_pct:+.1f}%\n"
+            f"Base: {result.consolidation_months:.1f} meses | {result.pattern}\n"
+            f"ATR compressão: {result.atr_contraction_ratio:.2f} | Range semanal: {result.weekly_range_ratio:.2f}\n"
+            f"Suporte: ${result.support:.3f} | Resistência: ${result.resistance:.3f}\n"
+            f"Entrada ideal: ${result.ideal_entry_low:.3f}–${result.ideal_entry_high:.3f} | Invalidação: ${result.invalidation:.3f}\n"
+            f"Catalisadores: {', '.join(result.catalysts)}\n"
+            f"Confirmação: {result.confirmation}"
+        )
+    blocks.append("\nAnálise financeira, diluição e filings SEC não são avaliados automaticamente.")
+    return "\n".join(blocks)
 
-    def _ensure_schema(self):
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if not self.path.exists():
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(SIGNALS_COLS)
-            return
-        try:
-            df = pd.read_csv(self.path)
-        except Exception:
-            with self.path.open("w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(SIGNALS_COLS)
-            return
-        if "asof" not in df.columns:
-            df.insert(1, "asof", "")
-        for c in SIGNALS_COLS:
-            if c not in df.columns:
-                df[c] = ""
-        df[SIGNALS_COLS].to_csv(self.path, index=False)
 
-    def _load_keys(self, asof: str):
-        if asof in self._keys:
-            return
-        keys = set()
-        try:
-            df = pd.read_csv(self.path, usecols=["asof","ticker","signal"]).dropna()
-            df = df[df["asof"].astype(str) == asof]
-            for _, r in df.iterrows():
-                keys.add((str(r["asof"]), str(r["ticker"]).upper().strip(), str(r["signal"]).upper().strip()))
-        except Exception:
-            pass
-        self._keys[asof] = keys
+def tg_send(cfg: Config, text: str) -> None:
+    if not cfg.tg_token or not cfg.tg_chat_id:
+        log.info("Telegram não configurado.\n%s", text)
+        return
+    url = f"https://api.telegram.org/bot{cfg.tg_token}/sendMessage"
+    for start in range(0, len(text), 3900):
+        chunk = text[start : start + 3900]
+        response = SESSION.post(
+            url,
+            json={"chat_id": cfg.tg_chat_id, "text": chunk, "disable_web_page_preview": True},
+            timeout=30,
+        )
+        response.raise_for_status()
 
-    def append(self, row: dict) -> None:
-        asof = str(row.get("asof", "")).strip()
-        t = str(row.get("ticker", "")).strip().upper()
-        s = str(row.get("signal", "")).strip().upper()
-        if not asof or not t or not s:
-            return
-        self._load_keys(asof)
-        k = (asof, t, s)
-        if k in self._keys[asof]:
-            return
-        with self.path.open("a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=SIGNALS_COLS).writerow(
-                {c: row.get(c, "") for c in SIGNALS_COLS}
-            )
-        self._keys[asof].add(k)
 
-    def recent_watch_stats(self, ticker: str, lookback_days: int = 15) -> dict:
-        if not self.path.exists():
-            return {"days": 0, "dists": []}
-        try:
-            df = pd.read_csv(self.path, usecols=["ticker","dist_pct","asof","date"])
-        except Exception:
-            return {"days": 0, "dists": []}
-        df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
-        df = df[df["ticker"] == ticker].copy()
-        if df.empty:
-            return {"days": 0, "dists": []}
-        daycol = "asof" if "asof" in df.columns else "date"
-        df[daycol] = pd.to_datetime(df[daycol], errors="coerce")
-        df = df.dropna(subset=[daycol]).sort_values(daycol)
-        cutoff = df[daycol].max() - pd.Timedelta(days=lookback_days)
-        df = df[df[daycol] >= cutoff]
-        dists = pd.to_numeric(df.get("dist_pct", np.nan), errors="coerce").dropna().tolist()
-        return {"days": len(df), "dists": dists[-10:]}
+def serialise_result(result: TechnicalResult) -> dict[str, Any]:
+    data = asdict(result)
+    return data
 
-def watch_boost_and_stale_penalty(dist_series: list, cfg: Config) -> tuple:
-    if not dist_series:
-        return (0.0, 0.0)
-    days = len(dist_series)
-    boost = 0.0
-    penalty = 0.0
-    if days >= cfg.watch_boost_min_days:
-        tail = dist_series[-cfg.watch_boost_min_days:]
-        if all(np.isfinite(x) for x in tail) and tail[-1] < tail[0]:
-            boost = 0.30
-    if days >= cfg.watch_stale_days:
-        tail = dist_series[-cfg.watch_stale_days:]
-        if all(np.isfinite(x) for x in tail) and (tail[0] - tail[-1]) < 1.0:
-            penalty = 0.35
-    return (boost, penalty)
 
-# =========================
-# Outcomes update — FIX #9: só processa não resolvidos
-# =========================
-def update_outcomes_using_cache(cfg: Config) -> dict:
-    if not cfg.signals_csv.exists():
-        return {"updated": 0, "resolved_total": 0}
-    try:
-        df = pd.read_csv(cfg.signals_csv)
-    except Exception:
-        return {"updated": 0, "resolved_total": 0}
-    if df.empty or "resolved" not in df.columns:
-        return {"updated": 0, "resolved_total": 0}
+def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int, scanned: int) -> None:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "universe_size": universe_size,
+        "scanned": scanned,
+        "qualified": len(results),
+        "criteria": {
+            "exchange": "NASDAQ",
+            "price": f"{cfg.min_price} <= price < {cfg.max_price}",
+            "minimum_base_sessions": cfg.min_base_sessions,
+            "breakout_age_sessions": [cfg.breakout_min_age, cfg.breakout_max_age],
+            "minimum_breakout_volume_multiple": cfg.breakout_volume_mult,
+            "maximum_gain_since_breakout": cfg.max_gain_since_breakout,
+        },
+        "results": [serialise_result(result) for result in results],
+    }
+    cfg.results_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    df["resolved"] = df["resolved"].astype(str)
-    already = int((df["resolved"] == "1").sum())
+    flat_rows = []
+    for result in results:
+        row = serialise_result(result)
+        market = row.pop("market")
+        row.update({f"market_{key}": value for key, value in market.items()})
+        row["catalysts"] = "; ".join(row["catalysts"])
+        flat_rows.append(row)
+    pd.DataFrame(flat_rows).to_csv(cfg.results_csv, index=False)
+    cfg.last_run_json.write_text(
+        json.dumps(
+            {
+                "generated_at": payload["generated_at"],
+                "universe_size": universe_size,
+                "scanned": scanned,
+                "qualified": len(results),
+                "status": "ok",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
 
-    # FIX #9: filtra logo os não resolvidos (era iterado na totalidade antes)
-    unresolved_mask = df["resolved"] != "1"
-    unresolved_idx = df.index[unresolved_mask].tolist()
-    if not unresolved_idx:
-        return {"updated": 0, "resolved_total": already}
 
-    updated = 0
-    for idx in unresolved_idx[:800]:
-        try:
-            ticker = str(df.at[idx, "ticker"]).strip().upper()
-            sig_day = pd.to_datetime(df.at[idx, "asof"] if "asof" in df.columns else df.at[idx, "date"], errors="coerce")
-            if pd.isna(sig_day):
-                continue
-
-            o = load_cached_ohlcv_local(cfg, ticker, min_rows=260)
-            if o is None:
-                continue
-
-            o_dates = o["date"].dt.date.values
-            target = sig_day.date()
-            pos_candidates = np.where(o_dates == target)[0]
-            if len(pos_candidates) == 0:
-                pos_candidates = np.where(o_dates <= target)[0]
-                if len(pos_candidates) == 0:
-                    continue
-                pos = int(pos_candidates[-1])
-            else:
-                pos = int(pos_candidates[0])
-
-            if pos + cfg.horizon >= len(o):
-                continue
-
-            entry_close = safe_float(df.at[idx, "close"])
-            if not np.isfinite(entry_close) or entry_close <= 0:
-                entry_close = float(o["close"].iloc[pos])
-
-            rets = {}
-            for w in cfg.ret_windows:
-                c_fwd = float(o["close"].iloc[pos + w])
-                rets[w] = (c_fwd / entry_close) - 1.0
-
-            horizon_slice = pd.to_numeric(o["close"].iloc[pos:pos + cfg.horizon + 1], errors="coerce").dropna()
-            max_ret = (float(horizon_slice.max()) / entry_close) - 1.0 if len(horizon_slice) else np.nan
-
-            df.at[idx, "ret_5"] = round(rets[5], 6)
-            df.at[idx, "ret_10"] = round(rets[10], 6)
-            df.at[idx, "ret_20"] = round(rets[20], 6)
-            df.at[idx, "ret_40"] = round(rets[40], 6)
-            df.at[idx, "hit_30"] = 1 if (np.isfinite(max_ret) and max_ret >= 0.30) else 0
-            df.at[idx, "hit_50"] = 1 if (np.isfinite(max_ret) and max_ret >= 0.50) else 0
-            df.at[idx, "resolved"] = "1"
-            updated += 1
-        except Exception as e:
-            log.debug(f"[Outcomes] {ticker}: {e}")
-            continue
-
-    if updated > 0:
-        df.to_csv(cfg.signals_csv, index=False)
-        log.info(f"[Outcomes] {updated} sinais resolvidos")
-
-    return {"updated": updated, "resolved_total": int((df["resolved"] == "1").sum())}
-
-def empirical_prob_by_score_bin(cfg: Config, regime: str) -> str:
-    if not cfg.signals_csv.exists():
-        return "EMP: sem histórico"
-    try:
-        df = pd.read_csv(cfg.signals_csv)
-    except Exception:
-        return "EMP: sem histórico"
-    if df.empty or "resolved" not in df.columns:
-        return "EMP: sem histórico"
-
-    df = df[df["resolved"].astype(str) == "1"].copy()
-    df = df[df["signal"].astype(str).str.contains("EXEC", na=False)]
-    if df.empty:
-        return "EMP: sem EXEC resolvido"
-
-    if "regime" in df.columns:
-        df2 = df[df["regime"].astype(str) == regime]
-        if len(df2) >= 20:
-            df = df2
-
-    df["score"] = pd.to_numeric(df["score"], errors="coerce")
-    df = df.dropna(subset=["score"])
-    if len(df) < 30:
-        return f"EMP: n={len(df)} (insuficiente)"
-
-    df["bin"] = pd.qcut(df["score"], 5, duplicates="drop")
-    out = []
-    for b, g in df.groupby("bin"):
-        n = len(g)
-        p30 = float(pd.to_numeric(g.get("hit_30", 0), errors="coerce").fillna(0).mean())
-        p50 = float(pd.to_numeric(g.get("hit_50", 0), errors="coerce").fillna(0).mean())
-        out.append((n, p30, p50))
-    parts = [f"{i+1}:{n}|{p30*100:.0f}/{p50*100:.0f}" for i, (n, p30, p50) in enumerate(out)]
-    return "EMP bins(n|P30/P50%): " + " ".join(parts)
-
-# =========================
-# MAIN
-# =========================
 def main() -> None:
     cfg = Config()
-    cfg.ensure_dirs()
+    cfg.ohlcv_dir.mkdir(parents=True, exist_ok=True)
+    log.info("A construir universo NASDAQ sub-$%.2f…", cfg.max_price)
+    universe = fetch_nasdaq_universe(cfg)
+    log.info("Universo inicial: %d empresas", len(universe))
 
-    log.info("=== V9 Scanner iniciado ===")
-
-    # Apply learned params (retorna dict, não muta cfg)
-    gates = apply_learned_params(cfg)
-    log.info(f"Gates: {gates}")
-
-    now_dt = datetime.now(timezone.utc)
-    now = now_dt.strftime("%Y-%m-%d %H:%M UTC")
-    run_day = now_dt.strftime("%Y-%m-%d")
-
-    store = SignalsStore(cfg)
-    upd = update_outcomes_using_cache(cfg)
-    reg = regime_snapshot(cfg)
-    mode = reg["mode"]
-
-    dist_limit = gates.get("dist_max_pct", cfg.dist_max_pct)
-    bbz_gate = gates.get("bbz_gate", cfg.bbz_gate)
-    atrpctl_gate = gates.get("atrpctl_gate", cfg.atrpctl_gate)
-    vol_confirm_mult = max(1.05, gates.get("vol_confirm_mult_base", cfg.vol_confirm_mult_base) + reg["vol_mult_adj"])
-    dist_limit_eff = max(8.0, dist_limit + reg["dist_adj"])
-    breakout_mult = 1.0 + (cfg.breakout_buffer_pct / 100.0)
-
-    log.info(f"[Regime] {mode} | vol_mult={vol_confirm_mult:.3f} | dist_limit={dist_limit_eff:.1f}%")
-
-    # Universe
-    all_tickers = (
-        get_universe_from_holdings(cfg.iwc_url)
-        + get_universe_from_holdings(cfg.iwm_url)
-        + get_universe_from_holdings(cfg.ijr_url)
-    )
-    universe = sorted(set(t.strip().upper() for t in all_tickers if isinstance(t, str) and t.strip()))
-    log.info(f"[Universe] {len(universe)} tickers únicos")
-
-    # Deterministic scan order
-    scored = []
-    unscored = []
-    pool = universe[:min(cfg.candidate_pool, len(universe))]
-    for t in pool:
-        dv = read_cached_dv20(cfg, t)
-        if dv is None:
-            unscored.append(t)
-        else:
-            scored.append((t, float(dv)))
-    scored.sort(key=lambda x: (-x[1], x[0]))
-    unscored.sort()
-    tickers = ([t for t, _ in scored] + unscored)[:cfg.max_tickers]
-
-    execA, execB = [], []
-    watch_clean, watch_over = [], []
-    near, near_relax = [], []
-
-    hits_limited = False
-    no_data = cache_used = cache_miss = 0
-    hist_ok = liq_ok = comp_ok = base_ok = dry_ok = 0
-    asof_date_global = None
-
-    for i, t in enumerate(tickers):
+    results: list[TechnicalResult] = []
+    scanned = 0
+    for company in universe:
+        scanned += 1
         try:
-            if cfg.cache_only or hits_limited:
-                df = load_cached_ohlcv_local(cfg, t, min_rows=260)
-                if df is None:
-                    cache_miss += 1
-                    continue
-                cache_used += 1
-            else:
-                df = fetch_ohlcv_equity(cfg, t)
+            result = analyse_candidate(company, cfg)
+            if result is not None:
+                results.append(result)
+                log.info("QUALIFICADA %s — %.1f/100", result.ticker, result.total_score)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("%s falhou: %s", company.ticker, exc)
+        if cfg.request_pause:
+            time.sleep(cfg.request_pause)
 
-            if df is None or df.empty:
-                continue
+    results.sort(key=lambda item: (item.total_score, item.technical_score), reverse=True)
+    results = results[: cfg.max_results]
+    save_outputs(results, cfg, len(universe), scanned)
+    message = telegram_message(results)
+    tg_send(cfg, message)
+    log.info("Concluído: %d/%d qualificadas", len(results), scanned)
 
-            asof_row = pd.to_datetime(df["date"], errors="coerce").dropna().max()
-            if pd.isna(asof_row):
-                continue
-            asof_row = asof_row.normalize()
-            asof_str = asof_row.strftime("%Y-%m-%d")
-            if asof_date_global is None or asof_row > asof_date_global:
-                asof_date_global = asof_row
-
-            if len(df) < 260:
-                continue
-            hist_ok += 1
-
-            close_now = float(df["close"].iloc[-1])
-            open_now = float(df["open"].iloc[-1])
-            close_prev = float(df["close"].iloc[-2])
-            vol_now = float(df["volume"].iloc[-1])
-            dv20 = float((df["close"].iloc[-20:] * df["volume"].iloc[-20:]).mean())
-            vol20 = float(df["volume"].iloc[-20:].mean())
-            sv20 = vol20
-
-            if close_now < cfg.min_px or close_now > cfg.max_px:
-                continue
-            if dv20 < cfg.min_dv20 or dv20 > cfg.max_dv20:
-                continue
-            if sv20 < cfg.min_sv20:
-                continue
-            liq_ok += 1
-
-            bbw = compute_bb_width(df, 20)
-            bbz_s = zscore(bbw, 120)
-            atrp = compute_atr(df, 14) / df["close"]
-            atr_win = atrp.iloc[-252:].dropna()
-            if len(atr_win) < 80:
-                continue
-
-            bbz_last = float(bbz_s.iloc[-1])
-            atr_last = float(atrp.iloc[-1])
-            atr_pctl = float((atr_win <= atr_last).mean())
-
-            if not (bbz_last < bbz_gate and atr_pctl < atrpctl_gate):
-                if (bbz_last < (bbz_gate + 0.10)) or (atr_pctl < (atrpctl_gate + 0.08)):
-                    near_relax.append(("COMP", t, close_now, dv20, bbz_last, atr_pctl))
-                continue
-            comp_ok += 1
-
-            ok, trig, lowb, dd, contr, win = base_scan(df, cfg)
-            if not ok:
-                near.append((t, close_now, dv20, bbz_last, "BASE"))
-                continue
-            base_ok += 1
-
-            # V9 A: base position filter — close deve estar nos 65%+ superiores da base
-            base_range = trig - lowb
-            if base_range > 0:
-                base_pos = (close_now - lowb) / base_range
-                if base_pos < cfg.base_position_min:
-                    near.append((t, close_now, dv20, bbz_last, f"BASE_POS({base_pos:.2f}<{cfg.base_position_min})"))
-                    near_relax.append(("BPOS", t, close_now, dv20, bbz_last, atr_pctl))
-                    continue
-
-            # V9 C: força relativa vs QQQ (RS20)
-            qqq_df_reg = reg.get("qqq_df")
-            rs20 = compute_rs20(df, qqq_df_reg)
-            if rs20 is not None and rs20 < cfg.rs20_min:
-                near.append((t, close_now, dv20, bbz_last, f"RS20({rs20:.2f}<{cfg.rs20_min})"))
-                near_relax.append(("RS20", t, close_now, dv20, bbz_last, atr_pctl))
-                continue
-
-            dry = dryup_ratio(df)
-            if (not np.isfinite(dry)) or (dry >= cfg.dryup_max):
-                near.append((t, close_now, dv20, bbz_last, "DRY"))
-                if np.isfinite(dry) and dry < (cfg.dryup_max + 0.12):
-                    near_relax.append(("DRY", t, close_now, dv20, bbz_last, atr_pctl))
-                continue
-            dry_ok += 1
-
-            stop = lowb * 0.99
-            R_pct = ((trig - stop) / trig * 100.0) if trig > 0 else np.nan
-            if (not np.isfinite(R_pct)) or (R_pct < cfg.min_r_pct):
-                near.append((t, close_now, dv20, bbz_last, f"LOW_R({R_pct:.1f}%)"))
-                if np.isfinite(R_pct) and R_pct >= (cfg.min_r_pct - 1.5):
-                    near_relax.append(("R", t, close_now, dv20, bbz_last, atr_pctl))
-                continue
-
-            dist_pct = ((trig - close_now) / close_now * 100.0) if close_now > 0 else np.nan
-            overshoot_pct = ((close_now - trig) / trig * 100.0) if trig > 0 else 0.0
-            overhead = overhead_supply_touches(df, trig, cfg)
-
-            stats = store.recent_watch_stats(t)
-            boost, stale_pen = watch_boost_and_stale_penalty(stats["dists"], cfg)
-
-            sc = score_candidate(
-                bbz_last, atr_pctl, dd, contr, dry, dv20,
-                dist_pct if np.isfinite(dist_pct) else (dist_limit_eff + 999.0),
-                overhead, boost, stale_pen, cfg, gates
-            )
-
-            vol_mult = (vol_now / vol20) if vol20 > 0 else np.nan
-            trig_eff = trig * breakout_mult
-            breakout_now = close_now > trig_eff
-            vol_confirm = (vol20 > 0) and (vol_now >= vol_confirm_mult * vol20)
-            no_big_gap = (close_prev > 0) and (open_now <= close_prev * cfg.max_gap_up)
-            quality_ok = (bbz_last <= cfg.exec_bbz_max) or (atr_pctl <= cfg.exec_atrpctl_max)
-            not_too_extended = overshoot_pct <= cfg.exec_max_overshoot_pct
-            prev_above = close_prev > trig_eff
-
-            base_row = {
-                "date": run_day, "asof": asof_str, "ticker": t,
-                "score": round(sc, 6), "close": round(close_now, 6),
-                "trig": round(trig, 6), "stop": round(stop, 6),
-                "dist_pct": round(float(dist_pct), 6) if np.isfinite(dist_pct) else "",
-                "dv20": round(dv20, 2), "bbz": round(bbz_last, 6),
-                "atrpctl": round(atr_pctl, 6), "dd": round(dd, 6),
-                "contr": round(contr, 6), "dry": round(dry, 6),
-                "overhead_touches": overhead,
-                "vol_mult": round(float(vol_mult), 6) if np.isfinite(vol_mult) else "",
-                "overshoot_pct": round(float(overshoot_pct), 6),
-                "R_pct": round(float(R_pct), 6) if np.isfinite(R_pct) else "",
-                "regime": mode, "resolved": "0"
-            }
-
-            if breakout_now and vol_confirm and no_big_gap and quality_ok and not_too_extended:
-                sig = "EXEC_B" if prev_above else "EXEC_A"
-                item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, overshoot_pct, R_pct, vol_mult, overhead, win, dist_pct)
-                (execB if sig == "EXEC_B" else execA).append(item)
-                store.append({**base_row, "signal": sig})
-            else:
-                if (np.isfinite(dist_pct) and dist_pct <= dist_limit_eff
-                        and dist_pct >= -cfg.exec_max_overshoot_pct
-                        and atr_pctl <= 0.42):
-                    item = (sc, t, close_now, dv20, bbz_last, atr_pctl, trig, stop, dist_pct, R_pct, overhead, win, boost, stale_pen)
-                    (watch_clean if overhead <= 5 else watch_over).append(item)
-                    store.append({**base_row, "signal": "WATCH"})
-                else:
-                    if np.isfinite(dist_pct) and dist_pct <= (dist_limit_eff + 6.0) and atr_pctl <= 0.50:
-                        near_relax.append(("WATCH", t, close_now, dv20, bbz_last, atr_pctl))
-
-        except Exception as e:
-            s = str(e).upper()
-            if "NO_DATA" in s:
-                no_data += 1
-            elif "HITS_LIMIT" in s:
-                log.warning(f"[Stooq] Rate-limit atingido em {t} — modo cache daqui em diante")
-                hits_limited = True
-            else:
-                log.debug(f"[Scan] {t}: {e}")
-
-        if (i + 1) % cfg.sleep_every == 0:
-            time.sleep(cfg.sleep_seconds)
-
-    # Sort & trim
-    execA.sort(key=lambda x: x[0], reverse=True)
-    execB.sort(key=lambda x: x[0], reverse=True)
-    watch_clean.sort(key=lambda x: x[0], reverse=True)
-    watch_over.sort(key=lambda x: x[0], reverse=True)
-    execA, execB = execA[:12], execB[:12]
-    watch_clean, watch_over = watch_clean[:7], watch_over[:7]
-    near = near[:10]
-
-    emp = empirical_prob_by_score_bin(cfg, mode)
-    asof_str_global = asof_date_global.strftime("%Y-%m-%d") if asof_date_global else "—"
-
-    # WATCH_RELAX fallback
-    total_props = len(execA) + len(execB) + len(watch_clean) + len(watch_over)
-    watch_relax_lines = []
-    if total_props < cfg.min_daily_proposals and near_relax:
-        nr_sorted = sorted(near_relax, key=lambda x: (-float(x[3]) if np.isfinite(x[3]) else 0.0, str(x[1])))
-        nr_sorted = nr_sorted[:cfg.watch_relax_top]
-        watch_relax_lines.append(f"WATCH_RELAX (propostas < {cfg.min_daily_proposals}):")
-        for reason, t, c, dv, bbz, atrp in nr_sorted:
-            watch_relax_lines.append(f"  {t} | {reason} | {c:.2f} | dv={dv/1e6:.1f}M | BBz={bbz:.2f}")
-
-    # --- Compose message (HTML para Telegram) ---
-    def fmt_exec(items, label):
-        lines = [f"--- {label} ---"]
-        for sc, t, c, dv, bbz, atrp, trig, stop, over, Rp, vm, oh, win, dist in items:
-            lines.append(
-                f"  {t} sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% dv={dv/1e6:.1f}M "
-                f"BBz={bbz:.2f} trig={trig:.2f} stp={stop:.2f} R%={Rp:.1f} ovr={over:.1f}% vx={vm:.2f} oh={oh} b{win}"
-            )
-        return "\n".join(lines)
-
-    def fmt_watch(items, label):
-        def prio(x):
-            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
-            p = 0
-            if dist <= 4: p += 1
-            if oh <= 3: p += 1
-            if atrp <= 0.22: p += 1
-            if Rp >= 12: p += 1
-            return (p, sc)
-        items = sorted(items, key=prio, reverse=True)
-        lines = [f"--- {label} ---"]
-        for x in items:
-            sc, t, c, dv, bbz, atrp, trig, stop, dist, Rp, oh, win, boost, stale = x
-            p, _ = prio(x)
-            em = "🔥" if p == 4 else "✅" if p == 3 else "⚠️" if p == 2 else "❌"
-            lines.append(
-                f"  {em} {t} P={p}/4 sc={sc:.2f} cls={c:.2f} dist={dist:.1f}% "
-                f"dv={dv/1e6:.1f}M BBz={bbz:.2f} trig={trig:.2f} R%={Rp:.1f} oh={oh}"
-            )
-        return "\n".join(lines)
-
-    msg_parts = [
-        f"=== V9 Scanner | {now} ===",
-        f"ASOF={asof_str_global} | Modo={mode} | QQQ={reg['qqq_trend']} VIX={reg['vix_trend']}",
-        f"Eval={len(tickers)} hist={hist_ok} liq={liq_ok} comp={comp_ok} base={base_ok} dry={dry_ok}",
-        f"ExecB={len(execB)} ExecA={len(execA)} WClean={len(watch_clean)} WOver={len(watch_over)}",
-        f"Outcomes: +{upd['updated']} resolvidos ({upd['resolved_total']} total)",
-        emp,
-        "",
-    ]
-
-    if gates.get("used"):
-        msg_parts.append(
-            f"📐 Learned: blend={gates.get('blend',0):.2f} | "
-            f"BBz={gates.get('bbz_gate',bbz_gate):.3f} | ATRp={gates.get('atrpctl_gate',atrpctl_gate):.3f} | "
-            f"Dist={gates.get('dist_max_pct',dist_limit):.1f}%"
-        )
-    else:
-        msg_parts.append("📐 Learned: não aplicado (sem learned_params.json)")
-    msg_parts.append("")
-
-    if execB:
-        msg_parts.append(fmt_exec(execB, "🟢 EXEC_B (2-day confirmado)"))
-        msg_parts.append("")
-    if execA:
-        msg_parts.append(fmt_exec(execA, "🟡 EXEC_A (1-day)"))
-        msg_parts.append("")
-    if not execA and not execB:
-        msg_parts.append("⚪ EXEC: vazio")
-        msg_parts.append("")
-
-    if watch_clean:
-        msg_parts.append(fmt_watch(watch_clean, "👀 WATCH_LIMPO"))
-        msg_parts.append("")
-    else:
-        msg_parts.append("⚪ WATCH_LIMPO: vazio")
-        msg_parts.append("")
-
-    if watch_over:
-        msg_parts.append(fmt_watch(watch_over, "⚠️ WATCH_OVERHEAD"))
-        msg_parts.append("")
-
-    if watch_relax_lines:
-        msg_parts.extend(watch_relax_lines)
-        msg_parts.append("")
-
-    if near:
-        msg_parts.append("🔍 QUASE (debug):")
-        for t, c, dv, bbz, reason in near:
-            msg_parts.append(f"  {t} | {reason} | {c:.2f} | BBz={bbz:.2f}")
-
-    full_msg = "\n".join(msg_parts)
-    tg_send(cfg, full_msg)
-    log.info(full_msg)
-
-    # last_run.json
-    try:
-        cfg.last_run_json.write_text(json.dumps({
-            "run_utc": now, "asof": asof_str_global, "mode": mode,
-            "eval": len(tickers),
-            "counts": {"exec_b": len(execB), "exec_a": len(execA),
-                       "watch_clean": len(watch_clean), "watch_over": len(watch_over),
-                       "nodata": no_data, "cache_used": cache_used, "cache_miss": cache_miss},
-            "gates": gates,
-        }, indent=2), encoding="utf-8")
-    except Exception as e:
-        log.warning(f"last_run.json: {e}")
-
-    log.info("=== V8 Scanner concluído ===")
 
 if __name__ == "__main__":
     main()
