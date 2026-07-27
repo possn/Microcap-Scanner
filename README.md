@@ -1,29 +1,28 @@
-# Heartbeat Stage 2 Scanner
+# Heartbeat Stage 2 — Probability Engine v1.2.0
 
-Scanner técnico diário para ações NASDAQ abaixo de 1 USD, com foco em consolidações prolongadas, compressão de volatilidade e breakout recente da SMA150 com volume anormal.
+Scanner diário de ações NASDAQ abaixo de 1 USD. Não promete probabilidades certas: procura setups com melhor assimetria e cria um histórico para calibrar empiricamente o modelo.
 
-## Dados analisados automaticamente
+## Motor técnico
 
-- preço e histórico OHLCV;
-- SMA150 e data do breakout;
-- volume relativo no breakout;
-- duração e geometria da consolidação;
-- compressão de ATR e amplitude semanal;
-- liquidez;
-- market cap;
-- float apenas quando disponível na fonte de mercado;
-- suporte, resistência, entrada, invalidação e confirmação;
-- ranking técnico de 0 a 100.
+Mantém os critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150, volume ≥3x, preço não esticado, liquidez e market cap.
 
-O scanner não consulta a SEC e não avalia automaticamente caixa, runway, ofertas, diluição, reverse splits ou risco de permanência no Nasdaq. Essa análise é feita manualmente apenas para os tickers selecionados.
+Acrescenta:
 
-## Secrets obrigatórios no GitHub
+- força relativa a 20 e 60 sessões contra QQQ;
+- regime de mercado através de QQQ e IWM;
+- qualidade do fecho da sessão de impulso (CLV);
+- volume seco antes do breakout;
+- resistência real da base e estado BREAKOUT/RETEST;
+- persistência acima da SMA150 após a quebra;
+- contagem de falsos breakouts anteriores;
+- relação potencial/risco mínima;
+- score probabilístico multifatorial 0–100;
+- diário de sinais com retornos a 5, 10, 20, 40 e 60 sessões.
 
-- `TG_BOT_TOKEN`
-- `TG_CHAT_ID`
+## Telegram
 
-Não é necessário `SEC_USER_AGENT`.
+Secrets necessários: `TG_BOT_TOKEN` e `TG_CHAT_ID`.
 
-## Execução
+## Limitação importante
 
-O workflow `.github/workflows/daily.yml` corre de segunda a sexta-feira após o fecho regular dos EUA e também pode ser iniciado manualmente em **Actions**.
+O score é um ranking técnico, não uma probabilidade matemática validada enquanto o ficheiro `cache/signal_journal.json` não acumular amostra suficiente. A análise de SEC, caixa e diluição continua manual.

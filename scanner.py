@@ -114,7 +114,13 @@ class Config:
         default_factory=lambda: int(os.getenv("MAX_RESULTS", "10"))
     )
     max_candidates: int = field(
-        default_factory=lambda: int(os.getenv("MAX_CANDIDATES", "500"))
+        default_factory=lambda: int(os.getenv("MAX_CANDIDATES", "0"))
+    )
+    breakout_volume_window: int = field(
+        default_factory=lambda: int(os.getenv("BREAKOUT_VOLUME_WINDOW", "3"))
+    )
+    near_miss_limit: int = field(
+        default_factory=lambda: int(os.getenv("NEAR_MISS_LIMIT", "5"))
     )
     request_pause: float = field(
         default_factory=lambda: float(os.getenv("REQUEST_PAUSE", "0.12"))
@@ -128,10 +134,15 @@ class Config:
     strict_float: bool = field(
         default_factory=lambda: os.getenv("STRICT_FLOAT", "0") == "1"
     )
+    min_quality_score: float = field(default_factory=lambda: float(os.getenv("MIN_QUALITY_SCORE", "68")))
+    min_reward_risk: float = field(default_factory=lambda: float(os.getenv("MIN_REWARD_RISK", "2.0")))
+    min_close_location: float = field(default_factory=lambda: float(os.getenv("MIN_CLOSE_LOCATION", "0.60")))
+    max_failed_breakouts: int = field(default_factory=lambda: int(os.getenv("MAX_FAILED_BREAKOUTS", "3")))
 
     results_json: Path = Path("cache/heartbeat_results.json")
     results_csv: Path = Path("cache/heartbeat_results.csv")
     last_run_json: Path = Path("cache/last_run.json")
+    signal_journal_json: Path = Path("cache/signal_journal.json")
     ohlcv_dir: Path = Path("cache/ohlcv")
 
 
@@ -180,6 +191,17 @@ class TechnicalResult:
     higher_lows_slope: float
     lower_highs_slope: float
     sma150_slope_pct_20d: float
+    close_location_value: float
+    volume_dryup_ratio: float
+    relative_strength_20d: float
+    relative_strength_60d: float
+    resistance_break_pct: float
+    reward_risk: float
+    failed_breakouts: int
+    persistence_score: float
+    market_regime: str
+    setup_state: str
+    probability_band: str
     market: MarketSnapshot
     catalysts: list[str]
     technical_score: float
@@ -192,7 +214,7 @@ class TechnicalResult:
 SESSION = requests.Session()
 SESSION.headers.update(
     {
-        "User-Agent": "Mozilla/5.0 (compatible; HeartbeatStage2/1.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; HeartbeatStage2/1.2)",
         "Accept": "application/json,text/plain,*/*",
     }
 )
@@ -276,7 +298,7 @@ def fetch_nasdaq_universe(cfg: Config) -> list[UniverseRow]:
             )
         )
     universe.sort(key=lambda item: (item.market_cap or float("inf"), -item.price))
-    return universe[: cfg.max_candidates]
+    return universe if cfg.max_candidates <= 0 else universe[: cfg.max_candidates]
 
 
 # ---------------------------------------------------------------------------
@@ -480,7 +502,14 @@ def detect_base(df: pd.DataFrame, breakout_idx: int, cfg: Config) -> Optional[di
     return best
 
 
-def find_sma150_breakout(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, Any]]:
+def find_sma150_breakout(df: pd.DataFrame, cfg: Config) -> tuple[Optional[dict[str, Any]], str]:
+    """Find a recent SMA150 reclaim with volume confirmation near the crossing.
+
+    The price crossing and the >=3x volume confirmation do not need to occur on
+    exactly the same session. Institutional accumulation often appears shortly
+    before or after the technical reclaim, so a configurable ±N-session window
+    is used. The function returns both the result and a diagnostic reason.
+    """
     work = df.copy()
     work["sma150"] = work["close"].rolling(150).mean()
     work["vol50"] = work["volume"].shift(1).rolling(50).mean()
@@ -488,60 +517,171 @@ def find_sma150_breakout(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, An
     start = max(151, latest - cfg.breakout_max_age)
     end = latest - cfg.breakout_min_age
     if end < start:
-        return None
+        return None, "breakout_window"
 
-    possibilities: list[dict[str, Any]] = []
+    crosses: list[dict[str, Any]] = []
     for idx in range(start, end + 1):
         previous = work.iloc[idx - 1]
         row = work.iloc[idx]
-        if not np.isfinite(row["sma150"]) or not np.isfinite(row["vol50"]):
+        if not np.isfinite(row["sma150"]):
             continue
         crossed = previous["close"] <= previous["sma150"] and row["close"] > row["sma150"]
-        volume_multiple = row["volume"] / row["vol50"] if row["vol50"] > 0 else 0
-        if crossed and volume_multiple >= cfg.breakout_volume_mult:
-            possibilities.append({"idx": idx, "volume_multiple": float(volume_multiple)})
-    if not possibilities:
-        return None
-    # Prefer the most recent qualifying reclaim.
-    chosen = possibilities[-1]
+        if not crossed:
+            continue
+
+        lo = max(0, idx - cfg.breakout_volume_window)
+        hi = min(latest, idx + cfg.breakout_volume_window)
+        best_idx = None
+        best_multiple = 0.0
+        for vol_idx in range(lo, hi + 1):
+            vol_row = work.iloc[vol_idx]
+            if not np.isfinite(vol_row["vol50"]) or vol_row["vol50"] <= 0:
+                continue
+            multiple = float(vol_row["volume"] / vol_row["vol50"])
+            if multiple > best_multiple:
+                best_multiple = multiple
+                best_idx = vol_idx
+        crosses.append({"idx": idx, "volume_idx": best_idx, "volume_multiple": best_multiple})
+
+    if not crosses:
+        return None, "no_sma150_cross"
+
+    volume_confirmed = [x for x in crosses if x["volume_multiple"] >= cfg.breakout_volume_mult]
+    if not volume_confirmed:
+        return None, "breakout_volume"
+
+    chosen = volume_confirmed[-1]
     idx = chosen["idx"]
+    volume_idx = chosen["volume_idx"] if chosen["volume_idx"] is not None else idx
     row = work.iloc[idx]
+    volume_row = work.iloc[volume_idx]
     current = work.iloc[-1]
     if current["close"] <= current["sma150"]:
-        return None
+        return None, "below_sma150"
     gain = current["close"] / row["close"] - 1
     distance = current["close"] / current["sma150"] - 1
-    if gain > cfg.max_gain_since_breakout or distance > cfg.max_distance_sma150:
-        return None
+    if gain > cfg.max_gain_since_breakout:
+        return None, "extended_gain"
+    if distance > cfg.max_distance_sma150:
+        return None, "extended_sma"
     slope20 = work["sma150"].iloc[-1] / work["sma150"].iloc[-21] - 1
-    if slope20 < -0.035:  # sharply falling SMA150 is not Stage 2
-        return None
+    if slope20 < -0.035:
+        return None, "falling_sma150"
     return {
         "idx": idx,
         "date": row["date"],
         "age": latest - idx,
         "price": float(row["close"]),
-        "volume": float(row["volume"]),
+        "volume": float(volume_row["volume"]),
+        "volume_idx": int(volume_idx),
+        "volume_date": volume_row["date"],
+        "volume_offset": int(volume_idx - idx),
         "volume_multiple": chosen["volume_multiple"],
         "gain": float(gain),
         "distance": float(distance),
         "sma150": float(current["sma150"]),
         "slope20": float(slope20),
-    }
+    }, "ok"
+
+BENCHMARKS: dict[str, pd.DataFrame] = {}
+MARKET_REGIME: dict[str, Any] = {"label": "indeterminado", "score": 0.0}
 
 
-def technical_score(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame, cfg: Config) -> float:
+def close_location(row: pd.Series) -> float:
+    span = float(row["high"] - row["low"])
+    return 0.5 if span <= 0 else float((row["close"] - row["low"]) / span)
+
+
+def aligned_return(df: pd.DataFrame, benchmark: Optional[pd.DataFrame], sessions: int) -> float:
+    if benchmark is None or len(df) < sessions + 1:
+        return 0.0
+    left = df[["date", "close"]].tail(sessions + 10).rename(columns={"close": "asset"})
+    right = benchmark[["date", "close"]].tail(sessions + 10).rename(columns={"close": "bench"})
+    joined = left.merge(right, on="date", how="inner").tail(sessions + 1)
+    if len(joined) < max(10, sessions // 2):
+        return 0.0
+    ar = joined["asset"].iloc[-1] / joined["asset"].iloc[0] - 1
+    br = joined["bench"].iloc[-1] / joined["bench"].iloc[0] - 1
+    return float(ar - br)
+
+
+def failed_breakout_count(df: pd.DataFrame, resistance: float, lookback: int = 126) -> int:
+    w = df.tail(lookback).reset_index(drop=True)
+    count = 0
+    for i in range(1, max(1, len(w) - 3)):
+        if w.loc[i, "high"] > resistance * 1.02 and w.loc[i, "close"] > resistance:
+            future = w.loc[i + 1 : min(i + 3, len(w)-1), "close"]
+            if len(future) and (future < resistance * 0.98).any():
+                count += 1
+    return count
+
+
+def persistence_after_breakout(df: pd.DataFrame, idx: int) -> float:
+    post = df.iloc[idx + 1 : min(len(df), idx + 6)]
+    if post.empty:
+        return 0.5
+    sma = df["close"].rolling(150).mean().iloc[post.index]
+    above = float((post["close"].values > sma.values).mean())
+    giveback = max(0.0, 1 - float(post["close"].min() / max(df.iloc[idx]["close"], 1e-9)))
+    return float(max(0.0, min(1.0, above - giveback)))
+
+
+def compute_market_regime() -> dict[str, Any]:
+    scores=[]
+    labels=[]
+    for ticker in ("QQQ", "IWM"):
+        df=BENCHMARKS.get(ticker)
+        if df is None or len(df)<210:
+            continue
+        c=float(df["close"].iloc[-1]); sma50=float(df["close"].rolling(50).mean().iloc[-1]); sma200=float(df["close"].rolling(200).mean().iloc[-1])
+        sc=(1 if c>sma50 else -1)+(1 if c>sma200 else -1)+(0.5 if sma50>sma200 else -0.5)
+        scores.append(sc); labels.append(f"{ticker}:{'+' if sc>0 else '-'}")
+    score=float(np.mean(scores)) if scores else 0.0
+    label="favorável" if score>=1.0 else "adverso" if score<=-1.0 else "neutro"
+    return {"label":label,"score":score,"detail":" ".join(labels)}
+
+
+def enhanced_metrics(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
+    vi=int(breakout.get("volume_idx", breakout["idx"]))
+    volrow=df.iloc[vi]
+    clv=close_location(volrow)
+    pre=df.iloc[max(0, breakout["idx"]-20):breakout["idx"]]
+    dry=float(pre["volume"].tail(10).mean()/max(pre["volume"].tail(50).mean(),1)) if len(pre)>=10 else 1.0
+    rs20=aligned_return(df, BENCHMARKS.get("QQQ"), 20)
+    rs60=aligned_return(df, BENCHMARKS.get("QQQ"), 60)
+    resistance=float(base["resistance"]); current=float(df["close"].iloc[-1])
+    rbreak=current/resistance-1 if resistance else 0.0
+    support=min(float(base["support"]), float(breakout["sma150"]))
+    invalid=min(support*0.97, float(breakout["sma150"])*0.96)
+    risk=max(current-invalid, current*0.03)
+    next_target=max(resistance*1.25, current*1.20)
+    rr=max(0.0,(next_target-current)/risk)
+    fails=failed_breakout_count(df.iloc[:breakout["idx"]+1], resistance)
+    persist=persistence_after_breakout(df, breakout["idx"])
+    state="RETEST" if current>=resistance*0.97 and current<=resistance*1.08 and breakout["age"]>=5 else "BREAKOUT"
+    return {"clv":clv,"dry":dry,"rs20":rs20,"rs60":rs60,"rbreak":rbreak,"rr":rr,"fails":fails,"persist":persist,"state":state}
+
+
+def technical_score(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame, cfg: Config, extra: Optional[dict[str, Any]]=None) -> float:
+    extra=extra or enhanced_metrics(base, breakout, df)
     sessions = base["sessions"]
-    base_points = 12 + 8 * min(max((sessions - cfg.min_base_sessions) / 126, 0), 1)
-    atr_points = 15 * max(0, 1 - base["atr_ratio"] / cfg.max_atr_contraction_ratio)
-    weekly_points = 10 * max(0, 1 - base["weekly_ratio"] / cfg.max_weekly_range_ratio)
-    geometry_points = 10 * min(1, max(0, base["low_slope"] * 180) + max(0, -base["high_slope"] * 180) + 0.25)
-    vol_points = 15 * min((breakout["volume_multiple"] - 3) / 4 + 0.55, 1)
-    sma_points = 8 if breakout["slope20"] >= 0 else max(0, 8 + breakout["slope20"] * 200)
-    proximity_points = 10 * max(0, 1 - breakout["distance"] / cfg.max_distance_sma150)
-    avg_volume = float(df["volume"].tail(20).mean())
-    liquidity_points = 5 * min(avg_volume / 1_000_000, 1)
-    return round(min(100.0, base_points + atr_points + weekly_points + geometry_points + vol_points + sma_points + proximity_points + liquidity_points), 1)
+    score=0.0
+    score += 12 + 6 * min(max((sessions-cfg.min_base_sessions)/126,0),1)
+    score += 10 * max(0,1-base["atr_ratio"]/cfg.max_atr_contraction_ratio)
+    score += 7 * max(0,1-base["weekly_ratio"]/cfg.max_weekly_range_ratio)
+    score += 9 * min(1,max(0,base["low_slope"]*180)+max(0,-base["high_slope"]*180)+0.25)
+    score += 12 * min(1,max(0,(breakout["volume_multiple"]-2.5)/3.5))
+    score += 7 if breakout["slope20"]>=0 else max(0,7+breakout["slope20"]*180)
+    score += 6 * max(0,1-breakout["distance"]/cfg.max_distance_sma150)
+    score += 7 * max(0,min(1,(extra["clv"]-0.45)/0.45))
+    score += 5 * max(0,min(1,(1.15-extra["dry"])/0.55))
+    score += 7 * max(0,min(1,(extra["rs20"]+0.05)/0.25))
+    score += 5 * max(0,min(1,(extra["rs60"]+0.05)/0.35))
+    score += 5 * max(0,min(1,extra["rr"]/3.0))
+    score += 4 * extra["persist"]
+    score -= min(9,extra["fails"]*3)
+    score += 3 if MARKET_REGIME.get("label")=="favorável" else -3 if MARKET_REGIME.get("label")=="adverso" else 0
+    return round(max(0.0,min(100.0,score)),1)
 
 
 # ---------------------------------------------------------------------------
@@ -577,73 +717,36 @@ def market_adjustment(float_shares: Optional[float], market_cap: Optional[float]
     return score
 
 
-def analyse_candidate(company: UniverseRow, cfg: Config) -> Optional[TechnicalResult]:
+def analyse_candidate(company: UniverseRow, cfg: Config) -> tuple[Optional[TechnicalResult], str, dict[str, Any]]:
+    diagnostics: dict[str, Any] = {"ticker": company.ticker, "name": company.name}
     df = load_ohlcv(company.ticker, cfg)
-    if df is None or len(df) < cfg.min_history_sessions:
-        return None
-    latest_price = float(df["close"].iloc[-1])
-    if not (cfg.min_price <= latest_price < cfg.max_price):
-        return None
-
-    avg_volume_20 = float(df["volume"].tail(20).mean())
-    avg_dollar_volume_20 = float((df["close"] * df["volume"]).tail(20).mean())
-    if avg_volume_20 < cfg.min_avg_volume_20 or avg_dollar_volume_20 < cfg.min_avg_dollar_volume_20:
-        return None
-
-    breakout = find_sma150_breakout(df, cfg)
-    if breakout is None:
-        return None
-    base = detect_base(df, breakout["idx"], cfg)
-    if base is None:
-        return None
-
-    snapshot = MarketSnapshot()
-    if cfg.strict_float and snapshot.float_shares is not None and snapshot.float_shares > cfg.preferred_float:
-        return None
-
-    tech_score = technical_score(base, breakout, df, cfg)
-    total_score = round(max(0.0, min(100.0, tech_score + market_adjustment(snapshot.float_shares, company.market_cap, cfg))), 1)
-
-    resistance = max(base["resistance"], breakout["price"])
-    support = min(base["support"], breakout["sma150"])
-    ideal_low = max(breakout["sma150"], resistance * 0.97)
-    ideal_high = resistance * 1.04
-    invalidation = min(support * 0.97, breakout["sma150"] * 0.96)
-    confirmation = f"Fecho acima de ${resistance:.3f} com volume ≥2x média de 50 sessões e manutenção acima da SMA150."
-
-    return TechnicalResult(
-        ticker=company.ticker,
-        name=company.name,
-        price=latest_price,
-        market_cap=company.market_cap,
-        float_shares=snapshot.float_shares,
-        avg_volume_20=avg_volume_20,
-        avg_dollar_volume_20=avg_dollar_volume_20,
-        breakout_volume=breakout["volume"],
-        breakout_volume_multiple=breakout["volume_multiple"],
-        breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),
-        breakout_age_sessions=breakout["age"],
-        distance_sma150_pct=100 * breakout["distance"],
-        gain_since_breakout_pct=100 * breakout["gain"],
-        consolidation_sessions=base["sessions"],
-        consolidation_months=round(base["sessions"] / 21, 1),
-        pattern=base["pattern"],
-        support=support,
-        resistance=resistance,
-        ideal_entry_low=ideal_low,
-        ideal_entry_high=ideal_high,
-        invalidation=invalidation,
-        confirmation=confirmation,
-        atr_contraction_ratio=base["atr_ratio"],
-        weekly_range_ratio=base["weekly_ratio"],
-        higher_lows_slope=base["low_slope"],
-        lower_highs_slope=base["high_slope"],
-        sma150_slope_pct_20d=100 * breakout["slope20"],
-        market=snapshot,
-        catalysts=infer_catalysts(company),
-        technical_score=tech_score,
-        total_score=total_score,
-    )
+    if df is None: return None, "no_history", diagnostics
+    diagnostics["history_sessions"] = len(df)
+    if len(df) < cfg.min_history_sessions: return None, "short_history", diagnostics
+    latest_price=float(df["close"].iloc[-1]); diagnostics["latest_price"]=latest_price
+    if not (cfg.min_price <= latest_price < cfg.max_price): return None,"price_changed",diagnostics
+    avg_volume_20=float(df["volume"].tail(20).mean()); avg_dollar_volume_20=float((df["close"]*df["volume"]).tail(20).mean())
+    diagnostics.update(avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20)
+    if avg_volume_20<cfg.min_avg_volume_20 or avg_dollar_volume_20<cfg.min_avg_dollar_volume_20: return None,"liquidity",diagnostics
+    breakout,reason=find_sma150_breakout(df,cfg)
+    if breakout is None: return None,reason,diagnostics
+    diagnostics.update(breakout_age=breakout["age"],breakout_volume_multiple=breakout["volume_multiple"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"])
+    base=detect_base(df,breakout["idx"],cfg)
+    if base is None: return None,"base_compression",diagnostics
+    extra=enhanced_metrics(base,breakout,df)
+    diagnostics.update(base_sessions=base["sessions"],atr_ratio=base["atr_ratio"],weekly_ratio=base["weekly_ratio"],close_location=extra["clv"],relative_strength_20d=extra["rs20"],reward_risk=extra["rr"],failed_breakouts=extra["fails"])
+    # These are probability-quality gates, not arbitrary cosmetic filters.
+    if extra["clv"] < cfg.min_close_location: return None,"weak_close",diagnostics
+    if extra["rr"] < cfg.min_reward_risk: return None,"poor_reward_risk",diagnostics
+    if extra["fails"] > cfg.max_failed_breakouts: return None,"repeated_failures",diagnostics
+    snapshot=MarketSnapshot()
+    tech_score=technical_score(base,breakout,df,cfg,extra)
+    total_score=round(max(0,min(100,tech_score+market_adjustment(snapshot.float_shares,company.market_cap,cfg))),1)
+    if total_score < cfg.min_quality_score: return None,"quality_score",{**diagnostics,"quality_score":total_score}
+    resistance=max(base["resistance"],breakout["price"]); support=min(base["support"],breakout["sma150"]); ideal_low=max(breakout["sma150"],resistance*0.97); ideal_high=resistance*1.04; invalidation=min(support*0.97,breakout["sma150"]*0.96)
+    band="Alta" if total_score>=82 and MARKET_REGIME.get("label")!="adverso" else "Moderada-alta" if total_score>=74 else "Moderada"
+    confirmation=f"Fecho acima de ${resistance:.3f} com CLV ≥0,60, volume ≥2x e manutenção acima da SMA150."
+    return TechnicalResult(ticker=company.ticker,name=company.name,price=latest_price,market_cap=company.market_cap,float_shares=snapshot.float_shares,avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20,breakout_volume=breakout["volume"],breakout_volume_multiple=breakout["volume_multiple"],breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),breakout_age_sessions=breakout["age"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"],consolidation_sessions=base["sessions"],consolidation_months=round(base["sessions"]/21,1),pattern=base["pattern"],support=support,resistance=resistance,ideal_entry_low=ideal_low,ideal_entry_high=ideal_high,invalidation=invalidation,confirmation=confirmation,atr_contraction_ratio=base["atr_ratio"],weekly_range_ratio=base["weekly_ratio"],higher_lows_slope=base["low_slope"],lower_highs_slope=base["high_slope"],sma150_slope_pct_20d=100*breakout["slope20"],close_location_value=extra["clv"],volume_dryup_ratio=extra["dry"],relative_strength_20d=100*extra["rs20"],relative_strength_60d=100*extra["rs60"],resistance_break_pct=100*extra["rbreak"],reward_risk=extra["rr"],failed_breakouts=extra["fails"],persistence_score=extra["persist"],market_regime=MARKET_REGIME.get("label","indeterminado"),setup_state=extra["state"],probability_band=band,market=snapshot,catalysts=infer_catalysts(company),technical_score=tech_score,total_score=total_score),"qualified",diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -658,34 +761,83 @@ def human_number(value: Optional[float]) -> str:
     return f"{value:.0f}"
 
 
-def telegram_message(results: list[TechnicalResult]) -> str:
+def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], near_misses: list[dict[str, Any]]) -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    if not results:
-        return (
-            "🫀 HEARTBEAT STAGE 2\n"
-            f"Execução: {stamp}\n\n"
-            "Nenhuma empresa cumpriu TODOS os critérios obrigatórios. "
-            "O scanner não adicionou candidatos fracos para preencher a lista."
-        )
-    blocks = [f"🫀 HEARTBEAT STAGE 2 — {len(results)} setup(s)\nExecução: {stamp}"]
-    for rank, result in enumerate(results, 1):
-        m = result.market
-        blocks.append(
-            f"\n#{rank} {result.ticker} — {result.name}\n"
-            f"Score: {result.total_score:.1f}/100 (técnico {result.technical_score:.1f})\n"
-            f"Preço: ${result.price:.3f} | Cap: ${human_number(result.market_cap)} | Float: {human_number(result.float_shares)}\n"
-            f"Vol. médio 20d: {human_number(result.avg_volume_20)} | Breakout: {human_number(result.breakout_volume)} ({result.breakout_volume_multiple:.1f}x)\n"
-            f"SMA150: breakout {result.breakout_date}, há {result.breakout_age_sessions} sessões | Distância {result.distance_sma150_pct:+.1f}%\n"
-            f"Base: {result.consolidation_months:.1f} meses | {result.pattern}\n"
-            f"ATR compressão: {result.atr_contraction_ratio:.2f} | Range semanal: {result.weekly_range_ratio:.2f}\n"
-            f"Suporte: ${result.support:.3f} | Resistência: ${result.resistance:.3f}\n"
-            f"Entrada ideal: ${result.ideal_entry_low:.3f}–${result.ideal_entry_high:.3f} | Invalidação: ${result.invalidation:.3f}\n"
-            f"Catalisadores: {', '.join(result.catalysts)}\n"
-            f"Confirmação: {result.confirmation}"
-        )
-    blocks.append("\nAnálise financeira, diluição e filings SEC não são avaliados automaticamente.")
-    return "\n".join(blocks)
+    reason_labels = {
+        "no_history": "sem histórico/dados",
+        "short_history": "histórico insuficiente",
+        "price_changed": "preço fora do intervalo",
+        "liquidity": "liquidez insuficiente",
+        "breakout_window": "janela de breakout inválida",
+        "no_sma150_cross": "sem cruzamento recente da SMA150",
+        "breakout_volume": "volume <3x perto do breakout",
+        "below_sma150": "voltou abaixo da SMA150",
+        "extended_gain": "subida >50% desde breakout",
+        "extended_sma": "demasiado afastada da SMA150",
+        "falling_sma150": "SMA150 ainda muito descendente",
+        "base_compression": "base/compressão insuficiente",
+        "float": "float acima do limite",
+        "weak_close": "fecho fraco no impulso",
+        "poor_reward_risk": "assimetria risco/retorno insuficiente",
+        "repeated_failures": "demasiados falsos breakouts",
+        "quality_score": "score probabilístico insuficiente",
+        "error": "erro técnico",
+    }
+    header = [
+        "🫀 HEARTBEAT STAGE 2",
+        f"Execução: {stamp}",
+        "",
+        "FUNIL DE AUDITORIA",
+        f"Universo NASDAQ sub-$1 elegível: {funnel.get('universe', 0)}",
+        f"Empresas efetivamente processadas: {funnel.get('scanned', 0)}",
+        f"Histórico válido: {funnel.get('history_ok', 0)}",
+        f"Liquidez aprovada: {funnel.get('liquidity_ok', 0)}",
+        f"Breakout SMA150 aprovado: {funnel.get('breakout_ok', 0)}",
+        f"Base/compressão aprovada: {funnel.get('base_ok', 0)}",
+        f"Qualificadas: {len(results)}",
+        f"Regime: {MARKET_REGIME.get('label','indeterminado')} ({MARKET_REGIME.get('detail','')})",
+    ]
+    exclusions = [(k, v) for k, v in funnel.items() if k.startswith("reason:") and k != "reason:qualified" and v]
+    if exclusions:
+        exclusions.sort(key=lambda item: item[1], reverse=True)
+        header.append("")
+        header.append("PRINCIPAIS EXCLUSÕES")
+        for key, count in exclusions[:6]:
+            reason = key.split(":", 1)[1]
+            header.append(f"• {reason_labels.get(reason, reason)}: {count}")
 
+    if not results:
+        header.extend(["", "Nenhuma empresa cumpriu TODOS os critérios obrigatórios."])
+    else:
+        header.extend(["", f"RESULTADOS — {len(results)} setup(s)"])
+        for rank, result in enumerate(results, 1):
+            header.append(
+                f"\n#{rank} {result.ticker} — {result.name}\n"
+                f"Score: {result.total_score:.1f}/100 | Probabilidade: {result.probability_band} | Estado: {result.setup_state}\n"
+                f"Preço: ${result.price:.3f} | Cap: ${human_number(result.market_cap)} | Float: {human_number(result.float_shares)}\n"
+                f"Vol. médio 20d: {human_number(result.avg_volume_20)} | Confirmação de volume: {human_number(result.breakout_volume)} ({result.breakout_volume_multiple:.1f}x)\n"
+                f"SMA150: breakout {result.breakout_date}, há {result.breakout_age_sessions} sessões | Distância {result.distance_sma150_pct:+.1f}%\n"
+                f"Base: {result.consolidation_months:.1f} meses | {result.pattern}\n"
+                f"RS20: {result.relative_strength_20d:+.1f}% | RS60: {result.relative_strength_60d:+.1f}% | CLV: {result.close_location_value:.2f} | RR: {result.reward_risk:.1f}x\n"
+                f"Suporte: ${result.support:.3f} | Resistência: ${result.resistance:.3f}\n"
+                f"Entrada: ${result.ideal_entry_low:.3f}–${result.ideal_entry_high:.3f} | Invalidação: ${result.invalidation:.3f}"
+            )
+
+    if near_misses:
+        header.extend(["", "QUASE APROVADAS — para revisão, não são recomendações"])
+        for item in near_misses:
+            metrics = []
+            if "breakout_volume_multiple" in item:
+                metrics.append(f"vol {item['breakout_volume_multiple']:.1f}x")
+            if "distance_sma150_pct" in item:
+                metrics.append(f"dist SMA {item['distance_sma150_pct']:+.1f}%")
+            if "base_sessions" in item:
+                metrics.append(f"base {item['base_sessions']}d")
+            suffix = f" | {', '.join(metrics)}" if metrics else ""
+            header.append(f"• {item['ticker']}: falhou {reason_labels.get(item['reason'], item['reason'])}{suffix}")
+
+    header.append("\nA análise SEC/diluição continua manual.")
+    return "\n".join(header)
 
 def tg_send(cfg: Config, text: str) -> None:
     if not cfg.tg_token or not cfg.tg_chat_id:
@@ -707,7 +859,7 @@ def serialise_result(result: TechnicalResult) -> dict[str, Any]:
     return data
 
 
-def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int, scanned: int) -> None:
+def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int, scanned: int, funnel: dict[str, int], near_misses: list[dict[str, Any]]) -> None:
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "universe_size": universe_size,
@@ -721,6 +873,8 @@ def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int
             "minimum_breakout_volume_multiple": cfg.breakout_volume_mult,
             "maximum_gain_since_breakout": cfg.max_gain_since_breakout,
         },
+        "funnel": funnel,
+        "near_misses": near_misses,
         "results": [serialise_result(result) for result in results],
     }
     cfg.results_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -748,31 +902,101 @@ def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int
     )
 
 
+
+def update_signal_journal(results: list[TechnicalResult], cfg: Config) -> None:
+    """Persist signals and evaluate realised 5/10/20/40/60-session outcomes.
+
+    This is not used to manufacture a probability claim. It creates the data
+    required to calibrate the score empirically over time.
+    """
+    try:
+        journal = json.loads(cfg.signal_journal_json.read_text(encoding="utf-8")) if cfg.signal_journal_json.exists() else []
+    except Exception:
+        journal = []
+    today = datetime.now(timezone.utc).date().isoformat()
+    keys={(x.get("ticker"),x.get("signal_date")) for x in journal}
+    for r in results:
+        key=(r.ticker,today)
+        if key not in keys:
+            journal.append({"ticker":r.ticker,"signal_date":today,"signal_price":r.price,"score":r.total_score,"band":r.probability_band,"state":r.setup_state,"outcomes":{}})
+    horizons=(5,10,20,40,60)
+    unresolved=[x for x in journal if any(str(h) not in x.get("outcomes",{}) for h in horizons)]
+    for item in unresolved[-150:]:
+        df=load_ohlcv(item["ticker"],cfg)
+        if df is None: continue
+        dates=pd.to_datetime(df["date"]).dt.date
+        sig=datetime.fromisoformat(item["signal_date"]).date()
+        idxs=np.where(dates>=sig)[0]
+        if len(idxs)==0: continue
+        i=int(idxs[0]); entry=float(item["signal_price"]); outcomes=item.setdefault("outcomes",{})
+        for h in horizons:
+            if str(h) not in outcomes and i+h < len(df):
+                segment=df.iloc[i:i+h+1]
+                outcomes[str(h)]={"return_pct":round(100*(float(df.iloc[i+h]["close"])/entry-1),2),"max_gain_pct":round(100*(float(segment["high"].max())/entry-1),2),"max_drawdown_pct":round(100*(float(segment["low"].min())/entry-1),2)}
+    cfg.signal_journal_json.write_text(json.dumps(journal,ensure_ascii=False,indent=2),encoding="utf-8")
+
 def main() -> None:
+    global MARKET_REGIME
     cfg = Config()
     cfg.ohlcv_dir.mkdir(parents=True, exist_ok=True)
+    for benchmark in ("QQQ", "IWM"):
+        try:
+            BENCHMARKS[benchmark] = load_ohlcv(benchmark, cfg)
+        except Exception as exc:
+            log.warning("Benchmark %s indisponível: %s", benchmark, exc)
+    MARKET_REGIME = compute_market_regime()
+    log.info("Regime de mercado: %s", MARKET_REGIME)
     log.info("A construir universo NASDAQ sub-$%.2f…", cfg.max_price)
     universe = fetch_nasdaq_universe(cfg)
     log.info("Universo inicial: %d empresas", len(universe))
 
+    funnel: dict[str, int] = {"universe": len(universe), "scanned": 0}
     results: list[TechnicalResult] = []
+    near_misses: list[dict[str, Any]] = []
     scanned = 0
     for company in universe:
         scanned += 1
+        funnel["scanned"] = scanned
         try:
-            result = analyse_candidate(company, cfg)
+            result, reason, diagnostics = analyse_candidate(company, cfg)
+            funnel[f"reason:{reason}"] = funnel.get(f"reason:{reason}", 0) + 1
+            if reason not in {"no_history", "short_history", "error"}:
+                funnel["history_ok"] = funnel.get("history_ok", 0) + 1
+            if reason not in {"no_history", "short_history", "price_changed", "liquidity", "error"}:
+                funnel["liquidity_ok"] = funnel.get("liquidity_ok", 0) + 1
+            if reason in {"base_compression", "float", "qualified"}:
+                funnel["breakout_ok"] = funnel.get("breakout_ok", 0) + 1
+            if reason in {"float", "qualified"}:
+                funnel["base_ok"] = funnel.get("base_ok", 0) + 1
             if result is not None:
                 results.append(result)
                 log.info("QUALIFICADA %s — %.1f/100", result.ticker, result.total_score)
+            elif reason in {"breakout_volume", "below_sma150", "extended_gain", "extended_sma", "falling_sma150", "base_compression", "weak_close", "poor_reward_risk", "repeated_failures", "quality_score"}:
+                diagnostics["reason"] = reason
+                # Near misses are ranked by how far they progressed in the funnel.
+                diagnostics["progress"] = {
+                    "breakout_volume": 3,
+                    "below_sma150": 4,
+                    "extended_gain": 4,
+                    "extended_sma": 4,
+                    "falling_sma150": 4,
+                    "base_compression": 5,
+                    "weak_close": 6, "poor_reward_risk": 6, "repeated_failures": 6, "quality_score": 7,
+                }.get(reason, 0)
+                near_misses.append(diagnostics)
         except Exception as exc:  # noqa: BLE001
+            funnel["reason:error"] = funnel.get("reason:error", 0) + 1
             log.warning("%s falhou: %s", company.ticker, exc)
         if cfg.request_pause:
             time.sleep(cfg.request_pause)
 
     results.sort(key=lambda item: (item.total_score, item.technical_score), reverse=True)
     results = results[: cfg.max_results]
-    save_outputs(results, cfg, len(universe), scanned)
-    message = telegram_message(results)
+    near_misses.sort(key=lambda x: (x.get("progress", 0), x.get("breakout_volume_multiple", 0), x.get("base_sessions", 0)), reverse=True)
+    near_misses = near_misses[: cfg.near_miss_limit]
+    save_outputs(results, cfg, len(universe), scanned, funnel, near_misses)
+    update_signal_journal(results, cfg)
+    message = telegram_message(results, funnel, near_misses)
     tg_send(cfg, message)
     log.info("Concluído: %d/%d qualificadas", len(results), scanned)
 
