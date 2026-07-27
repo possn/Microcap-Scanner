@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-07-27T17:41:22.022942+00:00",
+  "universe_size": 500,
+  "scanned": 500,
+  "qualified": 0,
+  "criteria": {
+    "exchange": "NASDAQ",
+    "price": "0.08 <= price < 1.0",
+    "minimum_base_sessions": 84,
+    "breakout_age_sessions": [
+      10,
+      40
+    ],
+    "minimum_breakout_volume_multiple": 3.0,
+    "maximum_gain_since_breakout": 0.5
+  },
+  "results": []
+}
