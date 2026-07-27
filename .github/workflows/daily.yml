@@ -1,21 +1,22 @@
-name: microcap-scanner-daily
+name: heartbeat-stage2-daily
 
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "20 13 * * 1-5"
+    # 21:20 UTC, depois do fecho regular dos EUA; segunda a sexta.
+    - cron: "20 21 * * 1-5"
 
 permissions:
   contents: write
 
 concurrency:
-  group: microcap-scanner-daily
+  group: heartbeat-stage2-daily
   cancel-in-progress: true
 
 jobs:
-  run:
+  scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - name: Checkout repository
@@ -27,80 +28,52 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
+          cache: pip
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Reset learned params (força defaults V9)
-        run: rm -f cache/learned_params.json
-
-      - name: Run scanner (pre-open, EOD prior day)
+      - name: Run Heartbeat Stage 2 scanner
         env:
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
-          IWC_HOLDINGS_CSV_URL: ${{ secrets.IWC_HOLDINGS_CSV_URL }}
-          IWM_HOLDINGS_CSV_URL: ${{ secrets.IWM_HOLDINGS_CSV_URL }}
-          IJR_HOLDINGS_CSV_URL: ${{ secrets.IJR_HOLDINGS_CSV_URL }}
+          MIN_PRICE: "0.08"
+          MAX_PRICE: "1.00"
+          MAX_MARKET_CAP: "150000000"
+          STRICT_MARKET_CAP: "1"
+          STRICT_FLOAT: "0"
 
-          CACHE_ONLY: "0"
+          MIN_HISTORY_SESSIONS: "190"
+          MIN_BASE_SESSIONS: "84"
+          PREFERRED_BASE_SESSIONS: "126"
+          MAX_BASE_SESSIONS: "252"
 
-          MAX_TICKERS: "450"
-          CANDIDATE_POOL: "2000"
-          SLEEP_EVERY: "25"
-          SLEEP_SECONDS: "2.0"
+          BREAKOUT_MIN_AGE: "10"
+          BREAKOUT_MAX_AGE: "40"
+          BREAKOUT_VOLUME_MULT: "3.0"
+          MAX_GAIN_SINCE_BREAKOUT: "0.50"
+          MAX_DISTANCE_SMA150: "0.35"
 
-          MIN_PX: "1.0"
-          MAX_PX: "30"
+          MAX_ATR_CONTRACTION_RATIO: "0.78"
+          MAX_WEEKLY_RANGE_RATIO: "0.82"
+          MAX_BASE_DRAWDOWN: "0.62"
+          MAX_RECENT_VERTICAL_DROP: "0.45"
 
-          MIN_DV20: "1500000"
-          MAX_DV20: "120000000"
-          MIN_SV20: "250000"
+          MIN_AVG_VOLUME_20: "100000"
+          MIN_AVG_DOLLAR_VOLUME_20: "75000"
+          MAX_CANDIDATES: "500"
+          MAX_RESULTS: "10"
+          REQUEST_PAUSE: "0.12"
+        run: python scanner.py
 
-          BBZ_GATE: "-0.60"
-          ATRPCTL_GATE: "0.50"
-
-          BASE_DD_MAX: "0.62"
-          CONTRACTION_MAX: "0.92"
-          DRYUP_MAX: "1.10"
-
-          VOL_CONFIRM_MULT: "1.12"
-          MAX_GAP_UP: "1.14"
-          DIST_MAX_PCT: "12.0"
-          EXEC_MAX_OVERSHOOT_PCT: "8.0"
-
-          EXEC_BBZ_MAX: "-0.90"
-          EXEC_ATRPCTL_MAX: "0.38"
-
-          MIN_R_PCT: "6.0"
-
-          OVERHEAD_WINDOW: "200"
-          OVERHEAD_BAND_PCT: "8.0"
-          OVERHEAD_MAX_TOUCHES: "12"
-
-          WATCH_BOOST_MIN_DAYS: "3"
-          WATCH_STALE_DAYS: "10"
-
-          BASE_POSITION_MIN: "0.65"
-          RS20_MIN: "-0.05"
-
-          HORIZON_SESS: "40"
-          REG_QQQ: "QQQ"
-          REG_VIX: "^VIX"
-
-        run: |
-          python scanner.py
-
-      - name: Commit cache outputs (signals + ohlcv + learned + last_run)
+      - name: Commit scanner outputs
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git pull --rebase || true
-
-          git add cache/signals.csv cache/ohlcv cache/learned_params.json cache/last_run.json || true
-          git commit -m "Update cache (signals + ohlcv + learned + last_run)" || exit 0
+          git add cache/heartbeat_results.json cache/heartbeat_results.csv cache/last_run.json cache/ohlcv || true
+          git commit -m "Update Heartbeat Stage 2 scan" || exit 0
           git push
