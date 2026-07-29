@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-07-28T22:28:51.345541+00:00",
-  "universe_size": 310,
-  "scanned": 310,
+  "generated_at": "2026-07-29T22:17:21.683160+00:00",
+  "universe_size": 328,
+  "scanned": 328,
   "qualified": 0,
   "criteria": {
     "exchange": "NASDAQ",
@@ -15,18 +15,18 @@
     "maximum_gain_since_breakout": 0.5
   },
   "funnel": {
-    "universe": 310,
-    "scanned": 310,
-    "reason:no_sma150_cross": 176,
-    "history_ok": 303,
-    "liquidity_ok": 220,
-    "reason:liquidity": 82,
-    "reason:below_sma150": 27,
-    "reason:breakout_volume": 14,
-    "reason:no_history": 2,
+    "universe": 328,
+    "scanned": 328,
+    "reason:no_sma150_cross": 188,
+    "history_ok": 321,
+    "liquidity_ok": 233,
+    "reason:below_sma150": 28,
+    "reason:liquidity": 87,
     "reason:short_history": 5,
+    "reason:breakout_volume": 14,
     "reason:base_compression": 2,
     "breakout_ok": 2,
+    "reason:no_history": 2,
     "reason:extended_sma": 1,
     "reason:price_changed": 1
   },
@@ -60,6 +60,16 @@
       "progress": 5
     },
     {
+      "ticker": "BJDX",
+      "name": "Bluejay Diagnostics Inc. Common Stock",
+      "history_sessions": 501,
+      "latest_price": 0.878600001335144,
+      "avg_volume_20": 8239173.8,
+      "avg_dollar_volume_20": 11212880.029477214,
+      "reason": "below_sma150",
+      "progress": 4
+    },
+    {
       "ticker": "AEMD",
       "name": "Aethlon Medical Inc. Common Stock",
       "history_sessions": 499,
@@ -76,16 +86,6 @@
       "latest_price": 0.3725999891757965,
       "avg_volume_20": 278291.75,
       "avg_dollar_volume_20": 117536.17011567205,
-      "reason": "below_sma150",
-      "progress": 4
-    },
-    {
-      "ticker": "SMTK",
-      "name": "SmartKem Inc. Common Stock",
-      "history_sessions": 499,
-      "latest_price": 0.2004999965429306,
-      "avg_volume_20": 541201.15,
-      "avg_dollar_volume_20": 121015.93281628264,
       "reason": "below_sma150",
       "progress": 4
     }
