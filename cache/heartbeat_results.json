@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-07-30T22:31:07.311864+00:00",
-  "universe_size": 313,
-  "scanned": 313,
+  "generated_at": "2026-07-31T22:18:26.044507+00:00",
+  "universe_size": 315,
+  "scanned": 315,
   "qualified": 0,
   "criteria": {
     "exchange": "NASDAQ",
@@ -15,19 +15,18 @@
     "maximum_gain_since_breakout": 0.5
   },
   "funnel": {
-    "universe": 313,
-    "scanned": 313,
-    "reason:no_sma150_cross": 177,
-    "history_ok": 306,
-    "liquidity_ok": 224,
+    "universe": 315,
+    "scanned": 315,
+    "reason:no_sma150_cross": 176,
+    "history_ok": 308,
+    "liquidity_ok": 226,
+    "reason:below_sma150": 34,
     "reason:liquidity": 81,
-    "reason:below_sma150": 30,
     "reason:short_history": 5,
     "reason:breakout_volume": 14,
     "reason:base_compression": 2,
     "breakout_ok": 2,
     "reason:no_history": 2,
-    "reason:extended_sma": 1,
     "reason:price_changed": 1
   },
   "near_misses": [
@@ -80,12 +79,12 @@
       "progress": 4
     },
     {
-      "ticker": "SMTK",
-      "name": "SmartKem Inc. Common Stock",
-      "history_sessions": 499,
-      "latest_price": 0.2004999965429306,
-      "avg_volume_20": 541201.15,
-      "avg_dollar_volume_20": 121015.93281628264,
+      "ticker": "MBRX",
+      "name": "Moleculin Biotech Inc. Common Stock",
+      "history_sessions": 501,
+      "latest_price": 0.4000000059604645,
+      "avg_volume_20": 1228353.3,
+      "avg_dollar_volume_20": 829977.325311926,
       "reason": "below_sma150",
       "progress": 4
     }
