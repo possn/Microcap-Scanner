@@ -1,0 +1,54 @@
+name: Sector Inflow Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "Data de início (YYYY-MM-DD)"
+        required: false
+        default: "2022-01-01"
+      horizon:
+        description: "Horizonte forward em dias úteis"
+        required: false
+        default: "10"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install yfinance pandas numpy
+
+      - name: Correr backtest
+        run: |
+          python backtest_sector_inflow.py \
+            --start "${{ github.event.inputs.start_date }}" \
+            --horizon "${{ github.event.inputs.horizon }}" \
+            > backtest_output.txt
+          cat backtest_output.txt
+
+      - name: Guardar resultado como artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: backtest_output.txt
+
+      - name: Enviar resumo para Telegram
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          # Telegram tem limite de ~4096 caracteres por mensagem; truncar se necessário
+          SUMMARY=$(head -c 3500 backtest_output.txt)
+          curl -s -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TG_CHAT_ID}" \
+            -d parse_mode="HTML" \
+            --data-urlencode text="<pre>${SUMMARY}</pre>"
