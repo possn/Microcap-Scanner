@@ -11,6 +11,18 @@ on:
         description: "Horizonte forward em dias úteis"
         required: false
         default: "10"
+      mode:
+        description: "Modo: 'backtest' (um único teste) ou 'grid' (varrer thresholds)"
+        required: false
+        default: "backtest"
+      vol_multiplier:
+        description: "Threshold de volume (só usado no modo backtest)"
+        required: false
+        default: "2.0"
+      up_share_threshold:
+        description: "Threshold de up-day share (só usado no modo backtest)"
+        required: false
+        default: "0.6"
 
 jobs:
   backtest:
@@ -27,12 +39,22 @@ jobs:
       - name: Instalar dependências
         run: pip install yfinance pandas numpy
 
-      - name: Correr backtest
+      - name: Correr backtest ou grid-scan
         run: |
-          python backtest_sector_inflow.py \
-            --start "${{ github.event.inputs.start_date }}" \
-            --horizon "${{ github.event.inputs.horizon }}" \
-            > backtest_output.txt
+          if [ "${{ github.event.inputs.mode }}" = "grid" ]; then
+            python backtest_sector_inflow.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --horizon "${{ github.event.inputs.horizon }}" \
+              --grid \
+              > backtest_output.txt
+          else
+            python backtest_sector_inflow.py \
+              --start "${{ github.event.inputs.start_date }}" \
+              --horizon "${{ github.event.inputs.horizon }}" \
+              --vol_multiplier "${{ github.event.inputs.vol_multiplier }}" \
+              --up_share_threshold "${{ github.event.inputs.up_share_threshold }}" \
+              > backtest_output.txt
+          fi
           cat backtest_output.txt
 
       - name: Guardar resultado como artifact
