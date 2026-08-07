@@ -1,7 +1,7 @@
 {
-  "generated_at": "2026-08-07T01:03:39.734439+00:00",
-  "universe_size": 290,
-  "scanned": 290,
+  "generated_at": "2026-08-07T21:59:31.460262+00:00",
+  "universe_size": 289,
+  "scanned": 289,
   "qualified": 0,
   "criteria": {
     "exchange": "NASDAQ",
@@ -15,20 +15,19 @@
     "maximum_gain_since_breakout": 0.5
   },
   "funnel": {
-    "universe": 290,
-    "scanned": 290,
+    "universe": 289,
+    "scanned": 289,
     "reason:no_sma150_cross": 168,
-    "history_ok": 282,
-    "liquidity_ok": 207,
-    "reason:liquidity": 74,
+    "history_ok": 281,
+    "liquidity_ok": 206,
+    "reason:liquidity": 75,
     "reason:below_sma150": 24,
-    "reason:breakout_volume": 12,
+    "reason:breakout_volume": 11,
     "reason:short_history": 5,
     "reason:base_compression": 2,
     "breakout_ok": 2,
     "reason:no_history": 3,
-    "reason:extended_sma": 1,
-    "reason:price_changed": 1
+    "reason:extended_sma": 1
   },
   "near_misses": [
     {
