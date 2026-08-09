@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-07T21:59:31.460262+00:00",
+  "generated_at": "2026-08-09T07:31:59.067744+00:00",
   "universe_size": 289,
   "scanned": 289,
   "qualified": 0,
@@ -26,6 +26,7 @@
     "reason:short_history": 5,
     "reason:base_compression": 2,
     "breakout_ok": 2,
+    "sma50_curl_ok": 2,
     "reason:no_history": 3,
     "reason:extended_sma": 1
   },
@@ -41,8 +42,10 @@
       "breakout_volume_multiple": 4.971380681514239,
       "distance_sma150_pct": 17.570720867791145,
       "gain_since_breakout_pct": 11.393437352881563,
+      "sma50_slope_pct": 3.6975804766068654,
+      "sma50_prior_slope_pct": 0.6325152396072564,
       "reason": "base_compression",
-      "progress": 5
+      "progress": 6
     },
     {
       "ticker": "MYPS",
@@ -55,8 +58,10 @@
       "breakout_volume_multiple": 3.885150920474722,
       "distance_sma150_pct": 14.491181708872336,
       "gain_since_breakout_pct": 2.049178325562906,
+      "sma50_slope_pct": 11.993275825803607,
+      "sma50_prior_slope_pct": 6.630130085332109,
       "reason": "base_compression",
-      "progress": 5
+      "progress": 6
     },
     {
       "ticker": "SMTK",
