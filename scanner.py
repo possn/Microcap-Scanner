@@ -78,7 +78,7 @@ class Config:
         default_factory=lambda: int(os.getenv("BREAKOUT_MAX_AGE", "40"))
     )
     breakout_volume_mult: float = field(
-        default_factory=lambda: float(os.getenv("BREAKOUT_VOLUME_MULT", "3.0"))
+        default_factory=lambda: float(os.getenv("BREAKOUT_VOLUME_MULT", "2.0"))
     )
     max_gain_since_breakout: float = field(
         default_factory=lambda: float(os.getenv("MAX_GAIN_SINCE_BREAKOUT", "0.50"))
@@ -132,7 +132,7 @@ class Config:
         default_factory=lambda: int(os.getenv("MAX_CANDIDATES", "0"))
     )
     breakout_volume_window: int = field(
-        default_factory=lambda: int(os.getenv("BREAKOUT_VOLUME_WINDOW", "3"))
+        default_factory=lambda: int(os.getenv("BREAKOUT_VOLUME_WINDOW", "5"))
     )
     near_miss_limit: int = field(
         default_factory=lambda: int(os.getenv("NEAR_MISS_LIMIT", "5"))

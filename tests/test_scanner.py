@@ -45,7 +45,9 @@ def test_accepts_volume_confirmation_within_three_sessions():
 
 
 def test_rejects_when_volume_confirmation_is_outside_window():
-    result, reason = find_sma150_breakout(make_frame(5), Config())
+    # Window widened to ±5 sessions (v1.4.1 volume relax) — offset 8 is
+    # genuinely outside it, unlike the old ±3 window this test targeted.
+    result, reason = find_sma150_breakout(make_frame(8), Config())
     assert result is None
     assert reason == "breakout_volume"
 

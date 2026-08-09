@@ -10,9 +10,13 @@ Scanner diário de ações NASDAQ abaixo de 1 USD.
 
 ## Motor técnico
 
-Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150 com volume ≥3x, SMA50 diária a curvar para cima (inclinação positiva e a acelerar — não apenas "a subir"), preço não esticado, liquidez e market cap.
+Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150 com volume ≥2x, SMA50 diária a curvar para cima (inclinação positiva sustentada; aceleração/inflexão exata é opcional, ver `REQUIRE_SMA50_CURL_ACCELERATING`), preço não esticado, liquidez e market cap.
 
 Acrescenta: força relativa a 20/60 sessões (benchmark IWM, não QQQ — o universo é micro cap); regime de mercado via QQQ+IWM; CLV do impulso; secagem de volume pré-breakout; resistência real da base e estado BREAKOUT/RETEST; persistência acima da SMA150; contagem de falsos breakouts; relação potencial/risco mínima; score multifatorial 0–100.
+
+## Novo em 1.4.2
+
+- **Volume de confirmação relaxado**: `BREAKOUT_VOLUME_MULT` 3.0x → 2.0x; `BREAKOUT_VOLUME_WINDOW` ±3 → ±5 sessões à volta do cruzamento da SMA150. O funil estava perto de vazio quase todos os dias — a interseção de breakout confirmado + base + SMA50 a curvar era demasiado rara com o limiar antigo.
 
 ## Novo em 1.4.0
 
