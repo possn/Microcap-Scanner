@@ -16,7 +16,8 @@ Acrescenta: força relativa a 20/60 sessões (benchmark IWM, não QQQ — o univ
 
 ## Novo em 1.4.0
 
-- **Critério adicional obrigatório — SMA50 a curvar para cima.** A par da recuperação da SMA150, a SMA50 diária tem agora de mostrar inclinação positiva nas últimas `SMA50_CURL_LOOKBACK` sessões (padrão 10) **e** essa inclinação superior à do segmento anterior — ou seja, uma verdadeira inflexão, não apenas uma tendência de alta já madura em que a SMA50 sobe a ritmo constante. Ambos os critérios (SMA150 e SMA50) têm de se verificar; nenhum substitui o outro. Configurável via `SMA50_CURL_LOOKBACK`, `MIN_SMA50_SLOPE_PCT` e `REQUIRE_SMA50_CURL_ACCELERATING` (env vars).
+- **Critério adicional obrigatório — SMA50 a curvar para cima.** A par da recuperação da SMA150, a SMA50 diária tem agora de mostrar inclinação positiva nas últimas `SMA50_CURL_LOOKBACK` sessões (padrão 10). Ambos os critérios (SMA150 e SMA50) têm de se verificar; nenhum substitui o outro. Configurável via `SMA50_CURL_LOOKBACK`, `MIN_SMA50_SLOPE_PCT` e `REQUIRE_SMA50_CURL_ACCELERATING` (env vars).
+  - *Correção 1.4.1*: por omissão já não exige aceleração (inflexão exata) — só inclinação positiva sustentada. Exigir a par o breakout confirmado da SMA150 **e** o instante exato da inflexão da SMA50 no mesmo dia esvaziava o funil quase sempre: são dois eventos raros que raramente coincidem no calendário. Quem quiser a versão mais estrita (inflexão exata) liga `REQUIRE_SMA50_CURL_ACCELERATING=1`.
 - Novo campo `sma50_slope_pct` no resultado, no CSV/JSON, na mensagem do Telegram e nas "quase aprovadas".
 - `backtest.py` replica o gate exatamente na mesma ordem (SMA150 → SMA50 → base) para a calibração não divergir da produção.
 - Rejeitadas por `sma50_not_curling_up` entram no grupo de controlo do diário de sinais, para medir se este critério acrescenta algo de facto.

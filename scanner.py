@@ -86,14 +86,17 @@ class Config:
     max_distance_sma150: float = field(
         default_factory=lambda: float(os.getenv("MAX_DISTANCE_SMA150", "0.35"))
     )
-    # SMA50 "a curvar para cima": inclinação positiva no curto prazo (lookback_a)
-    # E essa inclinação superior à do segmento anterior (lookback_b) — não basta
-    # estar a subir, tem de estar a acelerar/inflectir, senão "curvar" não
-    # distingue nada de uma SMA150 já em tendência.
+    # SMA50 "a curvar para cima": inclinação positiva no curto prazo (lookback_a).
+    # Por omissão NÃO exige aceleração (ver require_sma50_curl_accelerating) —
+    # exigir a par o breakout confirmado da SMA150 E o instante exato da
+    # inflexão da SMA50 no mesmo dia esvaziava o funil quase sempre: são dois
+    # eventos raros que raramente coincidem no calendário. "Curvar para cima"
+    # passa a significar inclinação positiva sustentada na janela, não o
+    # ponto de inflexão isolado.
     sma50_curl_lookback: int = field(default_factory=lambda: int(os.getenv("SMA50_CURL_LOOKBACK", "10")))
     min_sma50_slope_pct: float = field(default_factory=lambda: float(os.getenv("MIN_SMA50_SLOPE_PCT", "0.0")))
     require_sma50_curl_accelerating: bool = field(
-        default_factory=lambda: os.getenv("REQUIRE_SMA50_CURL_ACCELERATING", "1") == "1"
+        default_factory=lambda: os.getenv("REQUIRE_SMA50_CURL_ACCELERATING", "0") == "1"
     )
     max_atr_contraction_ratio: float = field(
         default_factory=lambda: float(os.getenv("MAX_ATR_CONTRACTION_RATIO", "0.78"))

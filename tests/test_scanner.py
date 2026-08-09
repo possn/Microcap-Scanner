@@ -106,44 +106,34 @@ def test_calibration_refuses_to_report_on_small_samples(tmp_path):
     assert "amostra insuficiente" in text
 
 
-def test_sma50_curling_up_detects_inflection_not_established_uptrend():
+def test_sma50_curling_up_default_requires_positive_slope_only():
+    """Default mode (REQUIRE_SMA50_CURL_ACCELERATING=0): 'a curvar para cima'
+    means sustained positive slope, not the exact inflection instant. Requiring
+    both the SMA150 volume-confirmed breakout AND the precise SMA50 inflection
+    on the same session emptied the funnel almost every day — two rare events
+    that rarely land on the same date."""
+    import dataclasses
     import numpy as np, pandas as pd
     from scanner import Config, sma50_curling_up
 
     cfg = Config()
+    assert cfg.require_sma50_curl_accelerating is False  # locks the new default
     n = 260
     dates = pd.date_range("2024-01-02", periods=n, freq="B")
 
-    # Flat-then-up: the ramp starts recently enough that the SMA50 window still
-    # straddles flat+ramp today, producing genuine acceleration at the tail —
-    # not just "still rising" from an already-linear stretch.
-    flat_len, ramp_len = 235, n - 235
-    close_up = np.concatenate([
-        np.full(flat_len, 0.50),
-        np.linspace(0.50, 0.66, ramp_len),
-    ])
-    df_up = pd.DataFrame({"date": dates, "open": close_up, "high": close_up * 1.02,
-                           "low": close_up * 0.98, "close": close_up,
-                           "volume": np.full(n, 200_000.0)})
-    res_up = sma50_curling_up(df_up, cfg)
-    assert res_up is not None
-    assert res_up["curling_up"] is True
-    assert res_up["accelerating"] is True
-
-    # Established, steady uptrend: rising but NOT accelerating (linear price path
-    # -> ~constant SMA50 slope) — must be rejected by the default
-    # (require_sma50_curl_accelerating=True) since it is not an inflection, just
-    # a constant-slope trend already priced in.
+    # Established, steady uptrend: constant slope, no acceleration. Under the
+    # new default this must PASS — it is genuinely "curving up" (rising),
+    # even though it is not an inflection point.
     close_steady = np.linspace(0.30, 0.70, n)  # constant absolute slope throughout
     df_steady = pd.DataFrame({"date": dates, "open": close_steady, "high": close_steady * 1.01,
                                "low": close_steady * 0.99, "close": close_steady,
                                "volume": np.full(n, 200_000.0)})
     res_steady = sma50_curling_up(df_steady, cfg)
     assert res_steady is not None
-    assert res_steady["slope_pct"] > 0  # it IS rising
-    assert res_steady["curling_up"] is False  # but not curling: no acceleration
+    assert res_steady["slope_pct"] > 0
+    assert res_steady["curling_up"] is True
 
-    # Flat/declining: must be rejected outright.
+    # Flat/declining: must still be rejected regardless of mode.
     close_flat = np.full(n, 0.40) + np.random.default_rng(1).normal(0, 0.001, n)
     df_flat = pd.DataFrame({"date": dates, "open": close_flat, "high": close_flat * 1.01,
                              "low": close_flat * 0.99, "close": close_flat,
@@ -153,7 +143,30 @@ def test_sma50_curling_up_detects_inflection_not_established_uptrend():
     assert res_flat["curling_up"] is False
 
     # Insufficient history: must return None (fail-safe, never a silent pass).
-    assert sma50_curling_up(df_up.head(60), cfg) is None
+    assert sma50_curling_up(df_steady.head(60), cfg) is None
+
+    # Strict opt-in mode: same steady uptrend must now be REJECTED, since it
+    # is not accelerating — only the genuine inflection case (built below)
+    # should pass when this mode is explicitly requested.
+    strict_cfg = dataclasses.replace(cfg, require_sma50_curl_accelerating=True)
+    res_steady_strict = sma50_curling_up(df_steady, strict_cfg)
+    assert res_steady_strict["curling_up"] is False
+
+    flat_len, ramp_len = 235, n - 235
+    close_up = np.concatenate([
+        np.full(flat_len, 0.50),
+        np.linspace(0.50, 0.66, ramp_len),
+    ])
+    df_up = pd.DataFrame({"date": dates, "open": close_up, "high": close_up * 1.02,
+                           "low": close_up * 0.98, "close": close_up,
+                           "volume": np.full(n, 200_000.0)})
+    res_up_strict = sma50_curling_up(df_up, strict_cfg)
+    assert res_up_strict["curling_up"] is True
+    assert res_up_strict["accelerating"] is True
+    # And under the default (non-strict) mode, the same inflection data also
+    # passes, since positive-and-accelerating implies positive.
+    res_up_default = sma50_curling_up(df_up, cfg)
+    assert res_up_default["curling_up"] is True
 
 
 def test_sma50_gate_is_additional_not_a_replacement():
