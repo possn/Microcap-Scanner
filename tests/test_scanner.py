@@ -1,4 +1,5 @@
 import numpy as np
+import dataclasses
 import pandas as pd
 
 from scanner import Config, find_sma150_breakout, parse_money
@@ -234,3 +235,145 @@ def test_rs_benchmark_switches_to_mdy_above_mid_cap_threshold(monkeypatch):
     assert sc.choose_rs_benchmark(500_000_000) is iwm_marker      # below threshold
     assert sc.choose_rs_benchmark(sc.MID_CAP_RS_THRESHOLD) is mdy_marker   # at threshold
     assert sc.choose_rs_benchmark(8_000_000_000) is mdy_marker    # well above
+
+
+def test_classify_sector_matches_realistic_nasdaq_text():
+    """The specific-before-broad ordering in SECTOR_ETF_MAP matters: biotech
+    must not be swallowed by the broad 'health' bucket, and a specific
+    Nasdaq industry string ('Water Supply') must map correctly."""
+    from scanner import classify_sector
+    assert classify_sector("Technology", "Semiconductors") == ("Semicondutores", "SMH")
+    assert classify_sector("Health Care", "Biotechnology: Biological Products") == ("Biotecnologia", "XBI")
+    assert classify_sector("Health Care", "Medical/Dental Instruments") == ("Saúde", "XLV")
+    assert classify_sector("Public Utilities", "Water Supply") == ("Água", "PHO")
+    assert classify_sector("Public Utilities", "Electric Utilities: Central") == ("Utilities", "XLU")
+    assert classify_sector("Miscellaneous", "Services-Misc. Amusement & Recreation") is None
+    assert classify_sector(None, None) is None
+    assert classify_sector("", "") is None
+
+
+def test_sector_etf_gate_blocks_when_sector_not_curling(monkeypatch):
+    """The sector-ETF gate must run BEFORE the SMA150 breakout gate (ETFs
+    first, as requested) and reject candidates whose sector's ETF is not
+    curling up, even if the stock itself would otherwise qualify."""
+    import numpy as np, pandas as pd
+    import scanner as sc
+
+    cfg = sc.Config()
+    assert cfg.require_sector_etf_curl is True  # locks the default: hard gate, on
+
+    n = 230
+    dates = pd.date_range("2025-01-01", periods=n, freq="B")
+    close = np.full(n, 0.50)
+    close[:190] = 0.55
+    close[190:209] = 0.48
+    close[209:] = 0.58
+    volume = np.full(n, 200_000.0)
+    volume[209] = 500_000.0
+    df = pd.DataFrame({"date": dates, "open": close, "high": close * 1.02,
+                        "low": close * 0.98, "close": close, "volume": volume})
+
+    monkeypatch.setattr(sc, "load_ohlcv", lambda ticker, cfg: df)
+
+    class Fake:
+        ticker = "TEST"
+        name = "Test Semiconductor Corp"
+        market_cap = 20_000_000
+        sector = "Technology"
+        industry = "Semiconductors"
+
+    # Sector ETF not curling -> hard reject, regardless of the stock's own setup.
+    monkeypatch.setattr(sc, "SECTOR_STATUS", {"Semicondutores": {"etf": "SMH", "curling_up": False, "slope_pct": -1.2, "data_ok": True}})
+    result, reason, diagnostics = sc.analyse_candidate(Fake(), cfg)
+    assert result is None
+    assert reason == "sector_etf_not_curling"
+    assert diagnostics["sector_label"] == "Semicondutores"
+    assert diagnostics["sector_etf"] == "SMH"
+
+    # Unmapped sector -> also a hard reject (no ETF to verify against).
+    class FakeUnmapped(Fake):
+        sector = "Miscellaneous"
+        industry = "Services-Misc."
+    result2, reason2, _ = sc.analyse_candidate(FakeUnmapped(), cfg)
+    assert result2 is None
+    assert reason2 == "sector_unmapped"
+
+    # Gate disabled -> sector status must not block the candidate (though the
+    # stock will likely still fail later gates on this thin synthetic data;
+    # what matters here is that it does NOT fail specifically on the sector
+    # reasons once the gate is off).
+    cfg_off = dataclasses.replace(cfg, require_sector_etf_curl=False)
+    _, reason3, _ = sc.analyse_candidate(Fake(), cfg_off)
+    assert reason3 not in {"sector_unmapped", "sector_etf_not_curling", "sector_etf_no_data"}
+
+
+def test_sector_gate_runs_before_breakout_gate_in_source():
+    """Locks the ordering the user asked for: ETFs first, then stocks."""
+    import inspect
+    import scanner
+
+    src = inspect.getsource(scanner.analyse_candidate)
+    liquidity_pos = src.index('"liquidity"')
+    sector_pos = src.index("classify_sector")
+    breakout_pos = src.index("find_sma150_breakout")
+    assert liquidity_pos < sector_pos < breakout_pos, (
+        "esperado: liquidez -> gate de setor -> breakout SMA150"
+    )
+
+
+def test_backtest_sector_gate_is_point_in_time(monkeypatch, tmp_path):
+    """Isolates the backtest.py sector-ETF gate from the rest of the technical
+    pipeline (which needs realistic base-compression data that is fiddly to
+    synthesize). Monkeypatches evaluate_point to always 'hit', then checks
+    that run() only records signals once the sector's ETF — recomputed fresh
+    from data truncated to each cutoff date, not today's live status — was
+    actually curling up, and records none before that."""
+    import numpy as np, pandas as pd, json
+    import backtest as bt
+    import scanner as sc
+
+    cfg = sc.Config()
+    ohlcv_dir = tmp_path / "ohlcv"
+    ohlcv_dir.mkdir()
+    object.__setattr__(cfg, "ohlcv_dir", ohlcv_dir)
+    object.__setattr__(cfg, "sector_map_json", tmp_path / "sectors.json")
+
+    n = 400
+    dates = pd.date_range("2023-01-02", periods=n, freq="B")
+    for sym in ("QQQ", "IWM", "MDY"):
+        c = np.full(n, 10.0)
+        pd.DataFrame({"date": dates, "open": c, "high": c, "low": c, "close": c,
+                      "volume": np.full(n, 1_000_000.0)}).to_csv(ohlcv_dir / f"{sym}.csv", index=False)
+
+    # SMH: flat until index 300, then curls up (same shape already proven
+    # correct in the standalone sma50_curling_up tests above).
+    flat_len = 300
+    smh_close = np.concatenate([np.full(flat_len, 10.0), np.linspace(10.0, 13.0, n - flat_len)])
+    pd.DataFrame({"date": dates, "open": smh_close, "high": smh_close, "low": smh_close,
+                  "close": smh_close, "volume": np.full(n, 1_000_000.0)}).to_csv(ohlcv_dir / "SMH.csv", index=False)
+    for _, etf, _ in sc.SECTOR_ETF_MAP:
+        if etf != "SMH":
+            flat = np.full(n, 10.0)
+            pd.DataFrame({"date": dates, "open": flat, "high": flat, "low": flat,
+                          "close": flat, "volume": np.full(n, 1_000_000.0)}).to_csv(ohlcv_dir / f"{etf}.csv", index=False)
+
+    stock_close = np.full(n, 5.0) + np.cumsum(np.random.default_rng(1).normal(0, 0.01, n))
+    pd.DataFrame({"date": dates, "open": stock_close, "high": stock_close, "low": stock_close,
+                  "close": stock_close, "volume": np.full(n, 500_000.0)}).to_csv(ohlcv_dir / "CHIPCO.csv", index=False)
+
+    cfg.sector_map_json.write_text(json.dumps({"CHIPCO": {"sector": "Technology", "industry": "Semiconductors"}}), encoding="utf-8")
+    monkeypatch.setattr(bt, "evaluate_point", lambda window, cfg: {"score": 90.0, "state": "BREAKOUT", "rr": 3.0})
+
+    # Truncated to end BEFORE the sector ETF ever curls: the gate must block
+    # every single point, even though evaluate_point is patched to always hit.
+    truncated = pd.DataFrame({"date": dates[:290], "open": stock_close[:290], "high": stock_close[:290],
+                               "low": stock_close[:290], "close": stock_close[:290], "volume": np.full(290, 500_000.0)})
+    truncated.to_csv(ohlcv_dir / "CHIPCO.csv", index=False)
+    report_before = bt.run(cfg, step=5, min_score=0.0, max_per_ticker=50, min_i=200)
+    assert report_before["n_signals"] == 0, "o gate deixou passar sinais ANTES do ETF de setor começar a curvar"
+
+    # Full series, including the period where SMH curls: signals must appear.
+    pd.DataFrame({"date": dates, "open": stock_close, "high": stock_close, "low": stock_close,
+                  "close": stock_close, "volume": np.full(n, 500_000.0)}).to_csv(ohlcv_dir / "CHIPCO.csv", index=False)
+    report_after = bt.run(cfg, step=5, min_score=0.0, max_per_ticker=50, min_i=200)
+    assert report_after["n_signals"] > 0, "o gate nunca deixou passar nenhum ponto mesmo depois do ETF curvar"

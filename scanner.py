@@ -99,6 +99,12 @@ class Config:
     require_sma50_curl_accelerating: bool = field(
         default_factory=lambda: os.getenv("REQUIRE_SMA50_CURL_ACCELERATING", "0") == "1"
     )
+    # Pré-filtro de setor: só procura ações em setores cujo ETF representativo
+    # tem a SMA50 diária a curvar para cima. Padrão ligado — é o pedido
+    # original ("primeiro corre os ETFs... é aí que vamos à procura").
+    require_sector_etf_curl: bool = field(
+        default_factory=lambda: os.getenv("REQUIRE_SECTOR_ETF_CURL", "1") == "1"
+    )
     max_atr_contraction_ratio: float = field(
         default_factory=lambda: float(os.getenv("MAX_ATR_CONTRACTION_RATIO", "0.78"))
     )
@@ -160,6 +166,7 @@ class Config:
     last_run_json: Path = Path("cache/last_run.json")
     signal_journal_json: Path = Path("cache/signal_journal.json")
     ohlcv_dir: Path = Path("cache/ohlcv")
+    sector_map_json: Path = Path("cache/universe_sectors.json")
 
 
 @dataclass
@@ -208,6 +215,9 @@ class TechnicalResult:
     lower_highs_slope: float
     sma150_slope_pct_20d: float
     sma50_slope_pct: float
+    sector_label: str
+    sector_etf: str
+    sector_etf_slope_pct: float
     close_location_value: float
     volume_dryup_ratio: float
     relative_strength_20d: float
@@ -682,6 +692,78 @@ def sma50_curling_up(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, Any]]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Filtro ETF de setor (pré-filtro): só se procura ações num setor cujo ETF
+# representativo tem a SMA50 diária a curvar para cima. Primeiro corre-se o
+# ETF, só depois as ações desse setor — na mesma definição de "curvar" já
+# usada para ações individuais (sma50_curling_up), para não introduzir uma
+# terceira noção divergente do mesmo conceito.
+# ---------------------------------------------------------------------------
+# (rótulo, ticker ETF, palavras-chave em minúsculas a procurar em "sector
+# industry"). Primeira correspondência ganha — por isso categorias mais
+# específicas (ex.: Semicondutores, Biotecnologia) vêm antes de categorias
+# largas (ex.: Software/Tecnologia, Saúde) que as engoliriam.
+SECTOR_ETF_MAP: list[tuple[str, str, tuple[str, ...]]] = [
+    ("Semicondutores", "SMH", ("semiconductor",)),
+    ("Biotecnologia", "XBI", ("biotechnology", "biotech", "pharmaceutical", "drug manufactur", "therapeutic")),
+    ("Petróleo e Gás", "XOP", ("oil", "petroleum", "drilling", "oil & gas", "oil and gas")),
+    ("Água", "PHO", ("water",)),
+    ("Utilities", "XLU", ("utilit",)),
+    ("Energia", "XLE", ("energy", "coal")),
+    ("Defesa e Aeroespacial", "ITA", ("defense", "aerospace", "military")),
+    ("Robótica e Automação", "BOTZ", ("robot", "automation")),
+    ("Data Centers e Cloud", "SKYY", ("data center", "cloud")),
+    ("Computação Quântica", "QTUM", ("quantum",)),
+    ("Software e Tecnologia", "IGV", ("software", "technology services", "internet", "computer services", "computer software")),
+    ("Saúde", "XLV", ("health", "medical", "hospital")),
+    ("Mineração e Metais", "XME", ("mining", "metal", "steel")),
+    ("Financeiro", "XLF", ("bank", "financial", "insurance")),
+    ("Imobiliário", "XLRE", ("real estate", "reit")),
+    ("Telecomunicações", "IYZ", ("telecommunication", "wireless", "broadband")),
+    ("Transportes", "XTN", ("transportation", "airline", "trucking", "shipping")),
+    ("Consumo Discricionário", "XLY", ("retail", "apparel", "restaurant", "consumer discretionary", "auto")),
+    ("Consumo Básico", "XLP", ("consumer non-durables", "food", "beverage", "household")),
+    ("Industrial", "XLI", ("industrial", "machinery", "manufactur")),
+]
+
+
+def classify_sector(sector: Optional[str], industry: Optional[str]) -> Optional[tuple[str, str]]:
+    """Devolve (rótulo, ticker ETF) para a primeira categoria cujas
+    palavras-chave aparecem em "sector industry" (minúsculas). None se não
+    houver correspondência — nesse caso não há ETF de referência para
+    verificar, logo não há como aplicar o filtro a essa candidata."""
+    text = f"{sector or ''} {industry or ''}".lower()
+    if not text.strip():
+        return None
+    for label, etf, keywords in SECTOR_ETF_MAP:
+        if any(kw in text for kw in keywords):
+            return label, etf
+    return None
+
+
+SECTOR_STATUS: dict[str, dict[str, Any]] = {}
+
+
+def compute_sector_status(cfg: Config) -> dict[str, dict[str, Any]]:
+    """Corre sma50_curling_up sobre cada ETF de setor uma vez por execução.
+    Chamado a partir de main() antes de varrer candidatas — os ETFs correm
+    PRIMEIRO, exatamente como pedido."""
+    status: dict[str, dict[str, Any]] = {}
+    seen_etfs: dict[str, Optional[dict[str, Any]]] = {}
+    for label, etf, _ in SECTOR_ETF_MAP:
+        if etf not in seen_etfs:
+            df = load_ohlcv(etf, cfg)
+            seen_etfs[etf] = None if df is None else sma50_curling_up(df, cfg)
+        curl = seen_etfs[etf]
+        status[label] = {
+            "etf": etf,
+            "curling_up": bool(curl["curling_up"]) if curl else False,
+            "slope_pct": 100 * curl["slope_pct"] if curl else None,
+            "data_ok": curl is not None,
+        }
+    return status
+
+
 def close_location(row: pd.Series) -> float:
     span = float(row["high"] - row["low"])
     return 0.5 if span <= 0 else float((row["close"] - row["low"]) / span)
@@ -848,6 +930,20 @@ def analyse_candidate(company: UniverseRow, cfg: Config) -> tuple[Optional[Techn
     avg_volume_20=float(df["volume"].tail(20).mean()); avg_dollar_volume_20=float((df["close"]*df["volume"]).tail(20).mean())
     diagnostics.update(avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20)
     if avg_volume_20<cfg.min_avg_volume_20 or avg_dollar_volume_20<cfg.min_avg_dollar_volume_20: return None,"liquidity",diagnostics
+    sector_info = classify_sector(company.sector, company.industry)
+    if sector_info is not None:
+        diagnostics["sector_label"], diagnostics["sector_etf"] = sector_info
+    if cfg.require_sector_etf_curl:
+        if sector_info is None:
+            return None, "sector_unmapped", diagnostics
+        label, etf = sector_info
+        sector_status = SECTOR_STATUS.get(label)
+        if sector_status is not None:
+            diagnostics["sector_etf_slope_pct"] = sector_status.get("slope_pct")
+        if sector_status is None or not sector_status.get("data_ok"):
+            return None, "sector_etf_no_data", diagnostics
+        if not sector_status.get("curling_up"):
+            return None, "sector_etf_not_curling", diagnostics
     breakout,reason=find_sma150_breakout(df,cfg)
     if breakout is None: return None,reason,diagnostics
     diagnostics.update(breakout_age=breakout["age"],breakout_volume_multiple=breakout["volume_multiple"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"])
@@ -870,7 +966,7 @@ def analyse_candidate(company: UniverseRow, cfg: Config) -> tuple[Optional[Techn
     resistance=max(base["resistance"],breakout["price"]); support=min(base["support"],breakout["sma150"]); ideal_low=max(breakout["sma150"],resistance*0.97); ideal_high=resistance*1.04; invalidation=min(support*0.97,breakout["sma150"]*0.96)
     band="Alta" if total_score>=82 and MARKET_REGIME.get("label")!="adverso" else "Moderada-alta" if total_score>=74 else "Moderada"
     confirmation=f"Fecho acima de ${resistance:.3f} com CLV ≥0,60, volume ≥2x, SMA50 a curvar para cima e manutenção acima da SMA150."
-    return TechnicalResult(ticker=company.ticker,name=company.name,price=latest_price,market_cap=company.market_cap,float_shares=snapshot.float_shares,avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20,breakout_volume=breakout["volume"],breakout_volume_multiple=breakout["volume_multiple"],breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),breakout_age_sessions=breakout["age"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"],consolidation_sessions=base["sessions"],consolidation_months=round(base["sessions"]/21,1),pattern=base["pattern"],support=support,resistance=resistance,ideal_entry_low=ideal_low,ideal_entry_high=ideal_high,invalidation=invalidation,confirmation=confirmation,atr_contraction_ratio=base["atr_ratio"],weekly_range_ratio=base["weekly_ratio"],higher_lows_slope=base["low_slope"],lower_highs_slope=base["high_slope"],sma150_slope_pct_20d=100*breakout["slope20"],sma50_slope_pct=100*curl["slope_pct"],close_location_value=extra["clv"],volume_dryup_ratio=extra["dry"],relative_strength_20d=100*extra["rs20"],relative_strength_60d=100*extra["rs60"],resistance_break_pct=100*extra["rbreak"],reward_risk=extra["rr"],failed_breakouts=extra["fails"],persistence_score=extra["persist"],market_regime=MARKET_REGIME.get("label","indeterminado"),setup_state=extra["state"],probability_band=band,market=snapshot,catalysts=infer_catalysts(company),technical_score=tech_score,total_score=total_score),"qualified",diagnostics
+    return TechnicalResult(ticker=company.ticker,name=company.name,price=latest_price,market_cap=company.market_cap,float_shares=snapshot.float_shares,avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20,breakout_volume=breakout["volume"],breakout_volume_multiple=breakout["volume_multiple"],breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),breakout_age_sessions=breakout["age"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"],consolidation_sessions=base["sessions"],consolidation_months=round(base["sessions"]/21,1),pattern=base["pattern"],support=support,resistance=resistance,ideal_entry_low=ideal_low,ideal_entry_high=ideal_high,invalidation=invalidation,confirmation=confirmation,atr_contraction_ratio=base["atr_ratio"],weekly_range_ratio=base["weekly_ratio"],higher_lows_slope=base["low_slope"],lower_highs_slope=base["high_slope"],sma150_slope_pct_20d=100*breakout["slope20"],sma50_slope_pct=100*curl["slope_pct"],sector_label=diagnostics.get("sector_label") or "Não classificado",sector_etf=diagnostics.get("sector_etf") or "n/d",sector_etf_slope_pct=diagnostics.get("sector_etf_slope_pct") if diagnostics.get("sector_etf_slope_pct") is not None else 0.0,close_location_value=extra["clv"],volume_dryup_ratio=extra["dry"],relative_strength_20d=100*extra["rs20"],relative_strength_60d=100*extra["rs60"],resistance_break_pct=100*extra["rbreak"],reward_risk=extra["rr"],failed_breakouts=extra["fails"],persistence_score=extra["persist"],market_regime=MARKET_REGIME.get("label","indeterminado"),setup_state=extra["state"],probability_band=band,market=snapshot,catalysts=infer_catalysts(company),technical_score=tech_score,total_score=total_score),"qualified",diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -892,6 +988,9 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
         "short_history": "histórico insuficiente",
         "price_changed": "preço fora do intervalo",
         "liquidity": "liquidez insuficiente",
+        "sector_unmapped": "setor não classificado (sem ETF de referência)",
+        "sector_etf_no_data": "sem dados do ETF de setor",
+        "sector_etf_not_curling": "ETF do setor sem SMA50 a curvar para cima",
         "breakout_window": "janela de breakout inválida",
         "no_sma150_cross": "sem cruzamento recente da SMA150",
         "breakout_volume": "volume <3x perto do breakout",
@@ -912,18 +1011,36 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
     header = [
         "🫀 HEARTBEAT STAGE 2",
         f"Execução: {stamp}",
+    ]
+
+    if cfg.require_sector_etf_curl and SECTOR_STATUS:
+        approved = sorted(
+            ((label, s) for label, s in SECTOR_STATUS.items() if s["curling_up"]),
+            key=lambda x: x[1]["slope_pct"] or 0, reverse=True,
+        )
+        rejected = [(label, s) for label, s in SECTOR_STATUS.items() if not s["curling_up"]]
+        header.extend(["", f"ETFs DE SETOR — {len(approved)}/{len(SECTOR_STATUS)} aprovados (SMA50 a curvar para cima)"])
+        for label, s in approved:
+            slope = f"{s['slope_pct']:+.2f}%" if s["slope_pct"] is not None else "n/d"
+            header.append(f"✅ {label} ({s['etf']}): {slope}")
+        if rejected:
+            names = ", ".join(f"{label} ({s['etf']})" for label, s in rejected)
+            header.append(f"❌ Sem sinal: {names}")
+
+    header.extend([
         "",
         "FUNIL DE AUDITORIA",
         f"Universo NASDAQ elegível: {funnel.get('universe', 0)}",
         f"Empresas efetivamente processadas: {funnel.get('scanned', 0)}",
         f"Histórico válido: {funnel.get('history_ok', 0)}",
         f"Liquidez aprovada: {funnel.get('liquidity_ok', 0)}",
+        f"Setor com ETF a curvar: {funnel.get('sector_ok', 0)}",
         f"Breakout SMA150 aprovado: {funnel.get('breakout_ok', 0)}",
         f"SMA50 a curvar para cima: {funnel.get('sma50_curl_ok', 0)}",
         f"Base/compressão aprovada: {funnel.get('base_ok', 0)}",
         f"Qualificadas: {len(results)}",
         f"Regime: {MARKET_REGIME.get('label','indeterminado')} ({MARKET_REGIME.get('detail','')})",
-    ]
+    ])
     exclusions = [(k, v) for k, v in funnel.items() if k.startswith("reason:") and k != "reason:qualified" and v]
     if exclusions:
         exclusions.sort(key=lambda item: item[1], reverse=True)
@@ -936,20 +1053,37 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
     if not results:
         header.extend(["", "Nenhuma empresa cumpriu TODOS os critérios obrigatórios."])
     else:
-        header.extend(["", f"RESULTADOS — {len(results)} setup(s)"])
-        for rank, result in enumerate(results, 1):
-            header.append(
-                f"\n#{rank} {result.ticker} — {result.name}\n"
-                f"Score: {result.total_score:.1f}/100 | Probabilidade: {result.probability_band} | Estado: {result.setup_state}\n"
-                f"Preço: ${result.price:.3f} | Cap: ${human_number(result.market_cap)} | Float: {human_number(result.float_shares)}\n"
-                f"Vol. médio 20d: {human_number(result.avg_volume_20)} | Confirmação de volume: {human_number(result.breakout_volume)} ({result.breakout_volume_multiple:.1f}x)\n"
-                f"SMA150: breakout {result.breakout_date}, há {result.breakout_age_sessions} sessões | Distância {result.distance_sma150_pct:+.1f}%\n"
-                f"SMA50 (curvatura, {cfg.sma50_curl_lookback}d): {result.sma50_slope_pct:+.2f}%\n"
-                f"Base: {result.consolidation_months:.1f} meses | {result.pattern}\n"
-                f"RS20: {result.relative_strength_20d:+.1f}% | RS60: {result.relative_strength_60d:+.1f}% | CLV: {result.close_location_value:.2f} | RR: {result.reward_risk:.1f}x\n"
-                f"Suporte: ${result.support:.3f} | Resistência: ${result.resistance:.3f}\n"
-                f"Entrada: ${result.ideal_entry_low:.3f}–${result.ideal_entry_high:.3f} | Invalidação: ${result.invalidation:.3f}"
-            )
+        header.extend(["", f"RESULTADOS — {len(results)} setup(s), agrupados por setor"])
+        by_sector: dict[str, list[TechnicalResult]] = {}
+        for result in results:
+            by_sector.setdefault(result.sector_label, []).append(result)
+        # Setores ordenados pela força da curvatura do próprio ETF, não por
+        # ordem alfabética — o setor mais forte aparece primeiro.
+        sector_order = sorted(
+            by_sector.keys(),
+            key=lambda label: (SECTOR_STATUS.get(label) or {}).get("slope_pct") or 0,
+            reverse=True,
+        )
+        rank = 0
+        for label in sector_order:
+            group = by_sector[label]
+            status = SECTOR_STATUS.get(label)
+            etf_line = f"{group[0].sector_etf} {status['slope_pct']:+.2f}%" if status and status.get("slope_pct") is not None else group[0].sector_etf
+            header.append(f"\n▶ SETOR: {label} (ETF {etf_line})")
+            for result in group:
+                rank += 1
+                header.append(
+                    f"\n#{rank} {result.ticker} — {result.name}\n"
+                    f"Score: {result.total_score:.1f}/100 | Probabilidade: {result.probability_band} | Estado: {result.setup_state}\n"
+                    f"Preço: ${result.price:.3f} | Cap: ${human_number(result.market_cap)} | Float: {human_number(result.float_shares)}\n"
+                    f"Vol. médio 20d: {human_number(result.avg_volume_20)} | Confirmação de volume: {human_number(result.breakout_volume)} ({result.breakout_volume_multiple:.1f}x)\n"
+                    f"SMA150: breakout {result.breakout_date}, há {result.breakout_age_sessions} sessões | Distância {result.distance_sma150_pct:+.1f}%\n"
+                    f"SMA50 (curvatura, {cfg.sma50_curl_lookback}d): {result.sma50_slope_pct:+.2f}%\n"
+                    f"Base: {result.consolidation_months:.1f} meses | {result.pattern}\n"
+                    f"RS20: {result.relative_strength_20d:+.1f}% | RS60: {result.relative_strength_60d:+.1f}% | CLV: {result.close_location_value:.2f} | RR: {result.reward_risk:.1f}x\n"
+                    f"Suporte: ${result.support:.3f} | Resistência: ${result.resistance:.3f}\n"
+                    f"Entrada: ${result.ideal_entry_low:.3f}–${result.ideal_entry_high:.3f} | Invalidação: ${result.invalidation:.3f}"
+                )
 
     if near_misses:
         header.extend(["", "QUASE APROVADAS — para revisão, não são recomendações"])
@@ -1188,7 +1322,7 @@ def calibration_summary(cfg: Config, horizon: int = 20, min_n: int = 20) -> Opti
     return "\n".join(lines)
 
 def main() -> None:
-    global MARKET_REGIME
+    global MARKET_REGIME, SECTOR_STATUS
     cfg = Config()
     cfg.ohlcv_dir.mkdir(parents=True, exist_ok=True)
     for benchmark in ("QQQ", "IWM", "MDY"):
@@ -1198,9 +1332,19 @@ def main() -> None:
             log.warning("Benchmark %s indisponível: %s", benchmark, exc)
     MARKET_REGIME = compute_market_regime()
     log.info("Regime de mercado: %s", MARKET_REGIME)
+    if cfg.require_sector_etf_curl:
+        log.info("A correr ETFs de setor primeiro…")
+        SECTOR_STATUS = compute_sector_status(cfg)
+        approved = [f"{label} ({s['etf']} {s['slope_pct']:+.2f}%)" for label, s in SECTOR_STATUS.items() if s["curling_up"]]
+        log.info("Setores aprovados (%d/%d): %s", len(approved), len(SECTOR_STATUS), ", ".join(approved) or "nenhum")
     log.info("A construir universo NASDAQ $%.2f–$%.2f, cap ≤ $%.0f…", cfg.min_price, cfg.max_price, cfg.max_market_cap)
     universe = fetch_nasdaq_universe(cfg)
     log.info("Universo inicial: %d empresas", len(universe))
+    try:
+        sector_map = {row.ticker: {"sector": row.sector, "industry": row.industry} for row in universe}
+        cfg.sector_map_json.write_text(json.dumps(sector_map, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Não foi possível gravar cache/universe_sectors.json: %s", exc)
 
     funnel: dict[str, int] = {"universe": len(universe), "scanned": 0}
     results: list[TechnicalResult] = []
@@ -1216,11 +1360,17 @@ def main() -> None:
                 funnel["history_ok"] = funnel.get("history_ok", 0) + 1
             if reason not in {"no_history", "short_history", "price_changed", "liquidity", "error"}:
                 funnel["liquidity_ok"] = funnel.get("liquidity_ok", 0) + 1
+            post_sector = {"sma50_no_history", "sma50_not_curling_up", "base_compression", "float",
+                            "weak_close", "poor_reward_risk", "repeated_failures", "quality_score", "qualified",
+                            "breakout_window", "no_sma150_cross", "breakout_volume", "below_sma150",
+                            "extended_gain", "extended_sma", "falling_sma150"}
             post_breakout = {"sma50_no_history", "sma50_not_curling_up", "base_compression", "float",
                               "weak_close", "poor_reward_risk", "repeated_failures", "quality_score", "qualified"}
             post_sma50_curl = {"base_compression", "float", "weak_close", "poor_reward_risk",
                                 "repeated_failures", "quality_score", "qualified"}
             post_base = {"float", "weak_close", "poor_reward_risk", "repeated_failures", "quality_score", "qualified"}
+            if reason in post_sector:
+                funnel["sector_ok"] = funnel.get("sector_ok", 0) + 1
             if reason in post_breakout:
                 funnel["breakout_ok"] = funnel.get("breakout_ok", 0) + 1
             if reason in post_sma50_curl:

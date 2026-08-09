@@ -1,4 +1,4 @@
-# Heartbeat Stage 2 — Probability Engine v1.5.0
+# Heartbeat Stage 2 — Probability Engine v1.6.0
 
 Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável).
 
@@ -8,11 +8,26 @@ Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capital
 
 **Não** entrega "empresas com grande probabilidade de subir". Essa afirmação exige uma probabilidade medida, e uma probabilidade medida exige amostra fora de treino. Enquanto `cache/backtest_report.json` e `cache/signal_journal.json` não tiverem amostra suficiente, o score de 0–100 é um **ranking ordinal**, não uma probabilidade.
 
+## Pré-filtro: ETFs de setor primeiro
+
+Antes de analisar qualquer ação, o scanner corre um gate de setor: para ~20 setores (Semicondutores→SMH, Biotecnologia→XBI, Energia→XLE, Petróleo e Gás→XOP, Água→PHO, Saúde→XLV, Software/Tecnologia→IGV, Defesa→ITA, etc. — lista completa em `SECTOR_ETF_MAP` no `scanner.py`), verifica se a SMA50 diária do ETF representativo está a curvar para cima. **Só se procuram ações nos setores cujo ETF passa este teste.** Uma ação cujo setor/indústria não corresponde a nenhum ETF mapeado é rejeitada por defeito (`sector_unmapped`) — não há forma de verificar o filtro sem uma referência.
+
+Configurável via `REQUIRE_SECTOR_ETF_CURL` (padrão `1`, ligado — desligar remove o pré-filtro por completo). Os resultados no Telegram e no CSV/JSON vêm agrupados por setor, com o ETF e a sua inclinação no cabeçalho de cada grupo.
+
 ## Motor técnico
 
 Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150 com volume ≥2x, SMA50 diária a curvar para cima (inclinação positiva sustentada; aceleração/inflexão exata é opcional, ver `REQUIRE_SMA50_CURL_ACCELERATING`), preço não esticado, liquidez e market cap.
 
 Acrescenta: força relativa a 20/60 sessões (benchmark dependente do tamanho — IWM para small/micro cap, MDY/S&P MidCap 400 a partir de $2 mil milhões); regime de mercado via QQQ+IWM+MDY; CLV do impulso; secagem de volume pré-breakout; resistência real da base e estado BREAKOUT/RETEST; persistência acima da SMA150; contagem de falsos breakouts; relação potencial/risco mínima; score multifatorial 0–100.
+
+## Novo em 1.6.0
+
+- **Pré-filtro de ETF de setor** (o pedido desta versão): ETFs correm primeiro; só se procuram ações nos setores aprovados. Ver secção acima.
+- `classify_sector()` mapeia sector+industry (texto NASDAQ) → (rótulo, ETF) por palavra-chave, ordem específica→genérica para não deixar categorias largas engolirem as específicas (ex.: Biotecnologia antes de Saúde).
+- Novos campos no resultado: `sector_label`, `sector_etf`, `sector_etf_slope_pct`.
+- Telegram reestruturado: secção "ETFs DE SETOR" (aprovados/reprovados com inclinação) antes dos resultados; resultados agrupados por setor, ordenados pela força do próprio ETF.
+- `scanner.py` persiste `cache/universe_sectors.json` (ticker→setor/indústria) a cada execução, para o `backtest.py` poder replicar o gate ponto-no-tempo (recalcula a curvatura do ETF em cada data de corte, não usa o estado de hoje). Sem esse ficheiro (nenhuma execução do scanner ainda feita), o `backtest.py` desliga o gate e avisa — não falha silenciosamente.
+- 4 novos testes: cobertura de `classify_sector` contra texto realista, bloqueio do gate ao vivo, ordem no código-fonte (setor antes do breakout), e o gate ponto-no-tempo do backtest (zero sinais antes do ETF curvar, sinais depois).
 
 ## Novo em 1.5.0
 

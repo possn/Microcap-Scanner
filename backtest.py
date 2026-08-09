@@ -32,6 +32,13 @@ Known biases this script CANNOT remove (state them whenever quoting results)
 4. OVERLAPPING SAMPLES: consecutive signals on the same ticker are serially
    correlated, so the effective sample size is far below the nominal N. The
    per-ticker cap below mitigates but does not eliminate this.
+5. SECTOR MAP IS TODAY'S SNAPSHOT: the sector-ETF gate needs a ticker->sector
+   mapping, persisted by scanner.py at `cache/universe_sectors.json` from the
+   MOST RECENT live run. A ticker's sector rarely changes, so this is a mild
+   approximation, but it means the gate can only be replicated for tickers
+   that were part of a recent live scan. If the file is missing, the gate is
+   skipped entirely (documented, not silent) and the backtest reduces to the
+   pre-1.5.1 behaviour.
 
 Usage
 -----
@@ -51,6 +58,7 @@ import pandas as pd
 import scanner
 from scanner import (
     Config,
+    classify_sector,
     detect_base,
     enhanced_metrics,
     find_sma150_breakout,
@@ -107,12 +115,45 @@ def forward_returns(df: pd.DataFrame, i: int) -> dict[int, float]:
     return out
 
 
+def sector_curling_at(etf_full: Optional[pd.DataFrame], cutoff, cfg: Config) -> Optional[dict[str, Any]]:
+    """Estado da SMA50 do ETF de setor, recalculado apenas com dados até
+    `cutoff` — a mesma disciplina ponto-no-tempo usada para os benchmarks."""
+    if etf_full is None:
+        return None
+    sliced = etf_full[etf_full["date"] <= cutoff]
+    if len(sliced) < 50:
+        return None
+    return sma50_curling_up(sliced.reset_index(drop=True), cfg)
+
+
 def run(cfg: Config, step: int, min_score: float, max_per_ticker: int, min_i: int) -> dict[str, Any]:
     full_benchmarks = {}
     for symbol in ("QQQ", "IWM", "MDY"):
         path = cfg.ohlcv_dir / f"{symbol}.csv"
         if path.exists():
             full_benchmarks[symbol] = scanner._normalise_ohlcv(pd.read_csv(path))
+
+    sector_map: dict[str, dict[str, Any]] = {}
+    if cfg.sector_map_json.exists():
+        try:
+            sector_map = json.loads(cfg.sector_map_json.read_text(encoding="utf-8"))
+        except Exception:
+            sector_map = {}
+    elif cfg.require_sector_etf_curl:
+        print("AVISO: cache/universe_sectors.json não encontrado — gate de setor "
+              "desligado neste backtest (corre scanner.py pelo menos uma vez primeiro).")
+
+    full_sector_etfs: dict[str, pd.DataFrame] = {}
+    if cfg.require_sector_etf_curl and sector_map:
+        for _, etf, _ in scanner.SECTOR_ETF_MAP:
+            if etf in full_sector_etfs:
+                continue
+            path = cfg.ohlcv_dir / f"{etf}.csv"
+            if path.exists():
+                try:
+                    full_sector_etfs[etf] = scanner._normalise_ohlcv(pd.read_csv(path))
+                except Exception:
+                    pass
 
     files = sorted(p for p in cfg.ohlcv_dir.glob("*.csv") if p.stem not in {"QQQ", "IWM", "SPY"})
     samples: list[dict[str, Any]] = []
@@ -123,6 +164,11 @@ def run(cfg: Config, step: int, min_score: float, max_per_ticker: int, min_i: in
             continue
         if df is None or len(df) < cfg.min_history_sessions + max(HORIZONS):
             continue
+        ticker_sector = None
+        if cfg.require_sector_etf_curl and sector_map:
+            info = sector_map.get(path.stem)
+            if info:
+                ticker_sector = classify_sector(info.get("sector"), info.get("industry"))
         taken = 0
         last_signal = -10**9
         for i in range(max(min_i, cfg.min_history_sessions), len(df) - max(HORIZONS), step):
@@ -132,6 +178,16 @@ def run(cfg: Config, step: int, min_score: float, max_per_ticker: int, min_i: in
                 continue
             window = df.iloc[: i + 1].reset_index(drop=True)
             cutoff = window["date"].iloc[-1]
+            if cfg.require_sector_etf_curl and sector_map:
+                # Setor desconhecido/não classificado ou dados do ETF insuficientes
+                # nesta data => sem forma de verificar o gate => rejeita, tal como
+                # em produção (analyse_candidate faz o mesmo por omissão).
+                if ticker_sector is None:
+                    continue
+                _, etf = ticker_sector
+                curl_status = sector_curling_at(full_sector_etfs.get(etf), cutoff, cfg)
+                if curl_status is None or not curl_status["curling_up"]:
+                    continue
             scanner.BENCHMARKS = slice_benchmarks(full_benchmarks, cutoff)
             scanner.MARKET_REGIME = scanner.compute_market_regime()
             try:
