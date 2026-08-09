@@ -104,3 +104,69 @@ def test_calibration_refuses_to_report_on_small_samples(tmp_path):
     object.__setattr__(cfg, "signal_journal_json", path)
     text = sc.calibration_summary(cfg, horizon=20, min_n=20)
     assert "amostra insuficiente" in text
+
+
+def test_sma50_curling_up_detects_inflection_not_established_uptrend():
+    import numpy as np, pandas as pd
+    from scanner import Config, sma50_curling_up
+
+    cfg = Config()
+    n = 260
+    dates = pd.date_range("2024-01-02", periods=n, freq="B")
+
+    # Flat-then-up: the ramp starts recently enough that the SMA50 window still
+    # straddles flat+ramp today, producing genuine acceleration at the tail —
+    # not just "still rising" from an already-linear stretch.
+    flat_len, ramp_len = 235, n - 235
+    close_up = np.concatenate([
+        np.full(flat_len, 0.50),
+        np.linspace(0.50, 0.66, ramp_len),
+    ])
+    df_up = pd.DataFrame({"date": dates, "open": close_up, "high": close_up * 1.02,
+                           "low": close_up * 0.98, "close": close_up,
+                           "volume": np.full(n, 200_000.0)})
+    res_up = sma50_curling_up(df_up, cfg)
+    assert res_up is not None
+    assert res_up["curling_up"] is True
+    assert res_up["accelerating"] is True
+
+    # Established, steady uptrend: rising but NOT accelerating (linear price path
+    # -> ~constant SMA50 slope) — must be rejected by the default
+    # (require_sma50_curl_accelerating=True) since it is not an inflection, just
+    # a constant-slope trend already priced in.
+    close_steady = np.linspace(0.30, 0.70, n)  # constant absolute slope throughout
+    df_steady = pd.DataFrame({"date": dates, "open": close_steady, "high": close_steady * 1.01,
+                               "low": close_steady * 0.99, "close": close_steady,
+                               "volume": np.full(n, 200_000.0)})
+    res_steady = sma50_curling_up(df_steady, cfg)
+    assert res_steady is not None
+    assert res_steady["slope_pct"] > 0  # it IS rising
+    assert res_steady["curling_up"] is False  # but not curling: no acceleration
+
+    # Flat/declining: must be rejected outright.
+    close_flat = np.full(n, 0.40) + np.random.default_rng(1).normal(0, 0.001, n)
+    df_flat = pd.DataFrame({"date": dates, "open": close_flat, "high": close_flat * 1.01,
+                             "low": close_flat * 0.99, "close": close_flat,
+                             "volume": np.full(n, 200_000.0)})
+    res_flat = sma50_curling_up(df_flat, cfg)
+    assert res_flat is not None
+    assert res_flat["curling_up"] is False
+
+    # Insufficient history: must return None (fail-safe, never a silent pass).
+    assert sma50_curling_up(df_up.head(60), cfg) is None
+
+
+def test_sma50_gate_is_additional_not_a_replacement():
+    """The SMA50 curl check must not run instead of the SMA150 reclaim gate —
+    both are required. This locks the ordering asserted by the user: 'Adicional
+    (ambos têm de se verificar)'."""
+    import inspect
+    import scanner
+
+    src = inspect.getsource(scanner.analyse_candidate)
+    breakout_pos = src.index("find_sma150_breakout")
+    curl_pos = src.index("sma50_curling_up")
+    base_pos = src.index("detect_base(df")
+    assert breakout_pos < curl_pos < base_pos, (
+        "esperado: SMA150 -> SMA50 curl -> base, ambos os gates antes da deteção de base"
+    )

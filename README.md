@@ -1,4 +1,4 @@
-# Heartbeat Stage 2 — Probability Engine v1.3.0
+# Heartbeat Stage 2 — Probability Engine v1.4.0
 
 Scanner diário de ações NASDAQ abaixo de 1 USD.
 
@@ -10,9 +10,16 @@ Scanner diário de ações NASDAQ abaixo de 1 USD.
 
 ## Motor técnico
 
-Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150, volume ≥3x, preço não esticado, liquidez e market cap.
+Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150 com volume ≥3x, SMA50 diária a curvar para cima (inclinação positiva e a acelerar — não apenas "a subir"), preço não esticado, liquidez e market cap.
 
 Acrescenta: força relativa a 20/60 sessões (benchmark IWM, não QQQ — o universo é micro cap); regime de mercado via QQQ+IWM; CLV do impulso; secagem de volume pré-breakout; resistência real da base e estado BREAKOUT/RETEST; persistência acima da SMA150; contagem de falsos breakouts; relação potencial/risco mínima; score multifatorial 0–100.
+
+## Novo em 1.4.0
+
+- **Critério adicional obrigatório — SMA50 a curvar para cima.** A par da recuperação da SMA150, a SMA50 diária tem agora de mostrar inclinação positiva nas últimas `SMA50_CURL_LOOKBACK` sessões (padrão 10) **e** essa inclinação superior à do segmento anterior — ou seja, uma verdadeira inflexão, não apenas uma tendência de alta já madura em que a SMA50 sobe a ritmo constante. Ambos os critérios (SMA150 e SMA50) têm de se verificar; nenhum substitui o outro. Configurável via `SMA50_CURL_LOOKBACK`, `MIN_SMA50_SLOPE_PCT` e `REQUIRE_SMA50_CURL_ACCELERATING` (env vars).
+- Novo campo `sma50_slope_pct` no resultado, no CSV/JSON, na mensagem do Telegram e nas "quase aprovadas".
+- `backtest.py` replica o gate exatamente na mesma ordem (SMA150 → SMA50 → base) para a calibração não divergir da produção.
+- Rejeitadas por `sma50_not_curling_up` entram no grupo de controlo do diário de sinais, para medir se este critério acrescenta algo de facto.
 
 ## Novo em 1.3.0
 

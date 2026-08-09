@@ -48,6 +48,7 @@ from scanner import (
     detect_base,
     enhanced_metrics,
     find_sma150_breakout,
+    sma50_curling_up,
     technical_score,
     wilson_ci,
 )
@@ -69,6 +70,9 @@ def evaluate_point(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, Any]]:
     setup would not have been published on that date."""
     breakout, _ = find_sma150_breakout(df, cfg)
     if breakout is None:
+        return None
+    curl = sma50_curling_up(df, cfg)
+    if curl is None or not curl["curling_up"]:
         return None
     base = detect_base(df, breakout["idx"], cfg)
     if base is None:
