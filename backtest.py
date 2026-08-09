@@ -16,13 +16,19 @@ are then measured from `t` over 5/10/20/40/60 sessions.
 
 Known biases this script CANNOT remove (state them whenever quoting results)
 ---------------------------------------------------------------------------
-1. SURVIVORSHIP: the cache is built from the CURRENT Nasdaq sub-$1 list.
-   Companies that were delisted, acquired, or reverse-split out of the sub-$1
-   range are absent. This inflates every statistic, and below $1 the attrition
-   rate is high. Treat measured hit rates as an OPTIMISTIC upper bound.
-2. NO SLIPPAGE/SPREAD: sub-$1 microcaps routinely show 2-5% spreads. Real
-   entries are worse than the modelled close.
-3. NO BORROW/HALT MODELLING: trading halts are common in this segment.
+1. SURVIVORSHIP: the cache is built from the CURRENT Nasdaq universe eligible
+   under today's price/market-cap config. Companies that were delisted,
+   acquired, or moved outside that range are absent. This inflates every
+   statistic; the effect is largest at the nano/micro end (high attrition)
+   and smaller for established mid caps. Treat measured hit rates as an
+   OPTIMISTIC upper bound, more so toward the small end of the range.
+2. NO SLIPPAGE/SPREAD: real entries are worse than the modelled close.
+   This is a mixed-regime universe now — sub-$1 nano/micro names routinely
+   show 2-5% spreads, while liquid mid caps typically show a fraction of
+   that. A single aggregate statistic blends two very different liquidity
+   regimes; check `by_regime`/score buckets rather than the headline number.
+3. NO BORROW/HALT MODELLING: trading halts are common at the nano/micro end
+   of this universe, rarer for mid caps.
 4. OVERLAPPING SAMPLES: consecutive signals on the same ticker are serially
    correlated, so the effective sample size is far below the nominal N. The
    per-ticker cap below mitigates but does not eliminate this.
@@ -77,6 +83,10 @@ def evaluate_point(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, Any]]:
     base = detect_base(df, breakout["idx"], cfg)
     if base is None:
         return None
+    # market_cap não é armazenado na cache de OHLCV, por isso aqui a seleção
+    # de benchmark (choose_rs_benchmark) recai sempre em IWM. Para candidatas
+    # mid cap reais isto sub-estima a força relativa face ao MDY correto —
+    # o resultado do backtest é, nessa faixa, uma aproximação conservadora.
     extra = enhanced_metrics(base, breakout, df)
     if extra["clv"] < cfg.min_close_location:
         return None
@@ -99,7 +109,7 @@ def forward_returns(df: pd.DataFrame, i: int) -> dict[int, float]:
 
 def run(cfg: Config, step: int, min_score: float, max_per_ticker: int, min_i: int) -> dict[str, Any]:
     full_benchmarks = {}
-    for symbol in ("QQQ", "IWM"):
+    for symbol in ("QQQ", "IWM", "MDY"):
         path = cfg.ohlcv_dir / f"{symbol}.csv"
         if path.exists():
             full_benchmarks[symbol] = scanner._normalise_ohlcv(pd.read_csv(path))
@@ -182,8 +192,8 @@ def summarise(samples: list[dict[str, Any]]) -> dict[str, Any]:
             regimes[s.get("regime") or "n/d"].append(s["returns"][20])
     report["by_regime"] = {k: stats(v) for k, v in regimes.items() if len(v) >= 5}
     report["caveats"] = [
-        "Survivorship bias: universo construído a partir da lista atual — resultados são um limite SUPERIOR otimista.",
-        "Sem spread, slippage nem halts. Abaixo de $1 o spread real corrói vários pontos percentuais.",
+        "Survivorship bias: universo construído a partir da lista atual — resultados são um limite SUPERIOR otimista, mais acentuado no extremo nano/micro cap do que em mid cap.",
+        "Sem spread, slippage nem halts. Universo agora misto: sub-$1/nano cap tem spreads de vários pontos percentuais, mid cap líquida tem muito menos — ver score buckets/regime em vez do número agregado.",
         "Amostras sobrepostas por ticker: N efetivo << N nominal; os IC95 são otimistas.",
         "Monotonia entre buckets de score é o teste que importa. Se não for monótona, o score não discrimina.",
     ]

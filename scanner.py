@@ -1,10 +1,11 @@
 """Heartbeat Stage 2 Scanner.
 
-Strict NASDAQ sub-$1 scanner designed to detect prolonged volatility contraction
-bases shortly after a high-volume reclaim of the 150-day simple moving average,
-with the daily 50-day simple moving average confirmed to be curling upward
-(positive and accelerating slope — an inflection, not just an established
-uptrend) as an additional, independently required gate.
+Scanner NASDAQ (micro a mid cap, ~$0.08–$500, teto de capitalização
+configurável até $10 mil milhões) desenhado para detetar bases de compressão
+de volatilidade prolongada pouco depois de uma recuperação, com volume
+confirmado, da média móvel simples de 150 dias, com a média móvel simples
+diária de 50 dias confirmada a curvar para cima (inclinação positiva) como
+gate adicional e independente.
 
 Data sources (no paid API required):
 - Nasdaq public stock screener: exchange membership, last price, market cap, volume.
@@ -57,7 +58,7 @@ class Config:
     tg_token: str = field(default_factory=lambda: os.getenv("TG_BOT_TOKEN", ""))
     tg_chat_id: str = field(default_factory=lambda: os.getenv("TG_CHAT_ID", ""))
 
-    max_price: float = field(default_factory=lambda: float(os.getenv("MAX_PRICE", "1.0")))
+    max_price: float = field(default_factory=lambda: float(os.getenv("MAX_PRICE", "500.0")))
     min_price: float = field(default_factory=lambda: float(os.getenv("MIN_PRICE", "0.08")))
     min_history_sessions: int = field(
         default_factory=lambda: int(os.getenv("MIN_HISTORY_SESSIONS", "190"))
@@ -117,7 +118,7 @@ class Config:
         default_factory=lambda: float(os.getenv("MIN_AVG_DOLLAR_VOLUME_20", "75000"))
     )
     max_market_cap: float = field(
-        default_factory=lambda: float(os.getenv("MAX_MARKET_CAP", "150000000"))
+        default_factory=lambda: float(os.getenv("MAX_MARKET_CAP", "10000000000"))
     )
     preferred_float: float = field(
         default_factory=lambda: float(os.getenv("PREFERRED_FLOAT", "30000000"))
@@ -723,7 +724,7 @@ def persistence_after_breakout(df: pd.DataFrame, idx: int) -> float:
 def compute_market_regime() -> dict[str, Any]:
     scores=[]
     labels=[]
-    for ticker in ("QQQ", "IWM"):
+    for ticker in ("QQQ", "IWM", "MDY"):
         df=BENCHMARKS.get(ticker)
         if df is None or len(df)<210:
             continue
@@ -735,16 +736,30 @@ def compute_market_regime() -> dict[str, Any]:
     return {"label":label,"score":score,"detail":" ".join(labels)}
 
 
-def enhanced_metrics(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame) -> dict[str, Any]:
+MID_CAP_RS_THRESHOLD = 2_000_000_000  # abaixo: IWM (small/micro); a partir daqui: MDY (S&P MidCap 400)
+
+
+def choose_rs_benchmark(market_cap: Optional[float]) -> Optional[pd.DataFrame]:
+    """IWM (Russell 2000) mede small/micro caps; comparar uma empresa de
+    $8 mil milhões contra esse tape é a régua errada. Acima do limiar, usa
+    MDY (S&P MidCap 400) — a referência correta para essa faixa."""
+    if market_cap is not None and market_cap >= MID_CAP_RS_THRESHOLD:
+        mid = BENCHMARKS.get("MDY")
+        if mid is not None:
+            return mid
+    small = BENCHMARKS.get("IWM")
+    if small is not None:
+        return small
+    return BENCHMARKS.get("QQQ")
+
+
+def enhanced_metrics(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame, market_cap: Optional[float] = None) -> dict[str, Any]:
     vi=int(breakout.get("volume_idx", breakout["idx"]))
     volrow=df.iloc[vi]
     clv=close_location(volrow)
     pre=df.iloc[max(0, breakout["idx"]-20):breakout["idx"]]
     dry=float(pre["volume"].tail(10).mean()/max(pre["volume"].tail(50).mean(),1)) if len(pre)>=10 else 1.0
-    # IWM is the correct RS benchmark for micro caps; QQQ only as fallback.
-    rs_bench = BENCHMARKS.get("IWM")
-    if rs_bench is None:
-        rs_bench = BENCHMARKS.get("QQQ")
+    rs_bench = choose_rs_benchmark(market_cap)
     rs20=aligned_return(df, rs_bench, 20)
     rs60=aligned_return(df, rs_bench, 60)
     resistance=float(base["resistance"]); current=float(df["close"].iloc[-1])
@@ -760,8 +775,8 @@ def enhanced_metrics(base: dict[str, Any], breakout: dict[str, Any], df: pd.Data
     return {"clv":clv,"dry":dry,"rs20":rs20,"rs60":rs60,"rbreak":rbreak,"rr":rr,"fails":fails,"persist":persist,"state":state}
 
 
-def technical_score(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame, cfg: Config, extra: Optional[dict[str, Any]]=None) -> float:
-    extra=extra or enhanced_metrics(base, breakout, df)
+def technical_score(base: dict[str, Any], breakout: dict[str, Any], df: pd.DataFrame, cfg: Config, extra: Optional[dict[str, Any]]=None, market_cap: Optional[float]=None) -> float:
+    extra=extra or enhanced_metrics(base, breakout, df, market_cap)
     sessions = base["sessions"]
     score=0.0
     score += 12 + 6 * min(max((sessions-cfg.min_base_sessions)/126,0),1)
@@ -811,7 +826,14 @@ def market_adjustment(float_shares: Optional[float], market_cap: Optional[float]
         elif cfg.strict_float:
             score -= 20
     if market_cap is not None:
-        score += 4 if market_cap <= 50_000_000 else 2 if market_cap <= cfg.max_market_cap else -8
+        # O ponto de quebra é 1/3 do teto configurado, não um valor absoluto:
+        # com o teto antigo de $150M isso dava exatamente $50M (o valor
+        # histórico); com o teto agora em $10 mil milhões, um breakpoint fixo
+        # em $50M penalizaria sistematicamente TODAS as mid caps, tornando o
+        # alargamento inútil na prática (entravam no universo mas perdiam
+        # sempre no ranking).
+        small_tier = cfg.max_market_cap / 3
+        score += 4 if market_cap <= small_tier else 2 if market_cap <= cfg.max_market_cap else -8
     return score
 
 
@@ -835,7 +857,7 @@ def analyse_candidate(company: UniverseRow, cfg: Config) -> tuple[Optional[Techn
     if not curl["curling_up"]: return None,"sma50_not_curling_up",diagnostics
     base=detect_base(df,breakout["idx"],cfg)
     if base is None: return None,"base_compression",diagnostics
-    extra=enhanced_metrics(base,breakout,df)
+    extra=enhanced_metrics(base,breakout,df,company.market_cap)
     diagnostics.update(base_sessions=base["sessions"],atr_ratio=base["atr_ratio"],weekly_ratio=base["weekly_ratio"],close_location=extra["clv"],relative_strength_20d=extra["rs20"],reward_risk=extra["rr"],failed_breakouts=extra["fails"])
     # These are probability-quality gates, not arbitrary cosmetic filters.
     if extra["clv"] < cfg.min_close_location: return None,"weak_close",diagnostics
@@ -892,7 +914,7 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
         f"Execução: {stamp}",
         "",
         "FUNIL DE AUDITORIA",
-        f"Universo NASDAQ sub-$1 elegível: {funnel.get('universe', 0)}",
+        f"Universo NASDAQ elegível: {funnel.get('universe', 0)}",
         f"Empresas efetivamente processadas: {funnel.get('scanned', 0)}",
         f"Histórico válido: {funnel.get('history_ok', 0)}",
         f"Liquidez aprovada: {funnel.get('liquidity_ok', 0)}",
@@ -1169,14 +1191,14 @@ def main() -> None:
     global MARKET_REGIME
     cfg = Config()
     cfg.ohlcv_dir.mkdir(parents=True, exist_ok=True)
-    for benchmark in ("QQQ", "IWM"):
+    for benchmark in ("QQQ", "IWM", "MDY"):
         try:
             BENCHMARKS[benchmark] = load_ohlcv(benchmark, cfg)
         except Exception as exc:
             log.warning("Benchmark %s indisponível: %s", benchmark, exc)
     MARKET_REGIME = compute_market_regime()
     log.info("Regime de mercado: %s", MARKET_REGIME)
-    log.info("A construir universo NASDAQ sub-$%.2f…", cfg.max_price)
+    log.info("A construir universo NASDAQ $%.2f–$%.2f, cap ≤ $%.0f…", cfg.min_price, cfg.max_price, cfg.max_market_cap)
     universe = fetch_nasdaq_universe(cfg)
     log.info("Universo inicial: %d empresas", len(universe))
 

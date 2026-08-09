@@ -1,6 +1,6 @@
-# Heartbeat Stage 2 — Probability Engine v1.4.0
+# Heartbeat Stage 2 — Probability Engine v1.5.0
 
-Scanner diário de ações NASDAQ abaixo de 1 USD.
+Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável).
 
 ## O que este scanner é — e o que não é
 
@@ -12,7 +12,14 @@ Scanner diário de ações NASDAQ abaixo de 1 USD.
 
 Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150 com volume ≥2x, SMA50 diária a curvar para cima (inclinação positiva sustentada; aceleração/inflexão exata é opcional, ver `REQUIRE_SMA50_CURL_ACCELERATING`), preço não esticado, liquidez e market cap.
 
-Acrescenta: força relativa a 20/60 sessões (benchmark IWM, não QQQ — o universo é micro cap); regime de mercado via QQQ+IWM; CLV do impulso; secagem de volume pré-breakout; resistência real da base e estado BREAKOUT/RETEST; persistência acima da SMA150; contagem de falsos breakouts; relação potencial/risco mínima; score multifatorial 0–100.
+Acrescenta: força relativa a 20/60 sessões (benchmark dependente do tamanho — IWM para small/micro cap, MDY/S&P MidCap 400 a partir de $2 mil milhões); regime de mercado via QQQ+IWM+MDY; CLV do impulso; secagem de volume pré-breakout; resistência real da base e estado BREAKOUT/RETEST; persistência acima da SMA150; contagem de falsos breakouts; relação potencial/risco mínima; score multifatorial 0–100.
+
+## Novo em 1.5.0
+
+- **Universo alargado a mid caps**: `MAX_PRICE` $1.00 → $500; `MAX_MARKET_CAP` $150M → $10 mil milhões. Deixa de ser um scanner exclusivamente sub-$1.
+- **Benchmark de força relativa dependente do tamanho**: candidatas ≥$2 mil milhões passam a comparar-se contra o MDY (S&P MidCap 400) em vez do IWM (Russell 2000, small/micro cap) — usar o IWM para uma empresa de $8 mil milhões era a régua errada.
+- **Bónus de market cap no score corrigido**: estava fixo em $50M (calibrado para o teto antigo de $150M). Com o teto novo em $10 mil milhões isso penalizava sistematicamente qualquer mid cap que entrasse no universo — o alargamento seria inútil na prática, porque essas candidatas nunca ganhariam o ranking. Passa a ser proporcional ao teto configurado (1/3 do `MAX_MARKET_CAP`).
+- Texto do log e do Telegram deixou de assumir "sub-$1" fixo.
 
 ## Novo em 1.4.2
 
@@ -53,11 +60,11 @@ Secrets: `TG_BOT_TOKEN` e `TG_CHAT_ID`.
 
 ## Limitações que não desaparecem com código
 
-1. **Survivorship bias** — o universo é a lista NASDAQ sub-$1 de hoje. Empresas deslistadas, adquiridas ou reverse-split para fora do intervalo não existem no histórico. Qualquer estatística do backtest é um **limite superior otimista**.
-2. **Custos de transação** — spreads de 2–5% são normais neste segmento. Nenhum resultado modelado inclui spread, slippage ou halts.
+1. **Survivorship bias** — o universo é a lista NASDAQ elegível de hoje (preço e market cap). Empresas deslistadas, adquiridas ou que saíram do intervalo não existem no histórico. Qualquer estatística do backtest é um **limite superior otimista**.
+2. **Custos de transação heterogéneos** — spreads de 2–5% são normais na ponta sub-$1/nano cap; em mid caps líquidas o spread é tipicamente uma fração disso. Nenhum resultado modelado inclui spread, slippage ou halts, mas o efeito não é uniforme ao longo do universo alargado — tratar o backtest como uma única estimativa mistura dois regimes de liquidez distintos.
 3. **Amostras sobrepostas** — sinais consecutivos no mesmo ticker são correlacionados; o N efetivo é muito inferior ao N nominal.
-4. **Multiplicidade** — os limiares (68, 2.0x, 0.60, ...) foram escolhidos à mão. Cada limiar afinado sobre os mesmos dados é uma comparação múltipla não corrigida.
-5. **Diluição e SEC continuam manuais.** Neste segmento, o ATM offering é o risco dominante e é invisível no gráfico.
+4. **Multiplicidade** — os limiares (68, 2.0x, 0.60, $2 mil milhões para o corte IWM/MDY, ...) foram escolhidos à mão. Cada limiar afinado sobre os mesmos dados é uma comparação múltipla não corrigida.
+5. **Diluição e SEC continuam manuais.** Em nano/micro cap, o ATM offering é o risco dominante e é invisível no gráfico; em mid cap esse risco específico é menos comum, mas outros (guidance, cobertura de analistas, opções) passam a ser relevantes e continuam fora do âmbito do scanner.
 
 ## Teste de aceitação
 

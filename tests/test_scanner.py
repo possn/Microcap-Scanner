@@ -185,3 +185,52 @@ def test_sma50_gate_is_additional_not_a_replacement():
     assert breakout_pos < curl_pos < base_pos, (
         "esperado: SMA150 -> SMA50 curl -> base, ambos os gates antes da deteção de base"
     )
+
+
+def test_universe_widened_to_mid_cap_defaults():
+    """Locks the v1.5.0 widening: no longer sub-$1/nano-cap only."""
+    from scanner import Config
+    cfg = Config()
+    assert cfg.max_price == 500.0
+    assert cfg.max_market_cap == 10_000_000_000.0
+    assert cfg.min_price == 0.08  # floor unchanged — harmless at any tier
+
+
+def test_market_adjustment_bonus_scales_with_configured_ceiling():
+    """The old scanner gave +4 below a hardcoded $50M and +2 up to whatever
+    ceiling was configured. With MAX_MARKET_CAP now $10B, a fixed $50M
+    breakpoint would give every qualifying mid cap only +2 while nano caps
+    kept +4 — silently defeating the widening. The breakpoint must scale
+    with cfg.max_market_cap (1/3 of it), reproducing the historical $50M
+    breakpoint exactly when the ceiling is still $150M."""
+    import dataclasses
+    from scanner import Config, market_adjustment
+
+    cfg = Config()  # max_market_cap = 10B by default now
+    assert market_adjustment(None, 1_000_000_000, cfg) > market_adjustment(None, 9_000_000_000, cfg)
+    assert market_adjustment(None, cfg.max_market_cap / 6, cfg) == market_adjustment(None, 1.0, cfg)  # both in the small tier
+    assert market_adjustment(None, cfg.max_market_cap * 2, cfg) < market_adjustment(None, cfg.max_market_cap, cfg)
+
+    # Backward compatibility: at the OLD $150M ceiling, the breakpoint must
+    # land exactly on the historical $50M value.
+    old_cfg = dataclasses.replace(cfg, max_market_cap=150_000_000.0)
+    just_below = market_adjustment(None, 49_999_999, old_cfg)
+    just_above = market_adjustment(None, 50_000_001, old_cfg)
+    assert just_below > just_above
+
+
+def test_rs_benchmark_switches_to_mdy_above_mid_cap_threshold(monkeypatch):
+    """IWM (Russell 2000, small/micro cap) is the wrong yardstick for an $8B
+    company. Above MID_CAP_RS_THRESHOLD, relative strength must be measured
+    against MDY (S&P MidCap 400) instead."""
+    import pandas as pd
+    import scanner as sc
+
+    iwm_marker = pd.DataFrame({"marker": ["IWM"]})
+    mdy_marker = pd.DataFrame({"marker": ["MDY"]})
+    monkeypatch.setattr(sc, "BENCHMARKS", {"IWM": iwm_marker, "MDY": mdy_marker, "QQQ": iwm_marker})
+
+    assert sc.choose_rs_benchmark(None) is iwm_marker            # unknown cap: small/micro default
+    assert sc.choose_rs_benchmark(500_000_000) is iwm_marker      # below threshold
+    assert sc.choose_rs_benchmark(sc.MID_CAP_RS_THRESHOLD) is mdy_marker   # at threshold
+    assert sc.choose_rs_benchmark(8_000_000_000) is mdy_marker    # well above
