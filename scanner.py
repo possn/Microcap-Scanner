@@ -76,7 +76,7 @@ class Config:
         default_factory=lambda: int(os.getenv("BREAKOUT_MIN_AGE", "10"))
     )
     breakout_max_age: int = field(
-        default_factory=lambda: int(os.getenv("BREAKOUT_MAX_AGE", "40"))
+        default_factory=lambda: int(os.getenv("BREAKOUT_MAX_AGE", "90"))
     )
     breakout_volume_mult: float = field(
         default_factory=lambda: float(os.getenv("BREAKOUT_VOLUME_MULT", "2.0"))

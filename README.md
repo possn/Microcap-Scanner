@@ -1,4 +1,4 @@
-# Heartbeat Stage 2 — Probability Engine v1.6.0
+# Heartbeat Stage 2 — Probability Engine v1.6.1
 
 Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável).
 
@@ -19,6 +19,15 @@ Configurável via `REQUIRE_SECTOR_ETF_CURL` (padrão `1`, ligado — desligar re
 Critérios nucleares: base ≥4 meses, compressão ATR/semanal, recuperação recente da SMA150 com volume ≥2x, SMA50 diária a curvar para cima (inclinação positiva sustentada; aceleração/inflexão exata é opcional, ver `REQUIRE_SMA50_CURL_ACCELERATING`), preço não esticado, liquidez e market cap.
 
 Acrescenta: força relativa a 20/60 sessões (benchmark dependente do tamanho — IWM para small/micro cap, MDY/S&P MidCap 400 a partir de $2 mil milhões); regime de mercado via QQQ+IWM+MDY; CLV do impulso; secagem de volume pré-breakout; resistência real da base e estado BREAKOUT/RETEST; persistência acima da SMA150; contagem de falsos breakouts; relação potencial/risco mínima; score multifatorial 0–100.
+
+## Novo em 1.6.1 — auditoria orientada a dados (0 qualificadas há 9 dias)
+
+Diagnóstico a partir do funil real de 9 execuções consecutivas (5–12 ago), não de intuição:
+
+- **`.github/workflows/daily.yml` nunca foi atualizado.** As alterações de 1.4.2 (volume) e 1.5.0 (mid cap) só existiam nos defaults do `scanner.py` — o workflow continuava com `MAX_PRICE=1.00`, `MAX_MARKET_CAP=150000000`, `BREAKOUT_VOLUME_MULT=3.0`, `BREAKOUT_VOLUME_WINDOW=3`. O universo diário ficou preso em ~280 empresas sub-$1 durante todo este tempo — nenhuma das duas melhorias anteriores chegou a produção. Corrigido: os 4 valores agora sincronizados com o código.
+- **`no_sma150_cross` era, de longe, a maior perda do funil** (70–85% dos sobreviventes da liquidez, todos os 9 dias) — maior que o filtro de setor, liquidez e tudo o resto juntos. `BREAKOUT_MAX_AGE` (40 sessões, ~8 semanas) exigia que o cruzamento da SMA150 tivesse acontecido numa janela demasiado estreita. Alargado para 90 sessões (~4,5 meses); `BREAKOUT_MIN_AGE` mantido em 10 (evita comprar o próprio dia do cruzamento). Continua protegido por `MAX_GAIN_SINCE_BREAKOUT` e `MAX_DISTANCE_SMA150`, que rejeitam independentemente qualquer cruzamento antigo já esticado — medido no universo real em cache: cruzamentos encontrados sobem de 7 para 12 (quase duplica) sem qualquer outra alteração.
+- **O filtro de ETF de setor (1.6.0) NÃO é o gargalo principal** — custa ~35% (126/196 nos 9 dias), secundário face ao ponto acima. Mantido como está, sem alterações; o `breakout_ok` já estava preso em 1–2/dia mesmo nos 3 dias anteriores à existência do filtro de setor.
+- Uma única alteração de cada vez, por desenho: sector gate (1.6.0), workflow+janela (1.6.1) e mid cap (1.5.0) são medidos separadamente para se poder atribuir qualquer melhoria (ou piora) à causa certa, não a um pacote de mudanças simultâneas.
 
 ## Novo em 1.6.0
 
