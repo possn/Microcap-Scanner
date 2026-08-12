@@ -44,8 +44,8 @@ jobs:
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
 
           MIN_PRICE: "0.08"
-          MAX_PRICE: "1.00"
-          MAX_MARKET_CAP: "150000000"
+          MAX_PRICE: "500.00"
+          MAX_MARKET_CAP: "10000000000"
           STRICT_MARKET_CAP: "1"
           STRICT_FLOAT: "0"
 
@@ -55,8 +55,8 @@ jobs:
           MAX_BASE_SESSIONS: "252"
 
           BREAKOUT_MIN_AGE: "10"
-          BREAKOUT_MAX_AGE: "40"
-          BREAKOUT_VOLUME_MULT: "3.0"
+          BREAKOUT_MAX_AGE: "90"
+          BREAKOUT_VOLUME_MULT: "2.0"
           MAX_GAIN_SINCE_BREAKOUT: "0.50"
           MAX_DISTANCE_SMA150: "0.35"
 
@@ -68,7 +68,7 @@ jobs:
           MIN_AVG_VOLUME_20: "100000"
           MIN_AVG_DOLLAR_VOLUME_20: "75000"
           MAX_CANDIDATES: "0"
-          BREAKOUT_VOLUME_WINDOW: "3"
+          BREAKOUT_VOLUME_WINDOW: "5"
           NEAR_MISS_LIMIT: "5"
           MAX_RESULTS: "10"
           MIN_QUALITY_SCORE: "68"
