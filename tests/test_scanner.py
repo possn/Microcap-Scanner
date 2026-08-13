@@ -282,29 +282,36 @@ def test_sector_etf_gate_blocks_when_sector_not_curling(monkeypatch):
         sector = "Technology"
         industry = "Semiconductors"
 
-    # Sector ETF not curling -> hard reject, regardless of the stock's own setup.
+    # STRICT MODE (discovery_mode=False): sector ETF not curling -> hard
+    # reject, preserving the old guarantee for anyone who opts back into it.
+    strict_cfg = dataclasses.replace(cfg, discovery_mode=False)
     monkeypatch.setattr(sc, "SECTOR_STATUS", {"Semicondutores": {"etf": "SMH", "curling_up": False, "slope_pct": -1.2, "data_ok": True}})
-    result, reason, diagnostics = sc.analyse_candidate(Fake(), cfg)
+    result, reason, diagnostics = sc.analyse_candidate(Fake(), strict_cfg)
     assert result is None
     assert reason == "sector_etf_not_curling"
     assert diagnostics["sector_label"] == "Semicondutores"
     assert diagnostics["sector_etf"] == "SMH"
 
-    # Unmapped sector -> also a hard reject (no ETF to verify against).
     class FakeUnmapped(Fake):
         sector = "Miscellaneous"
         industry = "Services-Misc."
-    result2, reason2, _ = sc.analyse_candidate(FakeUnmapped(), cfg)
+    result2, reason2, _ = sc.analyse_candidate(FakeUnmapped(), strict_cfg)
     assert result2 is None
     assert reason2 == "sector_unmapped"
+
+    # DISCOVERY MODE (now the default): the same rejection must NOT be
+    # returned as a hard-stop reason anymore.
+    assert cfg.discovery_mode is True
+    _, reason3, _ = sc.analyse_candidate(Fake(), cfg)
+    assert reason3 not in {"sector_unmapped", "sector_etf_not_curling", "sector_etf_no_data"}
 
     # Gate disabled -> sector status must not block the candidate (though the
     # stock will likely still fail later gates on this thin synthetic data;
     # what matters here is that it does NOT fail specifically on the sector
     # reasons once the gate is off).
     cfg_off = dataclasses.replace(cfg, require_sector_etf_curl=False)
-    _, reason3, _ = sc.analyse_candidate(Fake(), cfg_off)
-    assert reason3 not in {"sector_unmapped", "sector_etf_not_curling", "sector_etf_no_data"}
+    _, reason4, _ = sc.analyse_candidate(Fake(), cfg_off)
+    assert reason4 not in {"sector_unmapped", "sector_etf_not_curling", "sector_etf_no_data"}
 
 
 def test_sector_gate_runs_before_breakout_gate_in_source():
@@ -377,3 +384,74 @@ def test_backtest_sector_gate_is_point_in_time(monkeypatch, tmp_path):
                   "close": stock_close, "volume": np.full(n, 500_000.0)}).to_csv(ohlcv_dir / "CHIPCO.csv", index=False)
     report_after = bt.run(cfg, step=5, min_score=0.0, max_per_ticker=50, min_i=200)
     assert report_after["n_signals"] > 0, "o gate nunca deixou passar nenhum ponto mesmo depois do ETF curvar"
+
+
+def test_discovery_mode_penalizes_instead_of_rejecting(monkeypatch):
+    """End-to-end proof of the core redesign: under discovery_mode (the new
+    default), a candidate that would previously have been silently dropped
+    for a weak sector/SMA50/CLV/RR now SURVIVES with a lower score and
+    explicit soft_flags explaining what's weak — the point being to give
+    the user something to manually evaluate instead of nothing."""
+    import dataclasses
+    import numpy as np, pandas as pd
+    import scanner as sc
+
+    cfg = sc.Config()
+    assert cfg.discovery_mode is True
+    assert cfg.discovery_min_score < cfg.min_quality_score  # floor is meaningfully lower
+    monkeypatch.setattr(sc, "BENCHMARKS", {})
+    monkeypatch.setattr(sc, "MARKET_REGIME", {"label": "indeterminado", "score": 0.0})
+
+    n = 230
+    dates = pd.date_range("2025-01-01", periods=n, freq="B")
+    close = np.full(n, 0.50)
+    close[:190] = 0.55
+    close[190:209] = 0.48
+    close[209:] = 0.58
+    volume = np.full(n, 200_000.0)
+    volume[209] = 500_000.0
+    df = pd.DataFrame({"date": dates, "open": close, "high": close * 1.02,
+                        "low": close * 0.98, "close": close, "volume": volume})
+    # Breakout-day candle: close near the day's high (CLV clears 0.60) so
+    # only the sector penalty is in play, not an accidental extra CLV penalty.
+    df.loc[209, "high"] = close[209] * 1.01
+    df.loc[209, "low"] = close[209] * 0.95
+    monkeypatch.setattr(sc, "load_ohlcv", lambda ticker, cfg: df)
+
+    # Bypass detect_base's fussy compression heuristics (unrelated to what
+    # this test checks) by handing back a plausible, always-valid base.
+    # Resistance set well above current price so RR clears its own threshold
+    # too — same reasoning: isolate the sector penalty as the one thing
+    # keeping this candidate out of "Alta".
+    fake_base = {
+        "sessions": 190, "base": df.iloc[:190], "atr_ratio": 0.5, "weekly_ratio": 0.5,
+        "low_slope": 0.0001, "high_slope": -0.0001, "pattern": "Base plana (teste)",
+        "support": 0.50, "resistance": 0.70, "quality": 1.5,
+    }
+    monkeypatch.setattr(sc, "detect_base", lambda df, idx, cfg: fake_base)
+
+    # Weak on purpose: sector ETF not curling (the stock's OWN SMA50 curls up
+    # fine on this synthetic series, so this isolates a single penalty source
+    # — used to be a hard reject on its own).
+    monkeypatch.setattr(sc, "SECTOR_STATUS", {"Semicondutores": {"etf": "SMH", "curling_up": False, "slope_pct": -0.8, "data_ok": True}})
+
+    class Fake:
+        ticker = "WEAKCO"
+        name = "Weak Signal Corp"
+        market_cap = 20_000_000
+        sector = "Technology"
+        industry = "Semiconductors"
+
+    result, reason, diagnostics = sc.analyse_candidate(Fake(), cfg)
+    assert reason == "qualified", f"esperado que sobrevivesse penalizado, mas foi rejeitado por: {reason}"
+    assert result is not None
+    assert len(result.soft_flags) >= 1
+    assert any("setor" in f.lower() or "smh" in f.lower() for f in result.soft_flags)
+    assert result.probability_band in {"Moderada", "Especulativa"}  # nunca "Alta" com flags fracas
+
+    # Strict mode on the identical inputs must still hard-reject — proving
+    # the old guarantee is preserved as an opt-in, not deleted.
+    strict_cfg = dataclasses.replace(cfg, discovery_mode=False)
+    result_strict, reason_strict, _ = sc.analyse_candidate(Fake(), strict_cfg)
+    assert result_strict is None
+    assert reason_strict == "sector_etf_not_curling"

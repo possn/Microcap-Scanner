@@ -1,12 +1,30 @@
-# Heartbeat Stage 2 — Probability Engine v1.6.1
+# Heartbeat Stage 2 — Discovery Engine v1.7.0
 
-Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável).
+Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável). Por omissão em **modo descoberta**: sinaliza candidatas plausíveis para avaliação manual em vez de eliminar tudo o que não é perfeito — ver secção abaixo.
 
 ## O que este scanner é — e o que não é
 
 É um **filtro de assimetria**: procura setups onde a relação potencial/risco é favorável e regista tudo para calibração empírica posterior.
 
 **Não** entrega "empresas com grande probabilidade de subir". Essa afirmação exige uma probabilidade medida, e uma probabilidade medida exige amostra fora de treino. Enquanto `cache/backtest_report.json` e `cache/signal_journal.json` não tiverem amostra suficiente, o score de 0–100 é um **ranking ordinal**, não uma probabilidade.
+
+## Modo descoberta (padrão desde 1.7.0)
+
+O objetivo deixou de ser "só os melhores" e passou a ser "candidatas plausíveis para eu avaliar manualmente". Isso muda o desenho: em vez de ~10 critérios obrigatórios em AND (onde reprovar em qualquer um apaga a candidata por completo), os critérios de **qualidade** passam a **penalizar o score** em vez de eliminar:
+
+- ETF do setor sem SMA50 a curvar
+- SMA50 da própria ação sem curvar
+- CLV fraco (fecho longe do topo do impulso)
+- Relação potencial/risco abaixo do ideal
+- Falsos breakouts em excesso
+
+A candidata continua visível, com score mais baixo e uma linha `⚠` no Telegram a dizer exatamente o que está fraco — quem decide é quem lê, não o filtro.
+
+**Continuam a eliminar** (estruturais, não de qualidade): histórico insuficiente, preço fora do intervalo, liquidez insuficiente, ausência de um breakout da SMA150 na janela, e ausência de uma base de compressão válida — sem estes não há sequer um setup para descrever (preço de entrada, suporte, invalidação dependem de existir uma base).
+
+O piso final de score também desce: `DISCOVERY_MIN_SCORE` (padrão 35) em vez de `MIN_QUALITY_SCORE` (68) — continua a existir para não mostrar autêntico ruído, mas deixou de ser o corte que apagava candidatas moderadas.
+
+Para voltar ao comportamento antigo (só recomendações de alta convicção, tudo o resto eliminado): `DISCOVERY_MODE=0`. Nesse modo os critérios acima voltam a ser cortes rígidos e `MIN_QUALITY_SCORE` volta a mandar.
 
 ## Pré-filtro: ETFs de setor primeiro
 

@@ -81,7 +81,16 @@ def slice_benchmarks(full: dict[str, pd.DataFrame], cutoff: pd.Timestamp) -> dic
 
 def evaluate_point(df: pd.DataFrame, cfg: Config) -> Optional[dict[str, Any]]:
     """Run the full live gate stack on a truncated frame. Returns None if the
-    setup would not have been published on that date."""
+    setup would not have been published on that date.
+
+    NOTA: esta função mede sempre a definição ESTRITA (todos os critérios de
+    qualidade como corte rígido), independentemente de cfg.discovery_mode.
+    O modo descoberta existe para dar candidatas de aviso a um humano, não
+    para reivindicar uma vantagem estatística — não faz sentido calibrar uma
+    probabilidade sobre sinais que foram publicados precisamente por não
+    cumprirem os critérios. Quem quiser medir o efeito do modo descoberta
+    fá-lo comparando dois relatórios (com e sem os campos soft) à parte.
+    """
     breakout, _ = find_sma150_breakout(df, cfg)
     if breakout is None:
         return None

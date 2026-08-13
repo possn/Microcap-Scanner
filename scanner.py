@@ -160,6 +160,19 @@ class Config:
     min_reward_risk: float = field(default_factory=lambda: float(os.getenv("MIN_REWARD_RISK", "2.0")))
     min_close_location: float = field(default_factory=lambda: float(os.getenv("MIN_CLOSE_LOCATION", "0.60")))
     max_failed_breakouts: int = field(default_factory=lambda: int(os.getenv("MAX_FAILED_BREAKOUTS", "3")))
+    # MODO DESCOBERTA: o objetivo deixou de ser "só os melhores" e passou a
+    # ser "candidatas plausíveis para avaliação manual". Sob este modo, os
+    # critérios de QUALIDADE (força do setor, curvatura da própria SMA50,
+    # CLV, relação potencial/risco, falsos breakouts) deixam de ELIMINAR a
+    # candidata e passam a PENALIZAR o score, mantendo-a visível e sinalizada
+    # — só quem decide manualmente é que corta. Os critérios ESTRUTURAIS
+    # (histórico, liquidez, existência de um breakout e de uma base) mantêm-se
+    # como filtros rígidos: sem eles não há sequer um setup para descrever.
+    discovery_mode: bool = field(default_factory=lambda: os.getenv("DISCOVERY_MODE", "1") == "1")
+    # Sob modo descoberta, este é o piso final (muito mais baixo que
+    # MIN_QUALITY_SCORE) — continua a existir para não mostrar autêntico
+    # lixo, mas deixou de ser o corte que apaga candidatas moderadas.
+    discovery_min_score: float = field(default_factory=lambda: float(os.getenv("DISCOVERY_MIN_SCORE", "35")))
 
     results_json: Path = Path("cache/heartbeat_results.json")
     results_csv: Path = Path("cache/heartbeat_results.csv")
@@ -218,6 +231,7 @@ class TechnicalResult:
     sector_label: str
     sector_etf: str
     sector_etf_slope_pct: float
+    soft_flags: list[str]
     close_location_value: float
     volume_dryup_ratio: float
     relative_strength_20d: float
@@ -930,43 +944,85 @@ def analyse_candidate(company: UniverseRow, cfg: Config) -> tuple[Optional[Techn
     avg_volume_20=float(df["volume"].tail(20).mean()); avg_dollar_volume_20=float((df["close"]*df["volume"]).tail(20).mean())
     diagnostics.update(avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20)
     if avg_volume_20<cfg.min_avg_volume_20 or avg_dollar_volume_20<cfg.min_avg_dollar_volume_20: return None,"liquidity",diagnostics
+
+    # A partir daqui: histórico, preço e liquidez já são estruturais e
+    # continuam a eliminar (não há candidata sem eles). Os critérios abaixo
+    # são de QUALIDADE — em modo descoberta, penalizam o score e ficam
+    # sinalizados em soft_flags; a candidata continua visível.
+    penalty = 0.0
+    soft_flags: list[str] = []
+
     sector_info = classify_sector(company.sector, company.industry)
     if sector_info is not None:
         diagnostics["sector_label"], diagnostics["sector_etf"] = sector_info
     if cfg.require_sector_etf_curl:
         if sector_info is None:
-            return None, "sector_unmapped", diagnostics
-        label, etf = sector_info
-        sector_status = SECTOR_STATUS.get(label)
-        if sector_status is not None:
-            diagnostics["sector_etf_slope_pct"] = sector_status.get("slope_pct")
-        if sector_status is None or not sector_status.get("data_ok"):
-            return None, "sector_etf_no_data", diagnostics
-        if not sector_status.get("curling_up"):
-            return None, "sector_etf_not_curling", diagnostics
+            if not cfg.discovery_mode:
+                return None, "sector_unmapped", diagnostics
+            penalty += 10; soft_flags.append("Setor não classificado (sem ETF de referência)")
+        else:
+            label, etf = sector_info
+            sector_status = SECTOR_STATUS.get(label)
+            if sector_status is not None:
+                diagnostics["sector_etf_slope_pct"] = sector_status.get("slope_pct")
+            if sector_status is None or not sector_status.get("data_ok"):
+                if not cfg.discovery_mode:
+                    return None, "sector_etf_no_data", diagnostics
+                penalty += 8; soft_flags.append("Sem dados do ETF de setor")
+            elif not sector_status.get("curling_up"):
+                if not cfg.discovery_mode:
+                    return None, "sector_etf_not_curling", diagnostics
+                penalty += 15; soft_flags.append(f"ETF do setor ({etf}) sem SMA50 a curvar para cima")
+
     breakout,reason=find_sma150_breakout(df,cfg)
     if breakout is None: return None,reason,diagnostics
     diagnostics.update(breakout_age=breakout["age"],breakout_volume_multiple=breakout["volume_multiple"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"])
+
     curl=sma50_curling_up(df,cfg)
-    if curl is None: return None,"sma50_no_history",diagnostics
+    if curl is None:
+        if not cfg.discovery_mode:
+            return None,"sma50_no_history",diagnostics
+        curl = {"slope_pct": 0.0, "prior_slope_pct": 0.0, "curling_up": False, "accelerating": False}
+        penalty += 8; soft_flags.append("Histórico insuficiente para confirmar a SMA50")
     diagnostics.update(sma50_slope_pct=100*curl["slope_pct"],sma50_prior_slope_pct=100*curl["prior_slope_pct"])
-    if not curl["curling_up"]: return None,"sma50_not_curling_up",diagnostics
+    if not curl["curling_up"]:
+        if not cfg.discovery_mode:
+            return None,"sma50_not_curling_up",diagnostics
+        penalty += 12; soft_flags.append("SMA50 da própria ação não está a curvar para cima")
+
     base=detect_base(df,breakout["idx"],cfg)
     if base is None: return None,"base_compression",diagnostics
     extra=enhanced_metrics(base,breakout,df,company.market_cap)
     diagnostics.update(base_sessions=base["sessions"],atr_ratio=base["atr_ratio"],weekly_ratio=base["weekly_ratio"],close_location=extra["clv"],relative_strength_20d=extra["rs20"],reward_risk=extra["rr"],failed_breakouts=extra["fails"])
-    # These are probability-quality gates, not arbitrary cosmetic filters.
-    if extra["clv"] < cfg.min_close_location: return None,"weak_close",diagnostics
-    if extra["rr"] < cfg.min_reward_risk: return None,"poor_reward_risk",diagnostics
-    if extra["fails"] > cfg.max_failed_breakouts: return None,"repeated_failures",diagnostics
+
+    if extra["clv"] < cfg.min_close_location:
+        if not cfg.discovery_mode:
+            return None,"weak_close",diagnostics
+        penalty += round(15 * (cfg.min_close_location - extra["clv"]) / cfg.min_close_location, 1)
+        soft_flags.append(f"Fecho fraco no impulso (CLV {extra['clv']:.2f} < {cfg.min_close_location:.2f})")
+    if extra["rr"] < cfg.min_reward_risk:
+        if not cfg.discovery_mode:
+            return None,"poor_reward_risk",diagnostics
+        penalty += round(15 * max(0.0, (cfg.min_reward_risk - extra["rr"]) / cfg.min_reward_risk), 1)
+        soft_flags.append(f"Assimetria risco/retorno abaixo do ideal (RR {extra['rr']:.1f}x < {cfg.min_reward_risk:.1f}x)")
+    if extra["fails"] > cfg.max_failed_breakouts:
+        if not cfg.discovery_mode:
+            return None,"repeated_failures",diagnostics
+        penalty += min(20, 6 * (extra["fails"] - cfg.max_failed_breakouts))
+        soft_flags.append(f"{extra['fails']} falsos breakouts na base (limite {cfg.max_failed_breakouts})")
+
     snapshot=MarketSnapshot()
     tech_score=technical_score(base,breakout,df,cfg,extra)
-    total_score=round(max(0,min(100,tech_score+market_adjustment(snapshot.float_shares,company.market_cap,cfg))),1)
-    if total_score < cfg.min_quality_score: return None,"quality_score",{**diagnostics,"quality_score":total_score}
+    total_score=round(max(0,min(100,tech_score+market_adjustment(snapshot.float_shares,company.market_cap,cfg)-penalty)),1)
+    min_score = cfg.discovery_min_score if cfg.discovery_mode else cfg.min_quality_score
+    if total_score < min_score: return None,"quality_score",{**diagnostics,"quality_score":total_score}
     resistance=max(base["resistance"],breakout["price"]); support=min(base["support"],breakout["sma150"]); ideal_low=max(breakout["sma150"],resistance*0.97); ideal_high=resistance*1.04; invalidation=min(support*0.97,breakout["sma150"]*0.96)
-    band="Alta" if total_score>=82 and MARKET_REGIME.get("label")!="adverso" else "Moderada-alta" if total_score>=74 else "Moderada"
+    band=("Alta" if total_score>=82 and MARKET_REGIME.get("label")!="adverso" and not soft_flags
+          else "Moderada-alta" if total_score>=74 and len(soft_flags)<=1
+          else "Moderada" if total_score>=55
+          else "Especulativa")
     confirmation=f"Fecho acima de ${resistance:.3f} com CLV ≥0,60, volume ≥2x, SMA50 a curvar para cima e manutenção acima da SMA150."
-    return TechnicalResult(ticker=company.ticker,name=company.name,price=latest_price,market_cap=company.market_cap,float_shares=snapshot.float_shares,avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20,breakout_volume=breakout["volume"],breakout_volume_multiple=breakout["volume_multiple"],breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),breakout_age_sessions=breakout["age"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"],consolidation_sessions=base["sessions"],consolidation_months=round(base["sessions"]/21,1),pattern=base["pattern"],support=support,resistance=resistance,ideal_entry_low=ideal_low,ideal_entry_high=ideal_high,invalidation=invalidation,confirmation=confirmation,atr_contraction_ratio=base["atr_ratio"],weekly_range_ratio=base["weekly_ratio"],higher_lows_slope=base["low_slope"],lower_highs_slope=base["high_slope"],sma150_slope_pct_20d=100*breakout["slope20"],sma50_slope_pct=100*curl["slope_pct"],sector_label=diagnostics.get("sector_label") or "Não classificado",sector_etf=diagnostics.get("sector_etf") or "n/d",sector_etf_slope_pct=diagnostics.get("sector_etf_slope_pct") if diagnostics.get("sector_etf_slope_pct") is not None else 0.0,close_location_value=extra["clv"],volume_dryup_ratio=extra["dry"],relative_strength_20d=100*extra["rs20"],relative_strength_60d=100*extra["rs60"],resistance_break_pct=100*extra["rbreak"],reward_risk=extra["rr"],failed_breakouts=extra["fails"],persistence_score=extra["persist"],market_regime=MARKET_REGIME.get("label","indeterminado"),setup_state=extra["state"],probability_band=band,market=snapshot,catalysts=infer_catalysts(company),technical_score=tech_score,total_score=total_score),"qualified",diagnostics
+    return TechnicalResult(ticker=company.ticker,name=company.name,price=latest_price,market_cap=company.market_cap,float_shares=snapshot.float_shares,avg_volume_20=avg_volume_20,avg_dollar_volume_20=avg_dollar_volume_20,breakout_volume=breakout["volume"],breakout_volume_multiple=breakout["volume_multiple"],breakout_date=pd.Timestamp(breakout["date"]).strftime("%Y-%m-%d"),breakout_age_sessions=breakout["age"],distance_sma150_pct=100*breakout["distance"],gain_since_breakout_pct=100*breakout["gain"],consolidation_sessions=base["sessions"],consolidation_months=round(base["sessions"]/21,1),pattern=base["pattern"],support=support,resistance=resistance,ideal_entry_low=ideal_low,ideal_entry_high=ideal_high,invalidation=invalidation,confirmation=confirmation,atr_contraction_ratio=base["atr_ratio"],weekly_range_ratio=base["weekly_ratio"],higher_lows_slope=base["low_slope"],lower_highs_slope=base["high_slope"],sma150_slope_pct_20d=100*breakout["slope20"],sma50_slope_pct=100*curl["slope_pct"],sector_label=diagnostics.get("sector_label") or "Não classificado",sector_etf=diagnostics.get("sector_etf") or "n/d",sector_etf_slope_pct=diagnostics.get("sector_etf_slope_pct") if diagnostics.get("sector_etf_slope_pct") is not None else 0.0,soft_flags=soft_flags,close_location_value=extra["clv"],volume_dryup_ratio=extra["dry"],relative_strength_20d=100*extra["rs20"],relative_strength_60d=100*extra["rs60"],resistance_break_pct=100*extra["rbreak"],reward_risk=extra["rr"],failed_breakouts=extra["fails"],persistence_score=extra["persist"],market_regime=MARKET_REGIME.get("label","indeterminado"),setup_state=extra["state"],probability_band=band,market=snapshot,catalysts=infer_catalysts(company),technical_score=tech_score,total_score=total_score),"qualified",diagnostics
 
 
 # ---------------------------------------------------------------------------
@@ -1012,6 +1068,8 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
         "🫀 HEARTBEAT STAGE 2",
         f"Execução: {stamp}",
     ]
+    if cfg.discovery_mode:
+        header.append("Modo: DESCOBERTA — candidatas para avaliação manual, não recomendações. Sinalizadas com o que está fraco.")
 
     if cfg.require_sector_etf_curl and SECTOR_STATUS:
         approved = sorted(
@@ -1057,11 +1115,13 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
         by_sector: dict[str, list[TechnicalResult]] = {}
         for result in results:
             by_sector.setdefault(result.sector_label, []).append(result)
-        # Setores ordenados pela força da curvatura do próprio ETF, não por
-        # ordem alfabética — o setor mais forte aparece primeiro.
+        # Setores ordenados pela MELHOR candidata dentro do grupo — em modo
+        # descoberta um setor sem ETF a curvar ainda pode ter a ação mais
+        # forte do dia (penalizada, não eliminada), e não deve ficar
+        # enterrada no fim só por causa da ordenação do ETF.
         sector_order = sorted(
             by_sector.keys(),
-            key=lambda label: (SECTOR_STATUS.get(label) or {}).get("slope_pct") or 0,
+            key=lambda label: max(r.total_score for r in by_sector[label]),
             reverse=True,
         )
         rank = 0
@@ -1072,6 +1132,7 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
             header.append(f"\n▶ SETOR: {label} (ETF {etf_line})")
             for result in group:
                 rank += 1
+                flags_line = ("\n⚠ " + " | ".join(result.soft_flags)) if result.soft_flags else ""
                 header.append(
                     f"\n#{rank} {result.ticker} — {result.name}\n"
                     f"Score: {result.total_score:.1f}/100 | Probabilidade: {result.probability_band} | Estado: {result.setup_state}\n"
@@ -1083,6 +1144,7 @@ def telegram_message(results: list[TechnicalResult], funnel: dict[str, int], nea
                     f"RS20: {result.relative_strength_20d:+.1f}% | RS60: {result.relative_strength_60d:+.1f}% | CLV: {result.close_location_value:.2f} | RR: {result.reward_risk:.1f}x\n"
                     f"Suporte: ${result.support:.3f} | Resistência: ${result.resistance:.3f}\n"
                     f"Entrada: ${result.ideal_entry_low:.3f}–${result.ideal_entry_high:.3f} | Invalidação: ${result.invalidation:.3f}"
+                    f"{flags_line}"
                 )
 
     if near_misses:
@@ -1152,6 +1214,7 @@ def save_outputs(results: list[TechnicalResult], cfg: Config, universe_size: int
         market = row.pop("market")
         row.update({f"market_{key}": value for key, value in market.items()})
         row["catalysts"] = "; ".join(row["catalysts"])
+        row["soft_flags"] = "; ".join(row["soft_flags"])
         flat_rows.append(row)
     pd.DataFrame(flat_rows).to_csv(cfg.results_csv, index=False)
     cfg.last_run_json.write_text(
