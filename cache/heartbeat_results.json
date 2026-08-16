@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-08-14T21:51:01.295371+00:00",
+  "generated_at": "2026-08-16T16:21:48.335699+00:00",
   "universe_size": 2954,
   "scanned": 2954,
   "qualified": 10,
@@ -17,10 +17,10 @@
   "funnel": {
     "universe": 2954,
     "scanned": 2954,
-    "reason:no_sma150_cross": 742,
-    "history_ok": 2716,
-    "liquidity_ok": 1861,
-    "sector_ok": 1861,
+    "reason:no_sma150_cross": 743,
+    "history_ok": 2717,
+    "liquidity_ok": 1862,
+    "sector_ok": 1862,
     "reason:falling_sma150": 39,
     "reason:liquidity": 855,
     "reason:below_sma150": 372,
@@ -32,7 +32,7 @@
     "reason:quality_score": 18,
     "base_ok": 37,
     "reason:extended_sma": 46,
-    "reason:no_history": 69,
+    "reason:no_history": 68,
     "reason:extended_gain": 72,
     "reason:qualified": 19
   },
