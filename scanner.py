@@ -262,7 +262,43 @@ SESSION.headers.update(
 
 
 def _fresh(path: Path, hours: int) -> bool:
+    """Verificação por mtime. NÃO usar sozinha em CI: um `actions/checkout`
+    novo repõe o mtime de TODOS os ficheiros para "agora" em cada execução,
+    independentemente da idade real dos dados dentro deles. Mantida como
+    atalho de desempenho para reruns no mesmo processo (onde o mtime é
+    genuinamente informativo), nunca como único critério de frescura."""
     return path.exists() and (time.time() - path.stat().st_mtime) < hours * 3600
+
+
+def _cache_has_recent_data(path: Path, max_staleness_days: int = 3) -> bool:
+    """Frescura pelo CONTEÚDO: verdadeiro se a última data na série já é a
+    sessão de negociação mais recente esperada (ou próxima dela).
+
+    Isto existe porque o workflow faz commit de cache/ohlcv/*.csv de volta
+    ao repositório a cada execução (para não recomeçar do zero todos os
+    dias). Isso significa que, em CI, o checkout do git repõe o mtime de
+    TODOS os ficheiros para o momento do checkout — `_fresh()` via mtime
+    reportava sempre "fresco" mesmo quando o conteúdo era de dias antes,
+    porque nunca comparava a DATA dos dados, só a idade do ficheiro em
+    disco. Resultado real observado: os mesmos 10 tickers, com o mesmo
+    score ao décimo, repetidos por 5 dias seguidos — o scanner ficou
+    congelado nos dados do primeiro fetch e nunca mais voltou a atualizar.
+    `max_staleness_days=3` tolera fim de semana (ler dados de sexta-feira ao
+    sábado/domingo) sem recusar dados válidos. É deliberadamente permissivo
+    para o lado de tentar obter dados novos com demasiada frequência, nunca
+    para o lado de aceitar dados velhos: uma segunda-feira a tentar sempre
+    a obtenção é um custo pequeno; um congelamento silencioso de dias é o
+    bug que isto existe para impedir.
+    """
+    if not path.exists():
+        return False
+    try:
+        last_date = pd.read_csv(path, usecols=["date"]).iloc[-1]["date"]
+        last_date = pd.Timestamp(last_date).date()
+    except Exception:  # noqa: BLE001
+        return False
+    today = datetime.now(timezone.utc).date()
+    return (today - last_date).days <= max_staleness_days
 
 
 def get_json(url: str, *, headers: Optional[dict[str, str]] = None, retries: int = 3) -> Any:
@@ -418,7 +454,11 @@ def fetch_stooq_ohlcv(ticker: str) -> Optional[pd.DataFrame]:
 def load_ohlcv(ticker: str, cfg: Config) -> Optional[pd.DataFrame]:
     cfg.ohlcv_dir.mkdir(parents=True, exist_ok=True)
     path = cfg.ohlcv_dir / f"{ticker}.csv"
-    if _fresh(path, cfg.cache_hours):
+    # mtime só é fiável dentro do MESMO processo/dia (reruns intradiários);
+    # em CI, um checkout novo torna-o sempre "fresco" mesmo com conteúdo
+    # antigo — por isso a frescura real exige SEMPRE verificar a data dentro
+    # dos dados, nunca só a idade do ficheiro em disco.
+    if _fresh(path, cfg.cache_hours) and _cache_has_recent_data(path):
         try:
             return _normalise_ohlcv(pd.read_csv(path))
         except Exception:  # noqa: BLE001

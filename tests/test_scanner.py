@@ -455,3 +455,68 @@ def test_discovery_mode_penalizes_instead_of_rejecting(monkeypatch):
     result_strict, reason_strict, _ = sc.analyse_candidate(Fake(), strict_cfg)
     assert result_strict is None
     assert reason_strict == "sector_etf_not_curling"
+
+
+def test_cache_freshness_uses_data_content_not_file_mtime(tmp_path, monkeypatch):
+    """Reproduces the exact bug found in production: cache/ohlcv/*.csv is
+    committed back to git every run, so a fresh `actions/checkout` resets
+    every file's mtime to 'now' regardless of the data's real age. The old
+    mtime-only check treated day-old committed data as fresh forever —
+    confirmed in the real repo: cache/ohlcv/OCFC.csv was written once on
+    2026-08-13 (data through 2026-08-12) and never updated again across 5
+    subsequent daily runs, producing bit-identical scores every day."""
+    import numpy as np, pandas as pd, os, time
+    import scanner as sc
+
+    path = tmp_path / "STALE.csv"
+    old_dates = pd.date_range("2020-01-01", periods=200, freq="B")
+    pd.DataFrame({
+        "date": old_dates, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        "volume": 100_000.0,
+    }).to_csv(path, index=False)
+
+    # Simulate exactly what `actions/checkout` does: the FILE's mtime becomes
+    # "right now", even though the DATA inside is years old.
+    now = time.time()
+    os.utime(path, (now, now))
+
+    # The old bug: mtime alone says "fresh" (just touched).
+    assert sc._fresh(path, hours=18) is True
+    # The fix: content-based freshness must catch this regardless of mtime.
+    assert sc._cache_has_recent_data(path) is False
+
+    cfg = sc.Config()
+    object.__setattr__(cfg, "ohlcv_dir", tmp_path)
+
+    # load_ohlcv must NOT silently serve the stale-content file just because
+    # its mtime is fresh — it must attempt a real refetch.
+    fresh_dates = pd.date_range("2025-01-01", periods=200, freq="B")
+    fresh_frame = pd.DataFrame({
+        "date": fresh_dates, "open": 2.0, "high": 2.0, "low": 2.0, "close": 2.0,
+        "volume": 200_000.0,
+    })
+    monkeypatch.setattr(sc, "fetch_yahoo_ohlcv", lambda ticker: fresh_frame)
+    monkeypatch.setattr(sc, "fetch_stooq_ohlcv", lambda ticker: None)
+
+    result = sc.load_ohlcv("STALE", cfg)
+    assert result is not None
+    assert pd.Timestamp(result["date"].iloc[-1]).date() == fresh_dates[-1].date(), (
+        "load_ohlcv devolveu os dados antigos em cache em vez de tentar obter dados novos"
+    )
+
+
+def test_cache_freshness_accepts_recent_weekend_data(tmp_path):
+    """A cache last updated Friday, read on a Sunday, must still count as
+    fresh (no market data to fetch over the weekend) — the tolerance window
+    must not force pointless refetches every non-trading day."""
+    import pandas as pd
+    import scanner as sc
+
+    path = tmp_path / "RECENT.csv"
+    last = pd.Timestamp.now(tz="UTC").date() - pd.Timedelta(days=2)
+    recent_dates = pd.date_range(end=last, periods=100, freq="D")  # calendar days: 'end' lands exactly on `last`, no weekend roll-back
+    pd.DataFrame({
+        "date": recent_dates, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        "volume": 100_000.0,
+    }).to_csv(path, index=False)
+    assert sc._cache_has_recent_data(path) is True

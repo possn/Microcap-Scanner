@@ -1,4 +1,4 @@
-# Heartbeat Stage 2 — Discovery Engine v1.7.0
+# Heartbeat Stage 2 — Discovery Engine v1.7.1
 
 Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável). Por omissão em **modo descoberta**: sinaliza candidatas plausíveis para avaliação manual em vez de eliminar tudo o que não é perfeito — ver secção abaixo.
 
@@ -7,6 +7,14 @@ Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capital
 É um **filtro de assimetria**: procura setups onde a relação potencial/risco é favorável e regista tudo para calibração empírica posterior.
 
 **Não** entrega "empresas com grande probabilidade de subir". Essa afirmação exige uma probabilidade medida, e uma probabilidade medida exige amostra fora de treino. Enquanto `cache/backtest_report.json` e `cache/signal_journal.json` não tiverem amostra suficiente, o score de 0–100 é um **ranking ordinal**, não uma probabilidade.
+
+## Corrigido em 1.7.1 — bug crítico: cache de OHLCV nunca atualizava
+
+Sintoma reportado: as mesmas 10 ações, com o mesmo score ao décimo, todos os dias desde 13 de agosto.
+
+Causa: o workflow faz `git add cache/ohlcv` e commit a cada execução (para não recomeçar do zero todos os dias). Em CI, um `actions/checkout` novo repõe o mtime de TODOS os ficheiros para "agora" a cada execução — a verificação de frescura antiga (`_fresh()`) olhava só para o mtime do ficheiro em disco, nunca para a data dentro dos dados. Resultado: o cache era sempre visto como "fresco" mesmo com conteúdo de dias antes, e o scanner nunca voltava a contactar a Yahoo/Stooq. Confirmado no repositório real: `cache/ohlcv/OCFC.csv` foi escrito uma única vez (13 ago, dados até 12 ago) e nunca mais atualizado em 5 execuções diárias seguintes.
+
+Corrigido: nova `_cache_has_recent_data()` verifica a **data dentro do CSV**, não a idade do ficheiro — só aceita o cache se a última sessão registada estiver a ≤3 dias de hoje (tolera fim de semana sem forçar obtenções inúteis). `load_ohlcv()` passa a exigir as duas condições (mtime E conteúdo) antes de servir cache; falhando qualquer uma, tenta sempre obter dados novos primeiro. 2 novos testes reproduzem o bug exato (ficheiro com mtime "agora" mas conteúdo de 2020) e confirmam a correção.
 
 ## Modo descoberta (padrão desde 1.7.0)
 
