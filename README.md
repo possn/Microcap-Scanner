@@ -1,4 +1,4 @@
-# Heartbeat Stage 2 — Discovery Engine v1.7.1
+# Heartbeat Stage 2 — Discovery Engine v1.7.2
 
 Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capitalização até $10 mil milhões, configurável). Por omissão em **modo descoberta**: sinaliza candidatas plausíveis para avaliação manual em vez de eliminar tudo o que não é perfeito — ver secção abaixo.
 
@@ -7,6 +7,14 @@ Scanner diário de ações NASDAQ, micro a mid cap (preço $0.08–$500, capital
 É um **filtro de assimetria**: procura setups onde a relação potencial/risco é favorável e regista tudo para calibração empírica posterior.
 
 **Não** entrega "empresas com grande probabilidade de subir". Essa afirmação exige uma probabilidade medida, e uma probabilidade medida exige amostra fora de treino. Enquanto `cache/backtest_report.json` e `cache/signal_journal.json` não tiverem amostra suficiente, o score de 0–100 é um **ranking ordinal**, não uma probabilidade.
+
+## Corrigido em 1.7.2 — a própria correção de 1.7.1 tinha uma folga a mais
+
+Reportado: "continuam a ser sempre as mesmas ações". Confirmei no histórico do git: a correção de 1.7.1 funcionou (os dados voltaram a atualizar — `OCFC.csv` chegou a ter preços até 18 de agosto), mas depois **congelou outra vez, agora por 3 dias seguidos, de terça a sexta-feira — sem fim de semana envolvido**.
+
+Causa: a tolerância de "até 3 dias corridos" que introduzi em 1.7.1 para não forçar obtenções desnecessárias ao fim de semana acabou por deixar passar 3 dias úteis reais como "suficientemente frescos", sem qualquer tentativa real de atualização em nenhum deles.
+
+Corrigido: `_cache_has_recent_data()` deixa de usar uma tolerância em número de dias e passa a comparar com a **sessão de negociação mais recente esperada** (`_most_recent_expected_session`) — hoje, se for dia útil; a sexta-feira anterior, se hoje for fim de semana. Só esse dia exato conta como fresco; um dia útil de atraso, seja qual for a data, força sempre uma tentativa de obtenção. 2 novos testes substituem o teste de tolerância antigo: um confirma que a sessão esperada exata é aceite em qualquer dia da semana em que os testes corram; outro reproduz especificamente o segundo bug (um dia útil antes da sessão esperada nunca pode passar como fresco).
 
 ## Corrigido em 1.7.1 — bug crítico: cache de OHLCV nunca atualizava
 

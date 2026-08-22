@@ -1,6 +1,7 @@
 import numpy as np
 import dataclasses
 import pandas as pd
+from datetime import datetime, timedelta, timezone
 
 from scanner import Config, find_sma150_breakout, parse_money
 
@@ -505,18 +506,48 @@ def test_cache_freshness_uses_data_content_not_file_mtime(tmp_path, monkeypatch)
     )
 
 
-def test_cache_freshness_accepts_recent_weekend_data(tmp_path):
-    """A cache last updated Friday, read on a Sunday, must still count as
-    fresh (no market data to fetch over the weekend) — the tolerance window
-    must not force pointless refetches every non-trading day."""
+def test_cache_freshness_accepts_the_expected_trading_session(tmp_path):
+    """A cache whose last row IS the most recent expected trading session
+    (today on a weekday, or the prior Friday if today is a weekend) must
+    count as fresh — this must hold no matter which day of the week the
+    test itself happens to run on."""
     import pandas as pd
     import scanner as sc
 
+    today = datetime.now(timezone.utc).date()
+    expected = sc._most_recent_expected_session(today)
+
     path = tmp_path / "RECENT.csv"
-    last = pd.Timestamp.now(tz="UTC").date() - pd.Timedelta(days=2)
-    recent_dates = pd.date_range(end=last, periods=100, freq="D")  # calendar days: 'end' lands exactly on `last`, no weekend roll-back
+    dates = pd.date_range(end=expected, periods=100, freq="D")
     pd.DataFrame({
-        "date": recent_dates, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        "date": dates, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
         "volume": 100_000.0,
     }).to_csv(path, index=False)
     assert sc._cache_has_recent_data(path) is True
+
+
+def test_cache_freshness_never_tolerates_stale_weekdays(tmp_path):
+    """Reproduces the SECOND version of the same production bug: the first
+    fix used a 3-calendar-day tolerance intended for weekends, but across
+    three consecutive real trading days (Tue-Wed-Thu-Fri, no weekend
+    involved) that tolerance let 3-day-old data pass as 'fresh' every single
+    day, so no refetch was ever attempted — the scanner froze again for a
+    different reason. One trading day short of the expected session must
+    now always be rejected, regardless of how many calendar days that is."""
+    import pandas as pd
+    import scanner as sc
+
+    today = datetime.now(timezone.utc).date()
+    expected = sc._most_recent_expected_session(today)
+    one_session_before = expected - timedelta(days=1)
+    while one_session_before.weekday() >= 5:
+        one_session_before -= timedelta(days=1)
+    assert one_session_before < expected
+
+    path = tmp_path / "ONE_SESSION_STALE.csv"
+    dates = pd.date_range(end=one_session_before, periods=100, freq="D")
+    pd.DataFrame({
+        "date": dates, "open": 1.0, "high": 1.0, "low": 1.0, "close": 1.0,
+        "volume": 100_000.0,
+    }).to_csv(path, index=False)
+    assert sc._cache_has_recent_data(path) is False

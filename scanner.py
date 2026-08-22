@@ -25,7 +25,7 @@ import os
 import re
 import time
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -270,9 +270,21 @@ def _fresh(path: Path, hours: int) -> bool:
     return path.exists() and (time.time() - path.stat().st_mtime) < hours * 3600
 
 
-def _cache_has_recent_data(path: Path, max_staleness_days: int = 3) -> bool:
-    """Frescura pelo CONTEÚDO: verdadeiro se a última data na série já é a
-    sessão de negociação mais recente esperada (ou próxima dela).
+def _most_recent_expected_session(today: "date") -> "date":
+    """A sessão de negociação mais recente que já deveria existir, a partir
+    de `today`. Recua apenas para fins de semana (sábado/domingo) — feriados
+    de bolsa não são tratados à parte: nesse caso o pedido de atualização
+    simplesmente devolve o fecho do dia útil anterior, sem custo real."""
+    d = today
+    while d.weekday() >= 5:  # 5=sábado, 6=domingo
+        d -= timedelta(days=1)
+    return d
+
+
+def _cache_has_recent_data(path: Path) -> bool:
+    """Frescura pelo CONTEÚDO: verdadeiro apenas se a última data na série já
+    é a sessão de negociação mais recente esperada — nunca um número fixo de
+    dias de tolerância.
 
     Isto existe porque o workflow faz commit de cache/ohlcv/*.csv de volta
     ao repositório a cada execução (para não recomeçar do zero todos os
@@ -280,15 +292,19 @@ def _cache_has_recent_data(path: Path, max_staleness_days: int = 3) -> bool:
     TODOS os ficheiros para o momento do checkout — `_fresh()` via mtime
     reportava sempre "fresco" mesmo quando o conteúdo era de dias antes,
     porque nunca comparava a DATA dos dados, só a idade do ficheiro em
-    disco. Resultado real observado: os mesmos 10 tickers, com o mesmo
-    score ao décimo, repetidos por 5 dias seguidos — o scanner ficou
-    congelado nos dados do primeiro fetch e nunca mais voltou a atualizar.
-    `max_staleness_days=3` tolera fim de semana (ler dados de sexta-feira ao
-    sábado/domingo) sem recusar dados válidos. É deliberadamente permissivo
-    para o lado de tentar obter dados novos com demasiada frequência, nunca
-    para o lado de aceitar dados velhos: uma segunda-feira a tentar sempre
-    a obtenção é um custo pequeno; um congelamento silencioso de dias é o
-    bug que isto existe para impedir.
+    disco. Resultado real observado (1ª versão do bug): os mesmos 10
+    tickers, com o mesmo score ao décimo, repetidos por 5 dias seguidos.
+
+    A primeira correção usava uma tolerância de 3 dias corridos "para não
+    forçar obtenções desnecessárias ao fim de semana" — mas isso reintroduziu
+    o MESMO bug por outra via: em 3 dias úteis reais e consecutivos (todos
+    terça a sexta, sem fim de semana envolvido), a tolerância deixou o cache
+    antigo passar como "fresco" e nenhuma tentativa de atualização chegou a
+    ser feita. Um scanner diário não pode tolerar "quase atualizado" — ou é
+    a sessão mais recente, ou tenta-se sempre obter dados novos. O único
+    fim de semana genuinamente tolerado é o do calendário (sábado/domingo
+    não têm sessão nova para perder), nunca uma folga arbitrária em dias
+    úteis.
     """
     if not path.exists():
         return False
@@ -297,8 +313,8 @@ def _cache_has_recent_data(path: Path, max_staleness_days: int = 3) -> bool:
         last_date = pd.Timestamp(last_date).date()
     except Exception:  # noqa: BLE001
         return False
-    today = datetime.now(timezone.utc).date()
-    return (today - last_date).days <= max_staleness_days
+    expected = _most_recent_expected_session(datetime.now(timezone.utc).date())
+    return last_date >= expected
 
 
 def get_json(url: str, *, headers: Optional[dict[str, str]] = None, retries: int = 3) -> Any:
