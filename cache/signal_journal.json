@@ -5095,7 +5095,7 @@
     "state": "BREAKOUT",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 4.63
+    "entry_price_adjusted": 5.28
   },
   {
     "ticker": "TOWN",
@@ -5106,7 +5106,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 37.43
+    "entry_price_adjusted": 37.040001
   },
   {
     "ticker": "SBCF",
@@ -5117,7 +5117,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 34.369999
+    "entry_price_adjusted": 33.959999
   },
   {
     "ticker": "OCFC",
@@ -5128,7 +5128,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 18.879999
+    "entry_price_adjusted": 18.84
   },
   {
     "ticker": "ONCH",
@@ -5139,7 +5139,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 10.32
+    "entry_price_adjusted": 10.33
   },
   {
     "ticker": "ARTW",
@@ -5150,7 +5150,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 2.88
+    "entry_price_adjusted": 2.76
   },
   {
     "ticker": "KLTR",
@@ -5161,7 +5161,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 1.6
+    "entry_price_adjusted": 1.58
   },
   {
     "ticker": "NVAX",
@@ -5172,7 +5172,7 @@
     "state": "BREAKOUT",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 9.26
+    "entry_price_adjusted": 9.37
   },
   {
     "ticker": "VANI",
@@ -5183,7 +5183,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 1.42
+    "entry_price_adjusted": 1.39
   },
   {
     "ticker": "HITI",
@@ -5206,7 +5206,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 7.55
+    "entry_price_adjusted": 7.775
   },
   {
     "ticker": "DSGR",
@@ -5230,7 +5230,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 10.1
+    "entry_price_adjusted": 10.21
   },
   {
     "ticker": "TRUP",
@@ -5242,7 +5242,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 29.620001
+    "entry_price_adjusted": 29.15
   },
   {
     "ticker": "MNTK",
@@ -5254,7 +5254,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 1.77
+    "entry_price_adjusted": 1.72
   },
   {
     "ticker": "ACAD",
@@ -5266,7 +5266,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 29.110001
+    "entry_price_adjusted": 28.91
   },
   {
     "ticker": "PRGS",
@@ -5278,7 +5278,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 44.759998
+    "entry_price_adjusted": 46.27
   },
   {
     "ticker": "BWIN",
@@ -5290,7 +5290,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 30.68
+    "entry_price_adjusted": 30.85
   },
   {
     "ticker": "CWST",
@@ -5302,7 +5302,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 93.68
+    "entry_price_adjusted": 92.25
   },
   {
     "ticker": "SAIC",
@@ -5314,7 +5314,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 125.959999
+    "entry_price_adjusted": 128.220001
   },
   {
     "ticker": "FOSL",
@@ -5326,7 +5326,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 5.35
+    "entry_price_adjusted": 4.97
   },
   {
     "ticker": "ABUS",
@@ -5338,7 +5338,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 5.07
+    "entry_price_adjusted": 5.08
   },
   {
     "ticker": "EBC",
@@ -5350,7 +5350,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 22.290001
+    "entry_price_adjusted": 21.959999
   },
   {
     "ticker": "TBBK",
@@ -5362,7 +5362,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 65.699997
+    "entry_price_adjusted": 65.0
   },
   {
     "ticker": "DNUT",
@@ -5374,7 +5374,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 3.47
+    "entry_price_adjusted": 3.42
   },
   {
     "ticker": "ASUR",
@@ -5386,7 +5386,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 9.07
+    "entry_price_adjusted": 9.12
   },
   {
     "ticker": "SLDE",
@@ -5398,7 +5398,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 23.48
+    "entry_price_adjusted": 23.25
   },
   {
     "ticker": "NEOG",
@@ -5410,7 +5410,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 11.66
+    "entry_price_adjusted": 11.56
   },
   {
     "ticker": "SLM",
@@ -5422,7 +5422,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 26.41
+    "entry_price_adjusted": 25.969999
   },
   {
     "ticker": "IMPP",
@@ -5434,7 +5434,7 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {},
-    "entry_price_adjusted": 5.19
+    "entry_price_adjusted": 5.25
   },
   {
     "ticker": "SPAI",
@@ -5467,7 +5467,7 @@
     "state": "RETEST",
     "published": true,
     "outcomes": {},
-    "entry_price_adjusted": 33.955002
+    "entry_price_adjusted": 33.959999
   },
   {
     "ticker": "OCFC",
@@ -5782,7 +5782,8 @@
     "band": "Moderada",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 36.48
   },
   {
     "ticker": "SBCF",
@@ -5792,7 +5793,8 @@
     "band": "Moderada",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 33.040001
   },
   {
     "ticker": "OCFC",
@@ -5802,7 +5804,8 @@
     "band": "Moderada",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 18.530001
   },
   {
     "ticker": "ARTW",
@@ -5812,7 +5815,8 @@
     "band": "Moderada",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 2.89
   },
   {
     "ticker": "SPAI",
@@ -5822,7 +5826,8 @@
     "band": "Moderada",
     "state": "BREAKOUT",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 4.6
   },
   {
     "ticker": "KLTR",
@@ -5832,7 +5837,8 @@
     "band": "Moderada",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 1.54
   },
   {
     "ticker": "NVAX",
@@ -5842,7 +5848,8 @@
     "band": "Especulativa",
     "state": "BREAKOUT",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 10.12
   },
   {
     "ticker": "HITI",
@@ -5852,7 +5859,8 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 2.48
   },
   {
     "ticker": "VANI",
@@ -5862,7 +5870,8 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 1.36
   },
   {
     "ticker": "FSUN",
@@ -5872,7 +5881,8 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 39.380001
   },
   {
     "ticker": "STI",
@@ -5883,7 +5893,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 7.66
   },
   {
     "ticker": "DSGR",
@@ -5894,7 +5905,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 34.700001
   },
   {
     "ticker": "SPCB",
@@ -5905,7 +5917,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 10.27
   },
   {
     "ticker": "TRUP",
@@ -5916,7 +5929,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 27.879999
   },
   {
     "ticker": "ACAD",
@@ -5927,7 +5941,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 28.889999
   },
   {
     "ticker": "PRGS",
@@ -5938,7 +5953,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 45.220001
   },
   {
     "ticker": "BWIN",
@@ -5949,7 +5965,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 30.26
   },
   {
     "ticker": "AEBI",
@@ -5960,7 +5977,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 12.05
   },
   {
     "ticker": "CWST",
@@ -5971,7 +5989,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 92.650002
   },
   {
     "ticker": "RZLV",
@@ -5982,7 +6001,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 2.39
   },
   {
     "ticker": "SAIC",
@@ -5993,7 +6013,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 126.779999
   },
   {
     "ticker": "FOSL",
@@ -6004,7 +6025,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 4.88
   },
   {
     "ticker": "ABUS",
@@ -6015,7 +6037,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 5.09
   },
   {
     "ticker": "EBC",
@@ -6026,7 +6049,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 21.5
   },
   {
     "ticker": "TBBK",
@@ -6037,7 +6061,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 64.349998
   },
   {
     "ticker": "DNUT",
@@ -6048,7 +6073,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 3.36
   },
   {
     "ticker": "ASUR",
@@ -6059,7 +6085,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 9.06
   },
   {
     "ticker": "SLDE",
@@ -6070,7 +6097,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 23.290001
   },
   {
     "ticker": "NEOG",
@@ -6081,7 +6109,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 11.64
   },
   {
     "ticker": "SLM",
@@ -6092,7 +6121,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 25.77
   },
   {
     "ticker": "IMPP",
@@ -6103,6 +6133,77 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 5.46
+  },
+  {
+    "ticker": "VKTX",
+    "signal_date": "2026-09-01",
+    "signal_price": 33.66999816894531,
+    "score": 49.8,
+    "band": "Especulativa",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {},
+    "entry_price_adjusted": 33.669998
+  },
+  {
+    "ticker": "IRON",
+    "signal_date": "2026-09-01",
+    "signal_price": 78.66999816894531,
+    "score": 48.9,
+    "band": "Especulativa",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {},
+    "entry_price_adjusted": 78.669998
+  },
+  {
+    "ticker": "DMRA",
+    "signal_date": "2026-09-01",
+    "signal_price": 28.139999389648438,
+    "score": 34.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {},
+    "entry_price_adjusted": 28.139999
+  },
+  {
+    "ticker": "PAYO",
+    "signal_date": "2026-09-01",
+    "signal_price": 7.099999904632568,
+    "score": 34.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {},
+    "entry_price_adjusted": 7.1
+  },
+  {
+    "ticker": "MNTK",
+    "signal_date": "2026-09-01",
+    "signal_price": 1.7599999904632568,
+    "score": 32.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {},
+    "entry_price_adjusted": 1.76
+  },
+  {
+    "ticker": "MCGA",
+    "signal_date": "2026-09-01",
+    "signal_price": 10.34000015258789,
+    "score": 33.1,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {},
+    "entry_price_adjusted": 10.34
   }
 ]
