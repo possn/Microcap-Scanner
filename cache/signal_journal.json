@@ -9911,5 +9911,292 @@
     "reject_reason": "quality_score",
     "outcomes": {},
     "entry_price_adjusted": 26.040001
+  },
+  {
+    "ticker": "TOWN",
+    "signal_date": "2026-09-15",
+    "signal_price": 37.0,
+    "score": 63.4,
+    "band": "Moderada",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "KLTR",
+    "signal_date": "2026-09-15",
+    "signal_price": 1.4199999570846558,
+    "score": 61.5,
+    "band": "Moderada",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "RTAC",
+    "signal_date": "2026-09-15",
+    "signal_price": 10.460000038146973,
+    "score": 60.0,
+    "band": "Moderada",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "SBCF",
+    "signal_date": "2026-09-15",
+    "signal_price": 33.97999954223633,
+    "score": 59.8,
+    "band": "Moderada",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "VANI",
+    "signal_date": "2026-09-15",
+    "signal_price": 1.2599999904632568,
+    "score": 58.7,
+    "band": "Moderada",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "TVA",
+    "signal_date": "2026-09-15",
+    "signal_price": 10.550000190734863,
+    "score": 51.0,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "MSEX",
+    "signal_date": "2026-09-15",
+    "signal_price": 56.689998626708984,
+    "score": 50.3,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "TELA",
+    "signal_date": "2026-09-15",
+    "signal_price": 1.0399999618530273,
+    "score": 49.3,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "FSUN",
+    "signal_date": "2026-09-15",
+    "signal_price": 40.15999984741211,
+    "score": 48.6,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "INMD",
+    "signal_date": "2026-09-15",
+    "signal_price": 14.899999618530273,
+    "score": 43.1,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "DSGR",
+    "signal_date": "2026-09-15",
+    "signal_price": 34.75,
+    "score": 15.3,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "DMRA",
+    "signal_date": "2026-09-15",
+    "signal_price": 28.100000381469727,
+    "score": 34.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "HITI",
+    "signal_date": "2026-09-15",
+    "signal_price": 2.630000114440918,
+    "score": 32.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "PAYO",
+    "signal_date": "2026-09-15",
+    "signal_price": 7.119999885559082,
+    "score": 16.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "ACAD",
+    "signal_date": "2026-09-15",
+    "signal_price": 27.829999923706055,
+    "score": 28.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "PRGS",
+    "signal_date": "2026-09-15",
+    "signal_price": 39.91999816894531,
+    "score": 27.2,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BWIN",
+    "signal_date": "2026-09-15",
+    "signal_price": 29.649999618530273,
+    "score": 18.1,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "CWST",
+    "signal_date": "2026-09-15",
+    "signal_price": 89.91000366210938,
+    "score": 27.4,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "SAIC",
+    "signal_date": "2026-09-15",
+    "signal_price": 129.89999389648438,
+    "score": 19.2,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "FOSL",
+    "signal_date": "2026-09-15",
+    "signal_price": 4.730000019073486,
+    "score": 10.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "ABUS",
+    "signal_date": "2026-09-15",
+    "signal_price": 5.119999885559082,
+    "score": 13.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "EBC",
+    "signal_date": "2026-09-15",
+    "signal_price": 21.600000381469727,
+    "score": 19.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "WAY",
+    "signal_date": "2026-09-15",
+    "signal_price": 23.469999313354492,
+    "score": 0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "ASUR",
+    "signal_date": "2026-09-15",
+    "signal_price": 8.579999923706055,
+    "score": 11.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "SLDE",
+    "signal_date": "2026-09-15",
+    "signal_price": 24.84000015258789,
+    "score": 26.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "NEOG",
+    "signal_date": "2026-09-15",
+    "signal_price": 11.779999732971191,
+    "score": 6.3,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "SLM",
+    "signal_date": "2026-09-15",
+    "signal_price": 26.040000915527344,
+    "score": 29.4,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
   }
 ]
