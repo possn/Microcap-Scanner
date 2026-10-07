@@ -14800,7 +14800,13 @@
     "band": "Moderada-alta",
     "state": "RETEST",
     "published": true,
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": 0.09,
+        "max_gain_pct": 0.28,
+        "max_drawdown_pct": -0.05
+      }
+    },
     "entry_price_adjusted": 10.68
   },
   {
@@ -14822,7 +14828,13 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": -1.14,
+        "max_gain_pct": 1.84,
+        "max_drawdown_pct": -2.09
+      }
+    },
     "entry_price_adjusted": 35.82
   },
   {
@@ -14844,7 +14856,13 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": 0.15,
+        "max_gain_pct": 1.42,
+        "max_drawdown_pct": -3.52
+      }
+    },
     "entry_price_adjusted": 32.369999
   },
   {
@@ -14889,7 +14907,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": 0.29,
+        "max_gain_pct": 0.43,
+        "max_drawdown_pct": -0.23
+      }
+    },
     "entry_price_adjusted": 34.950001
   },
   {
@@ -14937,7 +14961,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": -1.62,
+        "max_gain_pct": 1.7,
+        "max_drawdown_pct": -3.55
+      }
+    },
     "entry_price_adjusted": 37.73
   },
   {
@@ -14949,7 +14979,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": -5.68,
+        "max_gain_pct": 5.6,
+        "max_drawdown_pct": -8.98
+      }
+    },
     "entry_price_adjusted": 39.439999
   },
   {
@@ -14997,7 +15033,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": 4.62,
+        "max_gain_pct": 23.75,
+        "max_drawdown_pct": -4.99
+      }
+    },
     "entry_price_adjusted": 10.82
   },
   {
@@ -15009,7 +15051,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": -4.48,
+        "max_gain_pct": 5.54,
+        "max_drawdown_pct": -6.61
+      }
+    },
     "entry_price_adjusted": 4.69
   },
   {
@@ -15105,7 +15153,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": 0.95,
+        "max_gain_pct": 3.19,
+        "max_drawdown_pct": -1.47
+      }
+    },
     "entry_price_adjusted": 68.550003
   },
   {
@@ -15117,7 +15171,13 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": -1.35,
+        "max_gain_pct": 1.35,
+        "max_drawdown_pct": -3.8
+      }
+    },
     "entry_price_adjusted": 22.889999
   },
   {
@@ -16322,7 +16382,8 @@
     "band": "Moderada-alta",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 10.69
   },
   {
     "ticker": "RTAC",
@@ -16362,7 +16423,8 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 32.419998
   },
   {
     "ticker": "TOWN",
@@ -16372,7 +16434,8 @@
     "band": "Especulativa",
     "state": "RETEST",
     "published": true,
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 35.41
   },
   {
     "ticker": "FSUN",
@@ -16393,7 +16456,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 35.049999
   },
   {
     "ticker": "OBIO",
@@ -16448,7 +16512,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 13.52
   },
   {
     "ticker": "WSBC",
@@ -16459,7 +16524,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 37.119999
   },
   {
     "ticker": "PRGS",
@@ -16470,7 +16536,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 37.200001
   },
   {
     "ticker": "BWIN",
@@ -16492,7 +16559,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 8.81
   },
   {
     "ticker": "VOR",
@@ -16514,7 +16582,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 4.48
   },
   {
     "ticker": "HYPD",
@@ -16569,7 +16638,8 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 1.46
   },
   {
     "ticker": "SLDE",
@@ -16591,13 +16661,284 @@
     "state": null,
     "published": false,
     "reject_reason": "quality_score",
-    "outcomes": {}
+    "outcomes": {},
+    "entry_price_adjusted": 11.96
   },
   {
     "ticker": "BHRB",
     "signal_date": "2026-10-06",
     "signal_price": 69.27999877929688,
     "score": 17.4,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {},
+    "entry_price_adjusted": 69.199997
+  },
+  {
+    "ticker": "BEAG",
+    "signal_date": "2026-10-07",
+    "signal_price": 10.6899995803833,
+    "score": 77.1,
+    "band": "Moderada-alta",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "RTAC",
+    "signal_date": "2026-10-07",
+    "signal_price": 10.430000305175781,
+    "score": 57.4,
+    "band": "Moderada",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "TVA",
+    "signal_date": "2026-10-07",
+    "signal_price": 10.59000015258789,
+    "score": 54.2,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "TLNC",
+    "signal_date": "2026-10-07",
+    "signal_price": 10.300000190734863,
+    "score": 48.9,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "SBCF",
+    "signal_date": "2026-10-07",
+    "signal_price": 32.41999816894531,
+    "score": 40.5,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "FSUN",
+    "signal_date": "2026-10-07",
+    "signal_price": 39.45000076293945,
+    "score": 39.5,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "DSGR",
+    "signal_date": "2026-10-07",
+    "signal_price": 35.04999923706055,
+    "score": 18.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "OBIO",
+    "signal_date": "2026-10-07",
+    "signal_price": 6.03000020980835,
+    "score": 34.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "HITI",
+    "signal_date": "2026-10-07",
+    "signal_price": 2.7300000190734863,
+    "score": 32.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "PAYO",
+    "signal_date": "2026-10-07",
+    "signal_price": 7.150000095367432,
+    "score": 19.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "EPRX",
+    "signal_date": "2026-10-07",
+    "signal_price": 7.744999885559082,
+    "score": 32.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "WFCF",
+    "signal_date": "2026-10-07",
+    "signal_price": 13.520000457763672,
+    "score": 30.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "PRGS",
+    "signal_date": "2026-10-07",
+    "signal_price": 37.20000076293945,
+    "score": 16.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BWIN",
+    "signal_date": "2026-10-07",
+    "signal_price": 31.899999618530273,
+    "score": 20.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "OPRX",
+    "signal_date": "2026-10-07",
+    "signal_price": 8.8100004196167,
+    "score": 10.3,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "VOR",
+    "signal_date": "2026-10-07",
+    "signal_price": 18.579999923706055,
+    "score": 13.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "NVAX",
+    "signal_date": "2026-10-07",
+    "signal_price": 11.319999694824219,
+    "score": 32.2,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "HYPD",
+    "signal_date": "2026-10-07",
+    "signal_price": 3.890000104904175,
+    "score": 30.1,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "EBC",
+    "signal_date": "2026-10-07",
+    "signal_price": 21.239999771118164,
+    "score": 13.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "WAY",
+    "signal_date": "2026-10-07",
+    "signal_price": 26.479999542236328,
+    "score": 0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BAFN",
+    "signal_date": "2026-10-07",
+    "signal_price": 7.75,
+    "score": 6.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BTCS",
+    "signal_date": "2026-10-07",
+    "signal_price": 1.4600000381469727,
+    "score": 15.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "SLDE",
+    "signal_date": "2026-10-07",
+    "signal_price": 24.139999389648438,
+    "score": 23.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "NEOG",
+    "signal_date": "2026-10-07",
+    "signal_price": 11.960000038146973,
+    "score": 8.2,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BHRB",
+    "signal_date": "2026-10-07",
+    "signal_price": 69.19999694824219,
+    "score": 17.8,
     "band": null,
     "state": null,
     "published": false,
