@@ -16187,7 +16187,13 @@
     "band": "Moderada-alta",
     "state": "RETEST",
     "published": true,
-    "outcomes": {},
+    "outcomes": {
+      "5": {
+        "return_pct": -0.09,
+        "max_gain_pct": 0.19,
+        "max_drawdown_pct": -0.09
+      }
+    },
     "entry_price_adjusted": 10.7
   },
   {
@@ -17923,6 +17929,252 @@
     "signal_date": "2026-10-09",
     "signal_price": 68.94999694824219,
     "score": 18.3,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "RTAC",
+    "signal_date": "2026-10-10",
+    "signal_price": 10.4399995803833,
+    "score": 57.9,
+    "band": "Moderada",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "RXRX",
+    "signal_date": "2026-10-10",
+    "signal_price": 3.950000047683716,
+    "score": 52.6,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "BCDA",
+    "signal_date": "2026-10-10",
+    "signal_price": 1.059999942779541,
+    "score": 46.8,
+    "band": "Especulativa",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "FSUN",
+    "signal_date": "2026-10-10",
+    "signal_price": 38.900001525878906,
+    "score": 42.1,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "WFCF",
+    "signal_date": "2026-10-10",
+    "signal_price": 13.989999771118164,
+    "score": 38.5,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "HITI",
+    "signal_date": "2026-10-10",
+    "signal_price": 2.5799999237060547,
+    "score": 37.9,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "NVAX",
+    "signal_date": "2026-10-10",
+    "signal_price": 11.010000228881836,
+    "score": 35.3,
+    "band": "Especulativa",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "DSGR",
+    "signal_date": "2026-10-10",
+    "signal_price": 35.06999969482422,
+    "score": 18.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "OBIO",
+    "signal_date": "2026-10-10",
+    "signal_price": 5.730000019073486,
+    "score": 31.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "PAYO",
+    "signal_date": "2026-10-10",
+    "signal_price": 7.159999847412109,
+    "score": 19.4,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "EPRX",
+    "signal_date": "2026-10-10",
+    "signal_price": 7.570000171661377,
+    "score": 33.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "TRUP",
+    "signal_date": "2026-10-10",
+    "signal_price": 25.81999969482422,
+    "score": 25.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "PRGS",
+    "signal_date": "2026-10-10",
+    "signal_price": 38.279998779296875,
+    "score": 17.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BWIN",
+    "signal_date": "2026-10-10",
+    "signal_price": 31.850000381469727,
+    "score": 22.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "RNXT",
+    "signal_date": "2026-10-10",
+    "signal_price": 1.3300000429153442,
+    "score": 27.1,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "OPRX",
+    "signal_date": "2026-10-10",
+    "signal_price": 8.380000114440918,
+    "score": 13.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "VOR",
+    "signal_date": "2026-10-10",
+    "signal_price": 19.1299991607666,
+    "score": 2.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "EGHT",
+    "signal_date": "2026-10-10",
+    "signal_price": 2.1600000858306885,
+    "score": 28.8,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "WAY",
+    "signal_date": "2026-10-10",
+    "signal_price": 26.479999542236328,
+    "score": 0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BAFN",
+    "signal_date": "2026-10-10",
+    "signal_price": 6.71999979019165,
+    "score": 5.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "SLDE",
+    "signal_date": "2026-10-10",
+    "signal_price": 25.299999237060547,
+    "score": 25.6,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "NEOG",
+    "signal_date": "2026-10-10",
+    "signal_price": 11.710000038146973,
+    "score": 7.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "BHRB",
+    "signal_date": "2026-10-10",
+    "signal_price": 68.94999694824219,
+    "score": 18.1,
     "band": null,
     "state": null,
     "published": false,
