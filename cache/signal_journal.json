@@ -31204,5 +31204,152 @@
     "published": false,
     "reject_reason": "quality_score",
     "outcomes": {}
+  },
+  {
+    "ticker": "RTAC",
+    "signal_date": "2026-11-27",
+    "signal_price": 10.510000228881836,
+    "score": 64.8,
+    "band": "Moderada",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "LLYVA",
+    "signal_date": "2026-11-27",
+    "signal_price": 105.48999786376953,
+    "score": 52.4,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "MGRC",
+    "signal_date": "2026-11-27",
+    "signal_price": 119.4000015258789,
+    "score": 48.7,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "SBRA",
+    "signal_date": "2026-11-27",
+    "signal_price": 21.15999984741211,
+    "score": 43.8,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "PERI",
+    "signal_date": "2026-11-27",
+    "signal_price": 11.260000228881836,
+    "score": 41.3,
+    "band": "Especulativa",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "MNKD",
+    "signal_date": "2026-11-27",
+    "signal_price": 4.059999942779541,
+    "score": 41.1,
+    "band": "Especulativa",
+    "state": "BREAKOUT",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "LLYVK",
+    "signal_date": "2026-11-27",
+    "signal_price": 107.79000091552734,
+    "score": 37.2,
+    "band": "Especulativa",
+    "state": "RETEST",
+    "published": true,
+    "outcomes": {}
+  },
+  {
+    "ticker": "MXCT",
+    "signal_date": "2026-11-27",
+    "signal_price": 1.3300000429153442,
+    "score": 32.4,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "EWTX",
+    "signal_date": "2026-11-27",
+    "signal_price": 47.560001373291016,
+    "score": 14.9,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "ASTL",
+    "signal_date": "2026-11-27",
+    "signal_price": 4.864999771118164,
+    "score": 11.0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "OPRX",
+    "signal_date": "2026-11-27",
+    "signal_price": 7.309999942779541,
+    "score": 8.7,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "FSV",
+    "signal_date": "2026-11-27",
+    "signal_price": 161.63999938964844,
+    "score": 15.1,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "TNDM",
+    "signal_date": "2026-11-27",
+    "signal_price": 19.260000228881836,
+    "score": 21.5,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
+  },
+  {
+    "ticker": "WAY",
+    "signal_date": "2026-11-27",
+    "signal_price": 27.700000762939453,
+    "score": 0,
+    "band": null,
+    "state": null,
+    "published": false,
+    "reject_reason": "quality_score",
+    "outcomes": {}
   }
 ]
